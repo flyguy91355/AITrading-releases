@@ -467,12 +467,30 @@ tbody tr:hover { background: var(--bg-card-hover); }
    (long company name already ate width) that single-line truncation silently hid the added
    date entirely. Wrapping to 2 lines costs a little chart-row height instead. */
 .btn-meta-wrap { font-size: 10.5px; color: var(--text-muted); white-space: normal; line-height: 1.3; }
-/* Chart row: takes the height freed up by doubling the card, full card width. */
+/* Chart row: takes the height freed up by doubling the card, full card width.
+   Superseded 2026-08-12 (see .btn-chart-box below) for the card's own layout, but the
+   class stays defined -- nothing else references it, no reason to delete a still-valid,
+   still-documented rule that may be useful again. */
 .btn-chart-col { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .btn-chart-row { flex: 1; min-height: 0; display: flex; align-items: stretch; }
 .btn-chart-row svg { width: 100%; height: 100%; display: block; }
 .btn-chart-caption { flex-shrink: 0; font-size: 8.5px; color: var(--text-muted); text-align: center; }
 .btn-dip-summary { flex-shrink: 0; font-size: 9.5px; color: var(--text-secondary); line-height: 1.3; }
+/* Card layout rework (2026-08-12, owner request) -- chart moved from a full-width strip
+   at the bottom into a small contained box up top next to the ticker/Conv/R/R block;
+   business description + thesis moved down together (both are "about this company" text,
+   now grouped); Conv/R/R stacked vertically under the ticker instead of one wide line,
+   freeing the horizontal room the chart box now uses. Nothing removed -- every existing
+   piece (signal badge, need-RR text, meta lines, dip summary) just relocated. */
+.btn-conv-rr-stack { display: flex; flex-direction: column; gap: 0; margin-top: 2px; }
+.btn-side-col {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 3px;
+  flex-shrink: 0; width: 100px;
+}
+.btn-chart-box { width: 100%; height: 64px; border-radius: 3px; overflow: hidden; display: flex; align-items: stretch; }
+.btn-chart-box svg { width: 100%; height: 100%; display: block; }
+.btn-chart-box-caption { flex-shrink: 0; font-size: 7.5px; color: var(--text-muted); text-align: center; width: 100%; }
+.btn-desc-block { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 4px; overflow: hidden; padding-top: 2px; }
 .btn-sig-code {
   font-size: 10px;
   font-weight: 700;
@@ -2808,7 +2826,15 @@ async function applyUpdate() {
     const resp = await fetch('/api/apply-update', { method: 'POST' });
     const data = await resp.json();
     if (data.status === 'applying') {
-      statusEl.textContent = `Applying ${data.target_version} — service restarting, reload the page in ~10s.`;
+      statusEl.textContent = `Applying ${data.target_version} — service restarting...`;
+      pollUntilBackUpThenReload();
+    } else if (data.status === 'already_applying') {
+      // Another click (e.g. from a reopened panel with a fresh, un-disabled
+      // button -- see _apply_update_in_progress in web/app.py) already has a
+      // real apply running server-side. Same outcome either way, so this
+      // click also waits for it and reloads once the service is back.
+      statusEl.textContent = 'Already applying (from an earlier click) — waiting for it to finish...';
+      pollUntilBackUpThenReload();
     } else {
       statusEl.textContent = `Error: ${data.detail}`;
       btn.disabled = false;
@@ -2817,6 +2843,41 @@ async function applyUpdate() {
     statusEl.textContent = 'Error: request failed';
     btn.disabled = false;
   }
+}
+
+// Polls /api/update-status (a lightweight, always-available endpoint) every
+// 2s until it responds successfully, then reloads -- replaces an earlier
+// fixed 12s setTimeout guess (2026-08-12, owner: "why 12 seconds") with a
+// real readiness check instead of a blind wait, so the reload can't fire
+// too early (server still restarting) or leave the page waiting longer than
+// necessary once it's genuinely back. Starts after a short initial delay
+// (the server itself waits 2s before even issuing the restart) and gives up
+// after 60s, matching this project's condition-based-waiting precedent over
+// arbitrary timeouts.
+function pollUntilBackUpThenReload() {
+  const statusEl = document.getElementById('applyUpdateStatus');
+  let attempts = 0;
+  const maxAttempts = 30;
+  setTimeout(function poll() {
+    attempts++;
+    fetch('/api/update-status')
+      .then(resp => {
+        if (resp.ok) {
+          location.reload();
+        } else if (attempts < maxAttempts) {
+          setTimeout(poll, 2000);
+        } else if (statusEl) {
+          statusEl.textContent = 'Still restarting — reload the page manually when ready.';
+        }
+      })
+      .catch(() => {
+        if (attempts < maxAttempts) {
+          setTimeout(poll, 2000);
+        } else if (statusEl) {
+          statusEl.textContent = 'Still restarting — reload the page manually when ready.';
+        }
+      });
+  }, 3000);
 }
 
 // Shared by both On Deck and On Shore card rendering -- true iff rr sits within the
@@ -2899,12 +2960,11 @@ function renderNearMissGrid(data) {
       ? ` <span style="color:${nm.direction === 'up' ? 'var(--green)' : 'var(--red)'};font-size:10px;">×${nm.streak}</span>`
       : '';
     const [sigClass, sigLabel] = _sigMap[nm.signal] || ['sig-none', ''];
-    // "New" — added within the last 24h. Rendered as inline text, not a button class, so it
-    // can't be clobbered by updateTickerSignal()'s classList.remove('has-new', ...) on a live
-    // signal push (that reset is about the has-* border tint, unrelated to this text badge).
     const addedMs = nm.added_at ? new Date(nm.added_at).getTime() : 0;
-    const isNew = addedMs > 0 && (Date.now() - addedMs) < 24 * 60 * 60 * 1000;
-    const newBadge = isNew ? ' <span style="color:var(--cyan);font-weight:700;">NEW</span>' : '';
+    // "NEW" badge dropped (2026-08-12, owner request) -- with how often On Deck now
+    // churns, nearly every card qualified as "added within 24h" anyway, so the badge had
+    // stopped meaningfully distinguishing anything. added_at itself is still captured and
+    // still shown as the plain "Added M/D/YYYY" text in the meta-wrap line below.
     const addedStr = addedMs > 0 ? `Added ${new Date(nm.added_at).toLocaleDateString()}` : '';
     const fv = nm.fair_value_estimate || 0;
     const mos = nm.margin_of_safety_pct || 0;
@@ -2916,25 +2976,25 @@ function renderNearMissGrid(data) {
           <span class="btn-title-row">
             <span class="btn-rank">#${idx + 1}</span>
             <span class="btn-ticker">${nm.ticker}</span>
-            <span class="btn-name">${nm.company_name || ''}</span>${newBadge}
+            <span class="btn-name">${nm.company_name || ''}</span>
           </span>
-          ${nm.business_summary ? `<span class="btn-business">${nm.business_summary}</span>` : ''}
-          <span style="display:flex;align-items:baseline;gap:10px;margin-top:2px;">
+          <span class="btn-conv-rr-stack">
             <span style="font-size:13px;font-weight:700;color:${convColor};">Conv ${nm.conviction_score}/10</span>
             <span class="btn-rr-badge" style="font-size:13px;font-weight:700;color:${rrColor};">R/R ${(nm.rr||0).toFixed(2)}</span>
           </span>
           <span class="btn-meta">${dirArrow}$${(nm.last_price||0).toFixed(2)}${streakStr}</span>
           <span class="btn-meta-wrap">${[nm.sector, fvStr, addedStr].filter(Boolean).join(' · ')}</span>
         </span>
-        <span style="display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex-shrink:0;padding-right:12px;">
+        <span class="btn-side-col">
+          <span class="btn-chart-box" id="rrspark-${nm.ticker}"></span>
+          <span class="btn-chart-box-caption">${dateRangeCaption(nm.rr_sparkline)}</span>
           <span class="btn-sig-code ${sigClass}">${sigLabel}</span>
           <span style="font-size:9px;color:var(--text-muted);">need ≥${requiredRR.toFixed(2)}</span>
         </span>
       </span>
-      ${nm.thesis ? `<span class="btn-thesis">${nm.thesis}</span>` : ''}
-      <span class="btn-chart-col">
-        <span class="btn-chart-row" id="rrspark-${nm.ticker}"></span>
-        <span class="btn-chart-caption">${dateRangeCaption(nm.rr_sparkline)}</span>
+      <span class="btn-desc-block">
+        ${nm.business_summary ? `<span class="btn-business">${nm.business_summary}</span>` : ''}
+        ${nm.thesis ? `<span class="btn-thesis">${nm.thesis}</span>` : ''}
       </span>
       <span class="btn-dip-summary">${dipEntrySummary(nm)}</span>
     </button>`;
@@ -3004,23 +3064,23 @@ function renderTodayScanGrid(data) {
             <span class="btn-ticker">${r.ticker}</span>
             <span class="btn-name">${r.company_name || ''}</span>
           </span>
-          ${r.business_summary ? `<span class="btn-business">${r.business_summary}</span>` : ''}
-          <span style="display:flex;align-items:baseline;gap:10px;margin-top:2px;">
+          <span class="btn-conv-rr-stack">
             <span style="font-size:13px;font-weight:700;color:${convColor};">Conv ${r.conviction_score}/10</span>
             <span style="font-size:13px;font-weight:700;color:${rrColor};">R/R ${(r.rr||0).toFixed(2)}</span>
           </span>
           <span class="btn-meta">${metaStr}</span>
           <span class="btn-meta-wrap">${fvStr}</span>
         </span>
-        <span style="display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex-shrink:0;padding-right:12px;">
+        <span class="btn-side-col">
+          <span class="btn-chart-box" id="rrspark-${r.ticker}"></span>
+          <span class="btn-chart-box-caption">${dateRangeCaption(r.rr_sparkline)}</span>
           <span class="btn-sig-code ${sigClass}">${sigLabel}</span>
           <span style="font-size:9px;color:var(--text-muted);">need ≥${requiredRR.toFixed(2)}</span>
         </span>
       </span>
-      ${r.thesis ? `<span class="btn-thesis">${r.thesis}</span>` : ''}
-      <span class="btn-chart-col">
-        <span class="btn-chart-row" id="rrspark-${r.ticker}"></span>
-        <span class="btn-chart-caption">${dateRangeCaption(r.rr_sparkline)}</span>
+      <span class="btn-desc-block">
+        ${r.business_summary ? `<span class="btn-business">${r.business_summary}</span>` : ''}
+        ${r.thesis ? `<span class="btn-thesis">${r.thesis}</span>` : ''}
       </span>
     </button>`;
   };
@@ -3570,6 +3630,13 @@ updateClock();
 
 // Near-miss R/R updates server-side every 60s (near_miss_monitor_loop) — poll to match.
 setInterval(fetchNearMiss, 60000);
+
+// Update-available badge (2026-08-12, owner report: "if i have to refresh to get it
+// thats a problem") -- was fetch-once-on-load only, so an already-open dashboard tab
+// never saw a newly-cut release. Polling this every 60s is cheap: /api/update-status
+// itself caches the real GitHub lookup (see get_update_status, web/app.py), so this
+// just hits fast local server state, not GitHub, on every tick.
+setInterval(fetchUpdateStatus, 60000);
 
 // Composition-weighted benchmark tiles (2026-07-29) -- the API recomputes
 // live on every request, but nothing was asking for it periodically during

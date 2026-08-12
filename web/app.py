@@ -1376,6 +1376,26 @@ class DashboardState:
         # already-long, already-live function.
         self._full_scan_in_progress: bool = False
 
+        # Update-available apply guard (2026-08-12, owner concern: "someone would push
+        # the button again") -- the frontend already disables the clicked button for
+        # the duration of one apply, but closing and reopening the update panel rebuilds
+        # a fresh, un-disabled button with no memory of an apply already running. Same
+        # in-progress-flag pattern as _full_scan_in_progress above, so a second click
+        # can't launch a second concurrent download/extract/copy/restart cycle.
+        self._apply_update_in_progress: bool = False
+
+        # Update-status GitHub-fetch cache (2026-08-12, owner report: "if i have to
+        # refresh to get it thats a problem" -- the dashboard badge needed to poll
+        # periodically, not just check once on page load. Polling this endpoint every
+        # ~60s from an open dashboard tab is fine on its own, but calling
+        # fetch_latest_release() (a real GitHub API hit) on every single one of those
+        # polls, from potentially several open tabs/devices at once, risks GitHub's
+        # 60-req/hour-per-IP unauthenticated limit. This caches the real GitHub result
+        # for update.check_interval_minutes (default 60) -- the frontend can poll the
+        # cheap local endpoint often; the actual GitHub lookup stays rare.
+        self._update_status_cache: dict | None = None
+        self._update_status_cache_time: datetime | None = None
+
         # On Deck backfill reject cooldown (2026-08-03, owner request) -- a ticker that just
         # failed a real fresh re-check inside _backfill_on_deck_from_on_shore's _try_add
         # (no longer qualifies, or outside the R/R band) is the top-ranked On Shore
@@ -7401,11 +7421,17 @@ _VERSION_FILE_PATH = str(Path(__file__).resolve().parent.parent / "VERSION")
 async def get_update_status():
     """Compares this install's local VERSION against the latest release on
     the distribution repo (update.releases_repo in config) — no credential
-    needed, since that repo is public. Same fetch-once-on-load pattern the
-    dashboard already uses for /api/conviction-gate-config. A fetch failure
-    (network down, repo misconfigured) degrades to 'no update info
-    available' rather than raising — this endpoint must never break the
-    dashboard's own load."""
+    needed, since that repo is public. The frontend polls this endpoint
+    periodically (2026-08-12, owner: "if i have to refresh to get it thats
+    a problem" — was fetch-once-on-load only) so the badge can appear on an
+    already-open dashboard without a manual reload. The real GitHub lookup
+    itself is cached for update.check_interval_minutes (default 60) via
+    state._update_status_cache — frequent client polling hits this cheap
+    local endpoint, not GitHub, keeping this well under GitHub's
+    60-req/hour-per-IP unauthenticated limit even with several tabs/devices
+    open at once. A fetch failure degrades to the last good cached result if
+    one exists, or to 'no update info available' on the very first call —
+    this endpoint must never break the dashboard's own load."""
     current = read_local_version(_VERSION_FILE_PATH) or "v0.0.0"
     repo = state.config.get("update", {}).get("releases_repo", "")
     market_open = state._is_market_open()
@@ -7420,9 +7446,23 @@ async def get_update_status():
             "market_open": market_open,
         }
 
-    try:
-        release = fetch_latest_release(repo)
-    except Exception:
+    check_interval = timedelta(
+        minutes=state.config.get("update", {}).get("check_interval_minutes", 60)
+    )
+    cache_is_fresh = (
+        state._update_status_cache is not None
+        and state._update_status_cache_time is not None
+        and datetime.now() - state._update_status_cache_time < check_interval
+    )
+    if not cache_is_fresh:
+        try:
+            state._update_status_cache = fetch_latest_release(repo)
+            state._update_status_cache_time = datetime.now()
+        except Exception:
+            pass  # keep serving the last known-good cached release, if any
+
+    release = state._update_status_cache
+    if release is None:
         return {
             "current": current,
             "latest": None,
@@ -7462,62 +7502,76 @@ async def apply_update():
     Handling section) — a download/extract failure aborts before touching
     the live install at all; a pip install failure aborts before
     restarting, so a bad release never leaves the service down from this
-    endpoint's own actions."""
-    repo = state.config.get("update", {}).get("releases_repo", "")
-    if not repo:
-        return {"status": "error", "detail": "update.releases_repo not configured"}
+    endpoint's own actions.
 
+    Guarded by _apply_update_in_progress (2026-08-12, owner concern: "someone
+    would push the button again") — the frontend already disables the button
+    it was clicked from, but closing and reopening the update panel rebuilds
+    a fresh, un-disabled one with no memory of an apply already running.
+    Same in-progress-flag pattern as _full_scan_in_progress
+    (/api/trigger-batch-scan)."""
+    if state._apply_update_in_progress:
+        return {"status": "already_applying",
+                "detail": "An update is already being applied — wait for it to finish."}
+    state._apply_update_in_progress = True
     try:
-        release = fetch_latest_release(repo)
-    except Exception as exc:
-        return {"status": "error", "detail": f"could not fetch latest release: {exc}"}
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        archive_path = str(Path(tmp_dir) / "release.tar.gz")
-        try:
-            response = requests.get(release["tarball_url"], timeout=60)
-            response.raise_for_status()
-            Path(archive_path).write_bytes(response.content)
-        except Exception as exc:
-            return {"status": "error", "detail": f"could not download release archive: {exc}"}
+        repo = state.config.get("update", {}).get("releases_repo", "")
+        if not repo:
+            return {"status": "error", "detail": "update.releases_repo not configured"}
 
         try:
-            extract_dir = str(Path(tmp_dir) / "extracted")
-            Path(extract_dir).mkdir()
-            extracted_root = extract_release_archive(archive_path, extract_dir)
+            release = fetch_latest_release(repo)
         except Exception as exc:
-            return {"status": "error", "detail": f"could not extract release archive: {exc}"}
+            return {"status": "error", "detail": f"could not fetch latest release: {exc}"}
 
-        old_requirements_path = Path(_INSTALL_ROOT) / "requirements.txt"
-        old_requirements = (
-            old_requirements_path.read_text() if old_requirements_path.exists() else ""
-        )
-        new_requirements_path = Path(extracted_root) / "requirements.txt"
-        new_requirements = (
-            new_requirements_path.read_text() if new_requirements_path.exists() else old_requirements
-        )
-        needs_pip_install = requirements_changed(old_requirements, new_requirements)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive_path = str(Path(tmp_dir) / "release.tar.gz")
+            try:
+                response = requests.get(release["tarball_url"], timeout=60)
+                response.raise_for_status()
+                Path(archive_path).write_bytes(response.content)
+            except Exception as exc:
+                return {"status": "error", "detail": f"could not download release archive: {exc}"}
 
-        copy_updatable_files(extracted_root, _INSTALL_ROOT)
+            try:
+                extract_dir = str(Path(tmp_dir) / "extracted")
+                Path(extract_dir).mkdir()
+                extracted_root = extract_release_archive(archive_path, extract_dir)
+            except Exception as exc:
+                return {"status": "error", "detail": f"could not extract release archive: {exc}"}
 
-        if needs_pip_install:
-            pip_result = subprocess.run(
-                ["pip", "install", "-r", "requirements.txt"],
-                cwd=_INSTALL_ROOT,
-                capture_output=True,
-                text=True,
+            old_requirements_path = Path(_INSTALL_ROOT) / "requirements.txt"
+            old_requirements = (
+                old_requirements_path.read_text() if old_requirements_path.exists() else ""
             )
-            if pip_result.returncode != 0:
-                return {
-                    "status": "error",
-                    "detail": f"pip install failed, service NOT restarted: {pip_result.stderr}",
-                }
+            new_requirements_path = Path(extracted_root) / "requirements.txt"
+            new_requirements = (
+                new_requirements_path.read_text() if new_requirements_path.exists() else old_requirements
+            )
+            needs_pip_install = requirements_changed(old_requirements, new_requirements)
 
-        write_local_version(_VERSION_FILE_PATH, release["tag_name"])
+            copy_updatable_files(extracted_root, _INSTALL_ROOT)
 
-    threading.Thread(target=_restart_service_after_delay, daemon=True).start()
+            if needs_pip_install:
+                pip_result = subprocess.run(
+                    ["pip", "install", "-r", "requirements.txt"],
+                    cwd=_INSTALL_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if pip_result.returncode != 0:
+                    return {
+                        "status": "error",
+                        "detail": f"pip install failed, service NOT restarted: {pip_result.stderr}",
+                    }
 
-    return {"status": "applying", "target_version": release["tag_name"]}
+            write_local_version(_VERSION_FILE_PATH, release["tag_name"])
+
+        threading.Thread(target=_restart_service_after_delay, daemon=True).start()
+
+        return {"status": "applying", "target_version": release["tag_name"]}
+    finally:
+        state._apply_update_in_progress = False
 
 
 def _chart_price_history(nm: dict) -> list:
