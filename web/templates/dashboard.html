@@ -3063,13 +3063,16 @@ function renderTodayScanGrid(data) {
       'No scan rejects yet today — populated after the next pre-open universe scan.</div>';
     return;
   }
+  // Matches On Deck's own _sigMap exactly (2026-08-12, owner request: "the on shore
+  // still has the buy, no action hold little icons in it.. that should be treated the
+  // same way as on deck") -- only BUY/STRONG BUY ever produce a visible badge, same as
+  // On Deck; Hold/Sell/Strong Sell/No Action all fall through to the blank default,
+  // where On Deck's own signal set never included them in the first place. Previously
+  // On Shore had a much wider map showing all six signals, plus a literal "N/A" text
+  // fallback for anything unrecognized.
   const _sigMap = {
     'STRONG BUY': ['sig-sbuy', 'Strong Buy'],
     'BUY':        ['sig-buy',  'Buy'],
-    'HOLD':       ['sig-hold', 'Hold'],
-    'SELL':       ['sig-sell', 'Sell'],
-    'STRONG SELL':['sig-ssell','Strong Sell'],
-    'NO ACTION':  ['sig-na',   'No Action'],
   };
   const renderCard = (r) => {
     const requiredRR = r.required_rr != null ? r.required_rr : _MIN_RR_GATE;
@@ -3077,14 +3080,10 @@ function renderTodayScanGrid(data) {
     // 2026-08-11 fix + comment on the On Deck card above.
     const rrColor = _rrInQualifyingRange(r.rr, requiredRR) ? 'var(--green)' : 'var(--text-primary)';
     const convColor = (r.conviction_score || 0) >= _MIN_CONVICTION_GATE ? 'var(--green)' : 'var(--text-primary)';
-    // Same "not really a buy yet" fix as the On Deck card above -- only suppresses a
-    // BUY/STRONG BUY badge specifically when R/R hasn't reached its own gate; Hold/Sell/
-    // No Action badges aren't making that claim, so they're shown regardless.
-    const isBuySignal = r.signal === 'BUY' || r.signal === 'STRONG BUY';
+    // Same "not really a buy yet" fix as the On Deck card above -- badge only shows once
+    // R/R has actually reached its own gate.
     const rrClearedGate = (r.rr || 0) >= requiredRR;
-    const [sigClass, sigLabel] = (isBuySignal && !rrClearedGate)
-      ? ['sig-none', '']
-      : (_sigMap[r.signal] || ['sig-na', r.signal || 'N/A']);
+    const [sigClass, sigLabel] = rrClearedGate ? (_sigMap[r.signal] || ['sig-none', '']) : ['sig-none', ''];
     const priceStr = r.last_price ? `$${r.last_price.toFixed(2)}` : '';
     const fv = r.fair_value_estimate || 0;
     const mos = r.margin_of_safety_pct || 0;

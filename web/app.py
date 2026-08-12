@@ -7713,9 +7713,11 @@ async def get_today_scan_rejects():
 
     Computes rr/required_rr fresh here (not stored — these reports never went through
     _build_on_deck_entry/_passes_on_deck_rr_gate since they were rejected before reaching
-    that step) so
-    the tab can sort by the same composite score used for ranking everywhere else in the app,
-    per explicit request.
+    that step) so the tab can sort by the same tiered (is_buy_eligible, composite_score)
+    key used for ranking everywhere else in the app (see _on_deck_ranking_key — fixed
+    2026-08-12, this endpoint originally sorted by the flat composite score alone, which
+    let a non-buy-eligible candidate with an inflated R/R outlier top the list ahead of
+    genuinely strong ones; see docs/CLAUDE_HISTORY.md's 2026-08-12 COTY entry).
 
     R/R uses a LIVE price (2026-07-19 follow-up), not the frozen entry_price from whenever
     this morning's scan happened to analyze this ticker — same free (yfinance, no Claude)
@@ -7810,11 +7812,23 @@ async def get_today_scan_rejects():
             "rr_sparkline": rr_sparkline(histories.get(ticker, []), fair_value, stop_pct),
             "_score": score,
         }
-    # Sorted by conviction first, R/R-above-gate second (2026-07-19, per explicit request) —
-    # same composite score used for ranking everywhere else in the app, so this list reads
-    # consistently with On Deck's own sort order. rank added post-sort for the frontend's
-    # #N badge, matching On Deck's card numbering.
-    ranked = sorted(result.items(), key=lambda kv: kv[1]["_score"], reverse=True)
+    # Sorted by the same tiered (is_buy_eligible, composite_score) key On Deck's own
+    # ranking uses (fixed 2026-08-12, COTY incident — conviction 3.2, signal NO ACTION,
+    # but an inflated R/R of 12.00 from a tight stop against a big fair-value gap put it
+    # at #1 on this list under the old flat-_score sort, ahead of genuinely strong,
+    # buy-eligible candidates). _on_deck_ranking_key ranks every buy-eligible candidate
+    # ahead of every non-eligible one regardless of composite score, falling back to the
+    # flat score only to break ties within the same tier — same fix already applied to
+    # every On Deck ranking site (_on_deck_ranking_key's docstring, 2026-07-31). rank
+    # added post-sort for the frontend's #N badge, matching On Deck's card numbering.
+    ranked = sorted(
+        result.items(),
+        key=lambda kv: _on_deck_ranking_key(
+            kv[1]["conviction_score"], kv[1]["margin_of_safety_pct"],
+            kv[1]["rr"], kv[1]["required_rr"], min_conviction,
+        ),
+        reverse=True,
+    )
     for i, (_ticker, entry) in enumerate(ranked):
         entry["rank"] = i + 1
     return dict(ranked)
