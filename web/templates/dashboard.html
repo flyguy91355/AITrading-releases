@@ -432,8 +432,9 @@ tbody tr:hover { background: var(--bg-card-hover); }
    clamped to 2 lines rather than a single truncated line, since it's genuinely useful
    context worth a bit of wrapping room, not just a label. */
 .btn-thesis {
-  font-size: 10.5px;
-  line-height: 1.35;
+  font-size: 11px; /* was 10.5px -- bumped 2026-08-12, owner request, same day as the
+    card layout rework freed up room for it in .btn-desc-block */
+  line-height: 1.3;
   color: var(--text-secondary);
   flex: none;
   display: -webkit-box;
@@ -448,8 +449,8 @@ tbody tr:hover { background: var(--bg-card-hover); }
    blurb, not the main text on the card, just enough room to actually show the full 1-2
    sentences the AI prompt asks for. */
 .btn-business {
-  font-size: 10.5px;
-  line-height: 1.3;
+  font-size: 11px; /* was 10.5px -- see .btn-thesis's matching 2026-08-12 note above */
+  line-height: 1.25;
   color: var(--text-muted);
   font-style: italic;
   flex: none;
@@ -481,13 +482,26 @@ tbody tr:hover { background: var(--bg-card-hover); }
    business description + thesis moved down together (both are "about this company" text,
    now grouped); Conv/R/R stacked vertically under the ticker instead of one wide line,
    freeing the horizontal room the chart box now uses. Nothing removed -- every existing
-   piece (signal badge, need-RR text, meta lines, dip summary) just relocated. */
-.btn-conv-rr-stack { display: flex; flex-direction: column; gap: 0; margin-top: 2px; }
+   piece (signal badge, need-RR text, meta lines, dip summary) just relocated.
+   Signal badge + "need >=" text moved a second time, same day (owner: "if you put the
+   buy somewhere else you can have more company info area. put it just to the right of
+   the con/r/r") -- out of .btn-side-col (where it stacked below the chart, forcing
+   .btn-header's row height to fit chart+caption+badge+need-text all stacked) into a new
+   .btn-conv-sig-row beside .btn-conv-rr-stack instead. This didn't just move the badge:
+   since .btn-side-col's own height sets .btn-header's row height (align-items:
+   flex-start, whichever side is taller wins), removing 3 stacked elements' worth of
+   height from .btn-side-col let the chart box itself grow taller (64px -> 96px) without
+   pushing into the business/thesis text below -- .btn-info's own height barely changed,
+   since the badge now sits BESIDE the 2-line Conv/R/R stack at the same height, not as
+   an extra row. */
+.btn-conv-sig-row { display: flex; align-items: flex-start; gap: 14px; margin-top: 2px; }
+.btn-conv-rr-stack { display: flex; flex-direction: column; gap: 0; }
+.btn-sig-stack { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
 .btn-side-col {
   display: flex; flex-direction: column; align-items: flex-end; gap: 3px;
-  flex-shrink: 0; width: 100px;
+  flex-shrink: 0; width: 150px;
 }
-.btn-chart-box { width: 100%; height: 64px; border-radius: 3px; overflow: hidden; display: flex; align-items: stretch; }
+.btn-chart-box { width: 100%; height: 96px; border-radius: 3px; overflow: hidden; display: flex; align-items: stretch; }
 .btn-chart-box svg { width: 100%; height: 100%; display: block; }
 .btn-chart-box-caption { flex-shrink: 0; font-size: 7.5px; color: var(--text-muted); text-align: center; width: 100%; }
 .btn-desc-block { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 4px; overflow: hidden; padding-top: 2px; }
@@ -2959,7 +2973,16 @@ function renderNearMissGrid(data) {
     const streakStr = (nm.streak || 0) >= 2
       ? ` <span style="color:${nm.direction === 'up' ? 'var(--green)' : 'var(--red)'};font-size:10px;">×${nm.streak}</span>`
       : '';
-    const [sigClass, sigLabel] = _sigMap[nm.signal] || ['sig-none', ''];
+    // Badge only shows once R/R has actually risen to/above its own gate (2026-08-12,
+    // owner: "its not really a buy at that point... invisiable until the stock climbs
+    // up over the gate") -- nm.signal is Claude's own conviction-based BUY/STRONG BUY
+    // call, computed independently of the R/R gate this whole On Deck list exists
+    // because of. Showing it unconditionally read as "this should already be bought"
+    // for a candidate the system won't actually promote yet. sig-none (transparent,
+    // same slot) hides it without disturbing layout; "need >=X.XX" stays visible
+    // either way so the gap to a real buy is still shown.
+    const rrClearedGate = (nm.rr || 0) >= requiredRR;
+    const [sigClass, sigLabel] = rrClearedGate ? (_sigMap[nm.signal] || ['sig-none', '']) : ['sig-none', ''];
     const addedMs = nm.added_at ? new Date(nm.added_at).getTime() : 0;
     // "NEW" badge dropped (2026-08-12, owner request) -- with how often On Deck now
     // churns, nearly every card qualified as "added within 24h" anyway, so the badge had
@@ -2978,9 +3001,15 @@ function renderNearMissGrid(data) {
             <span class="btn-ticker">${nm.ticker}</span>
             <span class="btn-name">${nm.company_name || ''}</span>
           </span>
-          <span class="btn-conv-rr-stack">
-            <span style="font-size:13px;font-weight:700;color:${convColor};">Conv ${nm.conviction_score}/10</span>
-            <span class="btn-rr-badge" style="font-size:13px;font-weight:700;color:${rrColor};">R/R ${(nm.rr||0).toFixed(2)}</span>
+          <span class="btn-conv-sig-row">
+            <span class="btn-conv-rr-stack">
+              <span style="font-size:13px;font-weight:700;color:${convColor};">Conv ${nm.conviction_score}/10</span>
+              <span class="btn-rr-badge" style="font-size:13px;font-weight:700;color:${rrColor};">R/R ${(nm.rr||0).toFixed(2)}</span>
+            </span>
+            <span class="btn-sig-stack">
+              <span class="btn-sig-code ${sigClass}">${sigLabel}</span>
+              <span style="font-size:9px;color:var(--text-muted);">need ≥${requiredRR.toFixed(2)}</span>
+            </span>
           </span>
           <span class="btn-meta">${dirArrow}$${(nm.last_price||0).toFixed(2)}${streakStr}</span>
           <span class="btn-meta-wrap">${[nm.sector, fvStr, addedStr].filter(Boolean).join(' · ')}</span>
@@ -2988,8 +3017,6 @@ function renderNearMissGrid(data) {
         <span class="btn-side-col">
           <span class="btn-chart-box" id="rrspark-${nm.ticker}"></span>
           <span class="btn-chart-box-caption">${dateRangeCaption(nm.rr_sparkline)}</span>
-          <span class="btn-sig-code ${sigClass}">${sigLabel}</span>
-          <span style="font-size:9px;color:var(--text-muted);">need ≥${requiredRR.toFixed(2)}</span>
         </span>
       </span>
       <span class="btn-desc-block">
@@ -3050,7 +3077,14 @@ function renderTodayScanGrid(data) {
     // 2026-08-11 fix + comment on the On Deck card above.
     const rrColor = _rrInQualifyingRange(r.rr, requiredRR) ? 'var(--green)' : 'var(--text-primary)';
     const convColor = (r.conviction_score || 0) >= _MIN_CONVICTION_GATE ? 'var(--green)' : 'var(--text-primary)';
-    const [sigClass, sigLabel] = _sigMap[r.signal] || ['sig-na', r.signal || 'N/A'];
+    // Same "not really a buy yet" fix as the On Deck card above -- only suppresses a
+    // BUY/STRONG BUY badge specifically when R/R hasn't reached its own gate; Hold/Sell/
+    // No Action badges aren't making that claim, so they're shown regardless.
+    const isBuySignal = r.signal === 'BUY' || r.signal === 'STRONG BUY';
+    const rrClearedGate = (r.rr || 0) >= requiredRR;
+    const [sigClass, sigLabel] = (isBuySignal && !rrClearedGate)
+      ? ['sig-none', '']
+      : (_sigMap[r.signal] || ['sig-na', r.signal || 'N/A']);
     const priceStr = r.last_price ? `$${r.last_price.toFixed(2)}` : '';
     const fv = r.fair_value_estimate || 0;
     const mos = r.margin_of_safety_pct || 0;
@@ -3064,9 +3098,15 @@ function renderTodayScanGrid(data) {
             <span class="btn-ticker">${r.ticker}</span>
             <span class="btn-name">${r.company_name || ''}</span>
           </span>
-          <span class="btn-conv-rr-stack">
-            <span style="font-size:13px;font-weight:700;color:${convColor};">Conv ${r.conviction_score}/10</span>
-            <span style="font-size:13px;font-weight:700;color:${rrColor};">R/R ${(r.rr||0).toFixed(2)}</span>
+          <span class="btn-conv-sig-row">
+            <span class="btn-conv-rr-stack">
+              <span style="font-size:13px;font-weight:700;color:${convColor};">Conv ${r.conviction_score}/10</span>
+              <span style="font-size:13px;font-weight:700;color:${rrColor};">R/R ${(r.rr||0).toFixed(2)}</span>
+            </span>
+            <span class="btn-sig-stack">
+              <span class="btn-sig-code ${sigClass}">${sigLabel}</span>
+              <span style="font-size:9px;color:var(--text-muted);">need ≥${requiredRR.toFixed(2)}</span>
+            </span>
           </span>
           <span class="btn-meta">${metaStr}</span>
           <span class="btn-meta-wrap">${fvStr}</span>
@@ -3074,8 +3114,6 @@ function renderTodayScanGrid(data) {
         <span class="btn-side-col">
           <span class="btn-chart-box" id="rrspark-${r.ticker}"></span>
           <span class="btn-chart-box-caption">${dateRangeCaption(r.rr_sparkline)}</span>
-          <span class="btn-sig-code ${sigClass}">${sigLabel}</span>
-          <span style="font-size:9px;color:var(--text-muted);">need ≥${requiredRR.toFixed(2)}</span>
         </span>
       </span>
       <span class="btn-desc-block">
