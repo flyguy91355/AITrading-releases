@@ -557,12 +557,28 @@ def _on_deck_composite_score(
 ) -> float:
     """The valuation/R/R-aware composite score used to rank On Deck and On Shore
     candidates against each other (2026-07-31) -- conviction plus a margin-of-safety
-    and R/R-above-gate bonus. Extracted so DashboardState._on_deck_candidate_score and
+    and R/R-vs-gate bonus. Extracted so DashboardState._on_deck_candidate_score and
     _backfill_on_deck_from_on_shore's local _shore_score share one formula instead of
     each maintaining their own copy that could drift -- the exact failure class the
     XRAY population-floor incident (above) was caused by, just in the composite-score
-    formula instead of the population floor."""
-    return conviction + margin_of_safety_pct / 10 + (rr - required_rr) * 2
+    formula instead of the population floor.
+
+    The (rr - required_rr) term is capped at 0 once rr clears required_rr (fixed
+    2026-08-12, OKE/BMY incident) -- previously uncapped, so a candidate far above its
+    own gate (rr=2.43 vs. required 2.04, say) scored unboundedly higher the further
+    above it sat, purely from valuation math, ahead of a candidate still genuinely in
+    the qualifying watch range working toward its gate. This contradicted this
+    project's own established stance elsewhere that "above the gate" is ambiguous, not
+    simply better -- see _on_deck_rr_above_gate and the "AI is for a stock that has
+    risen up past the gate" judgment-call design a few sections up in CLAUDE.md's
+    On Deck Buy Pipeline section. Reaching the gate is now this score's ceiling for
+    the R/R term; a candidate already past it gets no further bonus for having run
+    even further, so ranking among already-qualified candidates falls to conviction
+    and margin of safety instead of an unbounded R/R blowout. Below the gate, the
+    term is unchanged (still a real, uncapped penalty -- further below the gate is
+    still genuinely worse)."""
+    rr_vs_gate = min(rr - required_rr, 0.0)
+    return conviction + margin_of_safety_pct / 10 + rr_vs_gate * 2
 
 
 def _on_deck_ranking_key(

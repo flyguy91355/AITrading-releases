@@ -1749,7 +1749,17 @@ function renderLightweightChart(container, seriesConfigs, opts) {
     };
     let s;
     if (cfg.type === 'area') {
+      // Area series has no `color` option -- Lightweight Charts uses `lineColor` for
+      // an area series' stroke (only plain Line series uses `color`). seriesOpts.color
+      // above was always silently ignored here, so every area-series line (R/R
+      // sparklines on On Deck/On Shore, the compact/expanded R/R charts, the Portfolio
+      // Value modal's dollar-value series) rendered the library's own default line
+      // color regardless of the real gate-clearing/theme color computed for it -- only
+      // the fill (topColor, correctly wired) ever reflected it. Fixed 2026-08-12,
+      // caught by the owner asking what the chart's colored shadows meant, since the
+      // line itself was never actually meaningful.
       s = chart.addAreaSeries(Object.assign({}, seriesOpts, {
+        lineColor: cfg.lineColor || cfg.color,
         topColor: cfg.topColor || cfg.color,
         bottomColor: cfg.bottomColor || 'transparent',
       }));
