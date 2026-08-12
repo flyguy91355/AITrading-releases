@@ -1,0 +1,57 @@
+# AITrading — pinned requirements from verified working environment
+# Python 3.12 required
+# To install: pip install -r requirements.txt
+
+# AI Engine
+anthropic==0.111.0
+
+# Market Data
+yfinance==0.2.58
+
+# Broker SDKs
+alpaca-trade-api==3.2.0
+websockets==10.4       # alpaca-trade-api 3.2.0 breaks with websockets>=11
+websocket-client==1.9.0
+robin_stocks==3.4.0
+
+# Dashboard
+fastapi==0.137.2
+uvicorn==0.49.0
+jinja2==3.1.6
+
+# Data / numerics
+numpy==2.4.6
+pandas==3.0.3
+
+# HTTP
+httpx==0.28.1
+aiohttp==3.14.1
+
+# Configuration
+PyYAML==6.0.1
+python-dotenv==1.2.2
+
+# Auth (Starlette SessionMiddleware, dashboard login gate)
+itsdangerous==2.2.0
+python-multipart==0.0.32
+
+# Database
+aiosqlite==0.22.1
+
+# Dependency of alpaca-trade-api — pin to 1.x; 2.x is a breaking change
+urllib3==1.26.20
+
+# PDF generation (optional — for USER_MANUAL.pdf)
+markdown==3.10.2
+weasyprint==69.0
+
+# Testing
+pytest==9.1.1
+pytest-asyncio==1.4.0
+
+# Other runtime deps (pulled in transitively — pin for reproducibility)
+pydantic==2.13.4
+starlette==1.3.1
+requests==2.34.2
+lxml==6.1.1
+html5lib==1.1     # required by pandas.read_html for Nasdaq 100 universe fetch

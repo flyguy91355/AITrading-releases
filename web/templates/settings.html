@@ -1,0 +1,1598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hilton's AITrading — Settings</title>
+<script>
+// Per-device theme (2026-07-28) -- see dashboard.html's identical inline script for the
+// full rationale. Runs before <style> is parsed to avoid a flash of the wrong theme.
+(function() {
+  const stored = localStorage.getItem('theme');
+  const theme = stored || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  document.documentElement.setAttribute('data-theme', theme);
+})();
+</script>
+<style>
+:root {
+  --bg-primary: #0a0e17;
+  --bg-secondary: #111827;
+  --bg-card: #1a2332;
+  --bg-input: #0d1421;
+  --border: #2a3a4e;
+  --border-light: #374151;
+  --text-primary: #e5e7eb;
+  --text-secondary: #9ca3af;
+  --text-muted: #6b7280;
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --green: #10b981;
+  --red: #ef4444;
+  --yellow: #f59e0b;
+  --cyan: #06b6d4;
+}
+/* Light theme (2026-07-28) -- see dashboard.html's identical override block for the
+   rationale; this is the same palette applied to this page's (smaller) variable set. */
+:root[data-theme="light"] {
+  --bg-primary: #f3f5f8;
+  --bg-secondary: #ffffff;
+  --bg-card: #ffffff;
+  --bg-input: #ffffff;
+  --border: #d8dee6;
+  --border-light: #c5ccd6;
+  --text-primary: #10151f;
+  --text-secondary: #4b5563;
+  --text-muted: #6b7280;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --green: #059669;
+  --red: #dc2626;
+  --yellow: #b45309;
+  --cyan: #0891b2;
+}
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.5;
+  min-height: 100vh;
+}
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 24px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  height: 56px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.logo {
+  font-size: 20px;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--accent), var(--cyan));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.back-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: none;
+  transition: border-color 0.2s, color 0.2s;
+}
+.back-btn:hover { border-color: var(--accent); color: var(--text-primary); }
+
+.page {
+  max-width: 760px;
+  margin: 32px auto;
+  padding: 0 24px 60px;
+}
+h1 {
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.subtitle { font-size: 13px; color: var(--text-muted); margin-bottom: 32px; }
+
+.section {
+  margin-bottom: 32px;
+}
+.section-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-grid {
+  display: grid;
+  gap: 2px;
+}
+.setting-row {
+  display: grid;
+  grid-template-columns: 1fr 120px 90px;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+.setting-row:hover { background: var(--bg-card); }
+.setting-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.setting-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.setting-input {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  transition: border-color 0.15s;
+  -moz-appearance: textfield;
+}
+.setting-input:focus { outline: none; border-color: var(--accent); }
+.setting-input::-webkit-inner-spin-button { -webkit-appearance: none; }
+.setting-input.changed { border-color: var(--yellow); }
+select.setting-input { text-align: left; cursor: pointer; }
+input[type=time].setting-input { font-family: monospace; }
+.default-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+}
+.default-val {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+/* Info button */
+.info-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: transparent;
+  border: 1px solid var(--yellow);
+  color: var(--yellow);
+  font-size: 9px;
+  font-style: italic;
+  font-weight: 700;
+  cursor: pointer;
+  flex-shrink: 0;
+  user-select: none;
+  line-height: 1;
+}
+.info-btn:hover { border-color: #fcd34d; color: #fcd34d; }
+#info-popup {
+  display: none;
+  position: fixed;
+  z-index: 500;
+  background: var(--bg-card);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 12px 14px;
+  max-width: 300px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+  pointer-events: none;
+}
+#info-popup.active { display: block; }
+
+#keys-grid .setting-row { grid-template-columns: 1fr auto auto; gap: 12px; align-items: center; }
+.key-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.65); z-index:2000; align-items:center; justify-content:center; }
+.key-modal-overlay.active { display:flex; }
+.key-modal { background:var(--bg-card); border:1px solid var(--accent); border-radius:10px; padding:22px 24px; width:480px; max-width:92vw; }
+.key-modal h3 { margin:0 0 16px; font-size:14px; color:var(--text-primary); }
+.key-modal label { display:block; font-size:11px; color:var(--text-muted); margin-bottom:4px; }
+.key-modal input[type=text] { width:100%; box-sizing:border-box; font-family:monospace; font-size:12px; background:var(--bg-input); border:1px solid var(--border); border-radius:6px; padding:8px 10px; color:var(--text-primary); margin-bottom:14px; }
+.key-modal-btns { display:flex; gap:8px; justify-content:flex-end; margin-top:4px; }
+
+.footer-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  padding: 14px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+.save-btn {
+  padding: 8px 28px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.save-btn:hover { background: var(--accent-hover); }
+.save-btn:disabled { background: var(--border); color: var(--text-muted); cursor: not-allowed; }
+.theme-toggle { display: flex; gap: 6px; }
+.theme-toggle-btn {
+  padding: 7px 16px;
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.theme-toggle-btn:hover { border-color: var(--accent); }
+.theme-toggle-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.reset-btn {
+  padding: 8px 18px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s;
+}
+.reset-btn:hover { border-color: var(--border-light); color: var(--text-primary); }
+
+.toast {
+  position: fixed;
+  top: 72px;
+  right: 24px;
+  padding: 10px 20px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  opacity: 0;
+  transition: opacity 0.3s;
+  pointer-events: none;
+  z-index: 100;
+}
+.toast.show { opacity: 1; }
+.toast.success { background: rgba(16,185,129,0.2); border: 1px solid rgba(16,185,129,0.5); color: #10b981; }
+.toast.error   { background: rgba(239,68,68,0.2);  border: 1px solid rgba(239,68,68,0.5);  color: #ef4444; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">Hilton's AITrading</div>
+  <a href="/" class="back-btn">← Back to Dashboard</a>
+</div>
+
+<div id="info-popup"></div>
+
+<div class="page">
+  <h1>Configuration</h1>
+  <p class="subtitle">Changes are saved to <code>settings.yaml</code> and take effect immediately.</p>
+
+  <!-- DISPLAY (2026-07-28) -- deliberately NOT part of settings.yaml/Save Settings below:
+       theme is a per-device preference (localStorage), not a system-wide trading setting,
+       so it applies the instant you click it, with no Save step. -->
+  <div class="section">
+    <div class="section-title">Display</div>
+    <div class="settings-grid">
+      <div class="setting-row" style="grid-template-columns: 1fr auto;">
+        <div>
+          <div class="setting-label">Theme</div>
+          <div class="setting-desc">This device only — applies instantly, no Save needed. New devices follow their own OS/browser light-or-dark setting until toggled here.</div>
+        </div>
+        <div class="theme-toggle">
+          <button type="button" class="theme-toggle-btn" id="themeBtnDark" onclick="setTheme('dark')">🌙 Dark</button>
+          <button type="button" class="theme-toggle-btn" id="themeBtnLight" onclick="setTheme('light')">☀️ Light</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PORTFOLIO -->
+  <div class="section">
+    <div class="section-title">Portfolio</div>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Max Positions <button type="button" class="info-btn" onclick="showInfo(event,'A sizing guideline for the live buy pipeline, not a hard cap -- the real gate on new buys is cash above the reserve floor. Since staged take-profits free cash from a winning position without closing it, the actual number of open positions can end up either lower (cash-constrained) or higher (cash-funded past this number) than this setting. Too many positions dilutes returns and makes monitoring harder; too few concentrates risk.')">i</button></div>
+          <div class="setting-desc">Sizing guideline for new positions — actual count can run lower or higher</div>
+        </div>
+        <input type="number" class="setting-input" name="portfolio.max_positions"
+               value="{{ cfg.portfolio.max_positions }}" min="1" max="50">
+        <div class="default-label">default<br><span class="default-val">15</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Initial Capital ($) <button type="button" class="info-btn" onclick="showInfo(event,'Your starting portfolio value in dollars. Used as the baseline for P&amp;L percentage calculations, drawdown thresholds, and position sizing math. This does not control available cash — that comes from your live Alpaca account balance. Update this if you fund or withdraw from the account.')">i</button></div>
+          <div class="setting-desc">Starting portfolio value used for P&amp;L and drawdown calculations</div>
+        </div>
+        <input type="number" class="setting-input" name="portfolio.initial_capital"
+               value="{{ cfg.portfolio.initial_capital }}" min="100" step="100">
+        <div class="default-label">default<br><span class="default-val">$10,000</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RISK MANAGEMENT -->
+  <div class="section">
+    <div class="section-title">Risk Management</div>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Max Position Size % <button type="button" class="info-btn" onclick="showInfo(event,'The largest a single stock position can grow to as a percentage of total portfolio value. Prevents overconcentration in any one name. Positions that grow through gains are not automatically trimmed — this cap applies to new buys only.')">i</button></div>
+          <div class="setting-desc">Largest a single position can grow to as % of portfolio</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.max_position_pct"
+               value="{{ cfg.risk_management.max_position_pct }}" min="1" max="50" step="0.5">
+        <div class="default-label">default<br><span class="default-val">7.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Starting Position Size % <button type="button" class="info-btn" onclick="showInfo(event,'The initial allocation when a new position is opened, as a percentage of total portfolio value. Typically set lower than Max Position Size to leave room to add to winners. Final size is also constrained by Max Loss Per Trade — whichever gives the smaller position wins.')">i</button></div>
+          <div class="setting-desc">Initial allocation when a new position is opened</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.starting_position_pct"
+               value="{{ cfg.risk_management.starting_position_pct }}" min="1" max="20" step="0.5">
+        <div class="default-label">default<br><span class="default-val">3.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Min Cash Reserve % <button type="button" class="info-btn" onclick="showInfo(event,'The system will not place a buy order if doing so would push available cash below this percentage of total portfolio value. Acts as a safety buffer for drawdowns, unexpected margin calls, and future opportunities. Temporarily set to 10% during position rebalancing.')">i</button></div>
+          <div class="setting-desc">Minimum cash kept out of positions at all times</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.min_cash_reserve_pct"
+               value="{{ cfg.risk_management.min_cash_reserve_pct }}" min="0" max="80" step="1">
+        <div class="default-label">default<br><span class="default-val">2%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Daily Loss Limit % <button type="button" class="info-btn" onclick="showInfo(event,'If the portfolio drops more than this percentage from its value at the start of today, all auto-buying halts for the rest of the trading day. This is a same-day protection — it resets each morning. Protects against runaway losses on high-volatility days.')">i</button></div>
+          <div class="setting-desc">Halt trading if portfolio drops this % in one day</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.daily_loss_limit_pct"
+               value="{{ cfg.risk_management.daily_loss_limit_pct }}" min="0.5" max="10" step="0.5">
+        <div class="default-label">default<br><span class="default-val">2.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Max Loss Per Trade % <button type="button" class="info-btn" onclick="showInfo(event,'The maximum dollar loss you are willing to accept on a single trade, expressed as a percentage of total portfolio. Combined with the stop-loss distance to calculate how many shares to buy — a tighter stop allows a larger position, a wider stop forces a smaller one. This is the primary position-sizing constraint.')">i</button></div>
+          <div class="setting-desc">Maximum portfolio risk allowed on a single trade</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.max_loss_per_trade_pct"
+               value="{{ cfg.risk_management.max_loss_per_trade_pct }}" min="0.5" max="10" step="0.5">
+        <div class="default-label">default<br><span class="default-val">2.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Sector Concentration Limit <button type="button" class="info-btn" onclick="showInfo(event,'When enabled, a buy is blocked once the max sector positions count below is already held in that stock\'s sector. When disabled, buys are never blocked on sector concentration for any reason -- the Max Sector Positions field below has no effect while this is off.')">i</button></div>
+          <div class="setting-desc">Turn the sector concentration check on or off entirely</div>
+        </div>
+        <select class="setting-input" name="risk_management.sector_concentration_enabled">
+          <option value="true" {% if cfg.risk_management.sector_concentration_enabled %}selected{% endif %}>Enabled</option>
+          <option value="false" {% if not cfg.risk_management.sector_concentration_enabled %}selected{% endif %}>Disabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">On</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Max Sector Positions <button type="button" class="info-btn" onclick="showInfo(event,'Limits overconcentration in a single market sector (e.g., no more than 3 tech stocks open at once). Sector is determined by the stock classification returned during research. Helps avoid situations where a sector-wide event wipes out multiple positions simultaneously. Only applies while Sector Concentration Limit above is Enabled.')">i</button></div>
+          <div class="setting-desc">Maximum positions allowed in the same sector (only while enabled above)</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.max_sector_positions"
+               value="{{ cfg.risk_management.max_sector_positions }}" min="1" max="10">
+        <div class="default-label">default<br><span class="default-val">3</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Drawdown Halt % <button type="button" class="info-btn" onclick="showInfo(event,'If the portfolio has fallen this much from its all-time peak value (not just today), all new buying stops completely until the drawdown recovers. This is the most severe automated protection. Example: a 5% halt on a $10,000 portfolio triggers at $9,500 peak-to-trough.')">i</button></div>
+          <div class="setting-desc">Stop all buying if portfolio drawdown from peak exceeds this</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.drawdown_halt_pct"
+               value="{{ cfg.risk_management.drawdown_halt_pct }}" min="1" max="30" step="0.5">
+        <div class="default-label">default<br><span class="default-val">5.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Drawdown Defensive % <button type="button" class="info-btn" onclick="showInfo(event,'At this drawdown level (measured from portfolio peak), the system enters defensive mode: position sizes are reduced and the conviction threshold may be raised. Less severe than Halt — trading continues but more cautiously. Must be set higher than Halt % to take effect.')">i</button></div>
+          <div class="setting-desc">Enter defensive mode (smaller positions) at this drawdown level</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.drawdown_defensive_pct"
+               value="{{ cfg.risk_management.drawdown_defensive_pct }}" min="1" max="50" step="0.5">
+        <div class="default-label">default<br><span class="default-val">10.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Drawdown Exit Review % <button type="button" class="info-btn" onclick="showInfo(event,'At this drawdown level, all open positions are flagged for exit review — the system evaluates whether each should be closed to limit further losses. This is the most severe active threshold before a complete halt. Set higher than Defensive % but lower than Halt %.')">i</button></div>
+          <div class="setting-desc">Flag all positions for exit review at this drawdown level</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.drawdown_exit_review_pct"
+               value="{{ cfg.risk_management.drawdown_exit_review_pct }}" min="1" max="50" step="0.5">
+        <div class="default-label">default<br><span class="default-val">15.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Trailing Stop <button type="button" class="info-btn" onclick="showInfo(event,'When enabled, the stop-loss on profitable positions is automatically raised as the price moves up, locking in gains without selling too early. Uses Alpaca\'s native trailing stop order type. The stop follows the price up but never moves down. Disabling this leaves original stop-loss prices fixed for the life of the position.')">i</button></div>
+          <div class="setting-desc">Automatically raise stop loss as a position becomes profitable</div>
+        </div>
+        <select class="setting-input" name="risk_management.trailing_stop_enabled">
+          <option value="true" {% if cfg.risk_management.trailing_stop_enabled %}selected{% endif %}>Enabled</option>
+          <option value="false" {% if not cfg.risk_management.trailing_stop_enabled %}selected{% endif %}>Disabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">On</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Trailing Stop Follows T1/T2 <button type="button" class="info-btn" onclick="showInfo(event,'How the trailing-stop distance tightens as a position moves from entry toward T3. Straight Line draws one smooth curve from this stock\'s own stop-loss % down to the final-tranche trail %, ignoring T1/T2 as anything special. Follow T1/T2/T3 instead bends that same curve through T1 and T2 as checkpoints (trail width split evenly across all four points), so a position that reaches T1 quickly tightens its protection sooner, matching the profit it just locked in on that tranche. Either way the trail now arms the moment the position goes positive, and only ever ratchets up.')">i</button></div>
+          <div class="setting-desc">Bend the trailing-stop curve through T1/T2, or keep it a straight line to T3</div>
+        </div>
+        <select class="setting-input" name="risk_management.trailing_stop_follow_tp_targets">
+          <option value="false" {% if not cfg.risk_management.trailing_stop_follow_tp_targets %}selected{% endif %}>Straight Line</option>
+          <option value="true" {% if cfg.risk_management.trailing_stop_follow_tp_targets %}selected{% endif %}>Follow T1/T2/T3</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Straight Line</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Protection Gap Alert Delay (sec) <button type="button" class="info-btn" onclick="showInfo(event,'How long a missing or mispriced stop/take-profit order must stay continuously open before it shows as an urgent alert. The automatic fix attempt still runs every 10 seconds no matter what this is set to -- this only delays the visible warning, since most gaps are routine DAY-order renewals that self-correct in 10-20 seconds on their own.')">i</button></div>
+          <div class="setting-desc">Seconds a stop/TP gap must persist before it shows as an urgent alert</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.protection_gap_alert_delay_seconds"
+               value="{{ cfg.risk_management.protection_gap_alert_delay_seconds }}" min="0" max="300" step="5">
+        <div class="default-label">default<br><span class="default-val">30s</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAKE PROFIT / STOP LOSS -->
+  <div class="section">
+    <div class="section-title">Take Profit &amp; Stop Loss</div>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Stop Loss % <button type="button" class="info-btn" onclick="showInfo(event,'How far below the entry price the initial stop-loss order is placed, as a percentage. Example: 5% on a $100 entry puts the stop at $95. Every position must have a stop — the system will not open a trade without one. Used with Max Loss Per Trade to calculate position size.')">i</button></div>
+          <div class="setting-desc">Initial stop loss placed this far below entry price</div>
+        </div>
+        <input type="number" class="setting-input" name="take_profit.stop_loss_pct"
+               value="{{ cfg.take_profit.stop_loss_pct }}" min="1" max="20" step="0.5">
+        <div class="default-label">default<br><span class="default-val">5.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">AI-Chosen Stop-Loss/Take-Profit <button type="button" class="info-btn" onclick="showInfo(event,'When Enabled, Claude judges stop-loss and take-profit levels from real Support/Resistance/SMA/RSI data instead of applying the fixed percentages above. Applies to both new buys and every re-analysis of an already-held position -- on a held position, a re-analysis can only tighten the stop (move it closer to price), never widen it. Bounded by the Min/Max % below regardless.')">i</button></div>
+          <div class="setting-desc">Let Claude pick stop/TP from real technicals instead of the fixed %s above</div>
+        </div>
+        <select class="setting-input" name="research.ai_chosen_stop_tp_enabled">
+          <option value="false" {% if not cfg.research.ai_chosen_stop_tp_enabled %}selected{% endif %}>Disabled</option>
+          <option value="true" {% if cfg.research.ai_chosen_stop_tp_enabled %}selected{% endif %}>Enabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Off</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">AI Stop-Loss Min % <button type="button" class="info-btn" onclick="showInfo(event,'Only used when AI-Chosen Stop-Loss/Take-Profit above is Enabled. The tightest a Claude-chosen stop-loss is allowed to be, as a percentage below entry -- guards against a bad technical read producing a degenerate, too-tight stop.')">i</button></div>
+          <div class="setting-desc">Sanity floor for an AI-chosen stop (AI-chosen mode only)</div>
+        </div>
+        <input type="number" class="setting-input" name="research.ai_stop_loss_min_pct"
+               value="{{ cfg.research.ai_stop_loss_min_pct }}" min="0.5" max="20" step="0.5">
+        <div class="default-label">default<br><span class="default-val">2.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">AI Stop-Loss Max % <button type="button" class="info-btn" onclick="showInfo(event,'Only used when AI-Chosen Stop-Loss/Take-Profit above is Enabled. The widest a Claude-chosen stop-loss is allowed to be, as a percentage below entry -- guards against a bad technical read producing a degenerate, too-wide stop that blows past the intended risk-per-trade sizing.')">i</button></div>
+          <div class="setting-desc">Sanity ceiling for an AI-chosen stop (AI-chosen mode only)</div>
+        </div>
+        <input type="number" class="setting-input" name="research.ai_stop_loss_max_pct"
+               value="{{ cfg.research.ai_stop_loss_max_pct }}" min="1" max="30" step="0.5">
+        <div class="default-label">default<br><span class="default-val">10.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">T1 Target % <button type="button" class="info-btn" onclick="showInfo(event,'First take-profit level, as a percentage above entry price. When hit, one-third of the position is sold and the stop-loss is raised to breakeven. This triggers the staged exit system. Setting T1 too close to the stop creates a poor risk/reward ratio and may block trades from passing the R/R filter.')">i</button></div>
+          <div class="setting-desc">First take-profit — sell ⅓ here, raise stop to breakeven</div>
+        </div>
+        <input type="number" class="setting-input" name="take_profit.t1_pct"
+               value="{{ cfg.take_profit.t1_pct }}" min="1" max="30" step="0.5">
+        <div class="default-label">default<br><span class="default-val">5.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">T2 Target % <button type="button" class="info-btn" onclick="showInfo(event,'Second take-profit level. After T1 fills, the remaining two-thirds becomes one-third sold here and one-third held for T3. The stop-loss is raised again after T2 fills. Must be higher than T1.')">i</button></div>
+          <div class="setting-desc">Second take-profit — sell ⅓ here, raise stop again</div>
+        </div>
+        <input type="number" class="setting-input" name="take_profit.t2_pct"
+               value="{{ cfg.take_profit.t2_pct }}" min="1" max="50" step="0.5">
+        <div class="default-label">default<br><span class="default-val">7.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">T3 Reference % <button type="button" class="info-btn" onclick="showInfo(event,'No order is ever placed at this level — the last third of the position always rides on the trailing stop instead (see Final Tranche Trail % below). This price still marks the point where that trail tightens sharply, on the theory that gains beyond the original good-exit target are bonus territory worth protecting more closely. The risk/reward ratio filter is evaluated against the fair value estimate Claude computes, not this setting.')">i</button></div>
+          <div class="setting-desc">Reference level where the final-tranche trail tightens — no order placed here</div>
+        </div>
+        <input type="number" class="setting-input" name="take_profit.t3_pct"
+               value="{{ cfg.take_profit.t3_pct }}" min="1" max="100" step="0.5">
+        <div class="default-label">default<br><span class="default-val">9.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Final Tranche Trail % <button type="button" class="info-btn" onclick="showInfo(event,'How tightly the trailing stop follows price for the last third of a position once it has cleared the T3 reference level above. Much tighter than the standard 3% final-stage trail, since gains past that point are considered bonus territory worth protecting closely. A smaller number protects more of the gain but is more likely to close on ordinary noise; a larger number gives more room to breathe.')">i</button></div>
+          <div class="setting-desc">Tight trail once price clears the T3 reference level</div>
+        </div>
+        <input type="number" class="setting-input" name="take_profit.final_tranche_trail_pct"
+               value="{{ cfg.take_profit.final_tranche_trail_pct }}" min="0.1" max="10" step="0.1">
+        <div class="default-label">default<br><span class="default-val">0.5%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Dollar Profit Target <button type="button" class="info-btn" onclick="showInfo(event,'Once a position\'s lifetime $ profit (realized + unrealized) reaches this dollar amount, its trailing stop permanently switches from the normal graduated entry-to-T3 curve to a small fixed percentage (Profit Target Trail % below) -- catching a big run-up with a tight trail instead of waiting for the slower graduated curve to tighten on its own. This never fires an instant sell -- it only tightens the trailing stop, so the position keeps riding (and ratcheting) if price keeps climbing.')">i</button></div>
+          <div class="setting-desc">Tighten the trailing stop once lifetime profit hits this $ amount</div>
+        </div>
+        <select class="setting-input" name="take_profit.dollar_target_enabled">
+          <option value="false" {% if not cfg.take_profit.dollar_target_enabled %}selected{% endif %}>Disabled</option>
+          <option value="true" {% if cfg.take_profit.dollar_target_enabled %}selected{% endif %}>Enabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Off</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Profit Target Amount ($) <button type="button" class="info-btn" onclick="showInfo(event,'The lifetime $ profit threshold for the setting above. Only takes effect when Dollar Profit Target is Enabled.')">i</button></div>
+          <div class="setting-desc">Lifetime $ profit that triggers the tightened trail</div>
+        </div>
+        <input type="number" class="setting-input" name="take_profit.dollar_target_amount"
+               value="{{ cfg.take_profit.dollar_target_amount }}" min="1" max="100000" step="1">
+        <div class="default-label">default<br><span class="default-val">$30</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Profit Target Trail % <button type="button" class="info-btn" onclick="showInfo(event,'The tightened trailing-stop percentage used once the Dollar Profit Target above is hit. Smaller protects more of the gain but is more likely to close on ordinary noise.')">i</button></div>
+          <div class="setting-desc">Trail width used once the dollar profit target is hit</div>
+        </div>
+        <input type="number" class="setting-input" name="take_profit.dollar_target_trail_pct"
+               value="{{ cfg.take_profit.dollar_target_trail_pct }}" min="0.1" max="10" step="0.1">
+        <div class="default-label">default<br><span class="default-val">1.0%</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RESEARCH & SCANNING -->
+  <div class="section">
+    <div class="section-title">Research &amp; Scanning</div>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Min Conviction Score <button type="button" class="info-btn" onclick="showInfo(event,'Claude scores each stock from 1 to 10, in one-decimal precision (e.g. 7.3), based on technical setup, fundamentals, news sentiment, and insider activity. This is the real BUY gate -- a fresh re-analysis must clear this exact number to actually execute a purchase. Raise this to reduce trade frequency and increase selectivity. Lower it cautiously -- scores below 7 often indicate weak setups. See On Deck Conviction Watch Band below for tracking stocks that fall just short of this number instead of dropping them outright.')">i</button></div>
+          <div class="setting-desc">Claude must score a stock ≥ this (1–10, one decimal) to trigger a buy</div>
+        </div>
+        <input type="number" class="setting-input" name="research.min_conviction_score"
+               value="{{ cfg.research.min_conviction_score }}" min="1" max="10" step="0.1">
+        <div class="default-label">default<br><span class="default-val">6.8</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Conviction Watch Band <button type="button" class="info-btn" onclick="showInfo(event,'A stock scoring just below Min Conviction Score (within this many points) still gets added to On Deck and continuously watched/re-analyzed -- it just cannot actually be bought until a later fresh analysis pushes it back to or above the real entry gate. Expressed as a differential off Min Conviction Score rather than an independent number, so it automatically follows if that gate is ever changed. Example: gate 7.0, band 0.3 -> a 6.8 clears population but still cannot buy; a 6.7 does not even get tracked. Set to 0 to disable and require the full gate just to be tracked at all.')">i</button></div>
+          <div class="setting-desc">Track stocks scoring up to this far below the entry gate, without letting them buy</div>
+        </div>
+        <input type="number" class="setting-input" name="research.on_deck_conviction_band"
+               value="{{ cfg.research.on_deck_conviction_band }}" min="0" max="3" step="0.1">
+        <div class="default-label">default<br><span class="default-val">0.2</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Removal Conviction <button type="button" class="info-btn" onclick="showInfo(event,'A separate, much lower floor from Min Conviction Score above -- an On Deck candidate whose conviction decays below THIS number on a re-check gets swept off the list entirely, rather than just blocked from buying. Deliberately set well under the real entry gate: this is a \'this thesis has clearly fallen apart\' floor, not the normal admission bar the Watch Band above governs.')">i</button></div>
+          <div class="setting-desc">Conviction level below which an existing On Deck candidate is removed entirely</div>
+        </div>
+        <input type="number" class="setting-input" name="research.on_deck_removal_conviction"
+               value="{{ cfg.research.on_deck_removal_conviction }}" min="0" max="10" step="0.1">
+        <div class="default-label">default<br><span class="default-val">3</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Min Risk/Reward Ratio <button type="button" class="info-btn" onclick="showInfo(event,'The base minimum ratio of potential gain (fair value estimate) versus potential loss (to stop-loss) required to buy. This is the bar for a stock right at the conviction minimum -- see On Deck R/R Conviction Discount and Floor below for how higher-conviction stocks get a slightly lower bar instead of this same flat number for every stock.')">i</button></div>
+          <div class="setting-desc">Base reward-to-risk ratio required at the conviction minimum</div>
+        </div>
+        <input type="number" class="setting-input" name="research.min_risk_reward_ratio"
+               value="{{ cfg.research.min_risk_reward_ratio }}" min="1" max="10" step="0.1">
+        <div class="default-label">default<br><span class="default-val">2.1</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">R/R Floor Margin <button type="button" class="info-btn" onclick="showInfo(event,'A lower margin below EACH CANDIDATE\'S OWN real, conviction-scaled R/R gate (not a flat number) -- separate from Min Risk/Reward Ratio above (the real buy requirement itself). Floor = gate + this margin -- use a NEGATIVE number for a floor below gate (e.g. -0.4 excludes anything more than 0.4 below its own gate). A stock whose R/R is deeply below its own gate is unlikely to realistically close that gap and get bought, so it is just as pointless to track. There is no separate ceiling setting (removed 2026-08-05) -- a candidate above its own gate is judged individually by a real AI call (still a good buy, or has the ratio become inflated by continued decline?) instead of a flat margin. Leaving this blank disables the floor entirely (any R/R, however low, still gets tracked as long as conviction qualifies) -- not recommended now that floor-to-gate is the core admission range; a real negative number like the -0.4 default is what actually establishes that range\'s lower edge.')">i</button></div>
+          <div class="setting-desc">Exclude candidates whose R/R is below their own gate + this margin -- use a negative number for a floor below gate. Above the gate is judged per-candidate by AI, not a margin.</div>
+        </div>
+        <input type="number" class="setting-input" name="research.on_deck_rr_floor_margin"
+               value="{{ cfg.research.on_deck_rr_floor_margin if cfg.research.on_deck_rr_floor_margin is not none else '' }}"
+               min="-10" max="10" step="0.1" placeholder="-0.4">
+        <div class="default-label">default<br><span class="default-val">-0.4</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck R/R Conviction Discount <button type="button" class="info-btn" onclick="showInfo(event,'How much the required R/R drops for each conviction point above the minimum. A higher-conviction thesis needs less reward-to-risk margin to be worth taking. Example: with base 2.1 and this set to 0.1, a conviction-10 stock only needs R/R 1.8 instead of 2.1. Deliberately small -- this narrows the gap for an already-qualified high-conviction stock, it never turns R/R into a rubber stamp.')">i</button></div>
+          <div class="setting-desc">R/R reduction per conviction point above the minimum</div>
+        </div>
+        <input type="number" step="0.01" class="setting-input" name="research.on_deck_rr_conviction_step"
+               value="{{ cfg.research.on_deck_rr_conviction_step }}" min="0" max="0.5">
+        <div class="default-label">default<br><span class="default-val">0.1</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck R/R Floor <button type="button" class="info-btn" onclick="showInfo(event,'The required R/R can never be discounted below this number, no matter how high conviction is. Prevents the conviction discount from ever making R/R meaningless for a very high-conviction stock.')">i</button></div>
+          <div class="setting-desc">Required R/R never discounts below this, regardless of conviction</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.on_deck_rr_floor"
+               value="{{ cfg.research.on_deck_rr_floor }}" min="1" max="10">
+        <div class="default-label">default<br><span class="default-val">1.5</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Long-Term Trend Years <button type="button" class="info-btn" onclick="showInfo(event,'How many years of price history feed the LONG-TERM TREND context included in every analysis prompt, alongside the usual 1-year technicals. A stock that fell for years and has since rallied hard can look like a fresh breakout in a 1-year window alone, with no visibility into whether the rally is a genuine turnaround or just a bounce back toward a much bigger prior decline. 5 years balances catching a real structural high/low against pulling in irrelevant decades-old history.')">i</button></div>
+          <div class="setting-desc">Years of history summarized as long-term trend context in every analysis prompt</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.long_term_trend_years"
+               value="{{ cfg.research.long_term_trend_years }}" min="1" max="20">
+        <div class="default-label">default<br><span class="default-val">5</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Entry Mode <button type="button" class="info-btn" onclick="showInfo(event,'How On Deck decides a dip has recovered enough to buy. AI mode: once a real dip starts recovering (2+ consecutive upticks off the low), asks Claude once for a specific entry price given the actual observed peak/low/current price -- a judgment call informed by real price action, not a prediction made before any dip happened. Retracement % mode: a fixed mechanical rule instead -- price must recover a set percentage of the dip depth (see the setting below). Both modes share the same underlying peak/low/depth detection; only how the final entry price is decided differs. The other mode\'s number is still shown on the chart for comparison even while inactive.')">i</button></div>
+          <div class="setting-desc">How the entry price for a recovering dip gets decided</div>
+        </div>
+        <select class="setting-input" name="research.on_deck_entry_mode">
+          <option value="ai" {% if cfg.research.on_deck_entry_mode == 'ai' %}selected{% endif %}>AI-recommended (Claude judges each real dip)</option>
+          <option value="retracement" {% if cfg.research.on_deck_entry_mode == 'retracement' %}selected{% endif %}>Fixed % retracement (mechanical rule)</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">AI</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">AI Dip-Entry Refresh % <button type="button" class="info-btn" onclick="showInfo(event,'AI mode fires a real Claude call to get a fresh recommended entry price the first time a dip shows 2+ consecutive upticks off its low. If the tracked low keeps drifting afterward by ordinary noise (a few cents as the observation window slides), this stops that from burning another real Claude call for essentially the same answer -- a new call only fires once the low has dropped at least this many percent further than the low the last recommendation was based on. A genuinely deeper dip still always gets a fresh look; only trivial sub-threshold drift is skipped. Only used in AI Entry Mode.')">i</button></div>
+          <div class="setting-desc">Min. % the dip low must drop further before asking Claude again for a fresh entry price (AI mode only)</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.on_deck_ai_entry_low_refresh_pct"
+               value="{{ cfg.research.on_deck_ai_entry_low_refresh_pct }}" min="0.1" max="20">
+        <div class="default-label">default<br><span class="default-val">1.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">AI Entry Arm Band % <button type="button" class="info-btn" onclick="showInfo(event,'How far ABOVE the AI-recommended entry price still counts as \'close enough\' to arm the buy trigger, instead of requiring price to fully cross below the exact entry first. Added 2026-08-04 after live monitoring found every recommendation started unarmed (price already above entry when Claude computed it, since it reasons about a support level below wherever price has already recovered to) -- in a persistently rising market that never gives back even a percent or two, an unarmed candidate could wait indefinitely for a pullback that never comes. Still requires real proof price got genuinely close to the reasoned support level -- just not the full round-trip back through it. Set to 0 to restore the original strict behavior (must fully cross below entry).')">i</button></div>
+          <div class="setting-desc">% above the AI entry price that still counts as close enough to arm the buy trigger</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.on_deck_ai_entry_arm_band_pct"
+               value="{{ cfg.research.on_deck_ai_entry_arm_band_pct }}" min="0" max="20">
+        <div class="default-label">default<br><span class="default-val">2.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Retracement % <button type="button" class="info-btn" onclick="showInfo(event,'How much of the dip an On Deck candidate must retrace before it gets bought, measured from the previous peak (the highest price in the history window before the low) down to the low. A stock that fell $10 and must retrace 20% needs to recover $2 off its low, scaling naturally to the size of the dip instead of asking the same flat bounce regardless of how far a stock actually fell. Prevents buying into a stock that is still actively falling; R/R crossing the gate alone does not confirm the price has actually turned. Requires a real peak-to-low move already recorded in the history window, so a brand new candidate with no prior peak yet cannot pass this check until one exists. Only used when Entry Mode above is set to Fixed % retracement -- still computed and shown on the chart for comparison even in AI mode.')">i</button></div>
+          <div class="setting-desc">% of the peak-to-low dip that must be retraced before an On Deck buy fires (Fixed % mode only)</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.on_deck_retracement_pct"
+               value="{{ cfg.research.on_deck_retracement_pct }}" min="5" max="100">
+        <div class="default-label">default<br><span class="default-val">20.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Dip-Recovery Retry % <button type="button" class="info-btn" onclick="showInfo(event,'After a dip-recovery promotion attempt fails (conviction, signal, or R/R didn\'t hold up on a fresh Claude check), the candidate won\'t be tried again for the SAME dip low until either a genuinely new, deeper low forms, or price has recovered at least this many percent further past the price where that attempt failed. Without this, a candidate whose tracked low never prints a new value could stay stuck indefinitely no matter how far price has since recovered, even after clearing every other gate. Mirrors the equivalent escape hatch the no-dip uptrend trigger already has.')">i</button></div>
+          <div class="setting-desc">Min. % price must recover past a failed attempt's level before retrying the same dip</div>
+        </div>
+        <input type="number" step="0.5" class="setting-input" name="research.on_deck_recovery_retry_pct"
+               value="{{ cfg.research.on_deck_recovery_retry_pct }}" min="0.1" max="20">
+        <div class="default-label">default<br><span class="default-val">2.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Max Dip Low Age (days) <button type="button" class="info-btn" onclick="showInfo(event,'How old a tracked dip low is allowed to be before it is treated as stale (no usable dip at all), rather than a genuine current setup. Without this, a mechanical peak/low search has no recency requirement -- it finds the single lowest point anywhere in the whole lookback window regardless of how old it is, so a low from weeks ago on a stock that has simply been trending the whole time can still pass a mechanical \'price is above the old low\' check. Covers both the dip-recovery trigger and the No-Dip Uptrend trigger below (its window-low reference has the identical flaw). Set to 0 to disable this recency check entirely.')">i</button></div>
+          <div class="setting-desc">A dip low older than this many days is treated as stale, not a real current dip</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.on_deck_max_dip_low_age_days"
+               value="{{ cfg.research.on_deck_max_dip_low_age_days }}" min="0" max="90">
+        <div class="default-label">default<br><span class="default-val">14</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">No-Dip Uptrend % Gain <button type="button" class="info-btn" onclick="showInfo(event,'A candidate that has never shown a real peak-to-low dip in its history window (it has simply been climbing steadily) cannot trigger a buy through the normal dip-recovery trigger above, since there is no dip to confirm a recovery from -- even if conviction and R/R already clear their gates. This is a second, independent trigger: once price has risen this many percent above the lowest price in the history window, it is treated as a confirmed sustained uptrend and a buy is attempted directly (still subject to a completely fresh re-check of every gate at the moment of the attempt). Measured as a percentage gain rather than a run of consecutive upticks, so one brief down tick in an otherwise real uptrend does not erase all prior progress the way a streak counter would.')">i</button></div>
+          <div class="setting-desc">% price must have risen above its window low to buy a candidate that never showed a real dip</div>
+        </div>
+        <input type="number" step="0.5" class="setting-input" name="research.on_deck_no_dip_pct_gain"
+               value="{{ cfg.research.on_deck_no_dip_pct_gain }}" min="1" max="100">
+        <div class="default-label">default<br><span class="default-val">10.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">No-Dip Up-Ticks Needed <button type="button" class="info-btn" onclick="showInfo(event,'A second, independent trigger alongside No-Dip Uptrend % Gain above, for a candidate that has never shown a real peak-to-low dip. Looks at the last N price changes (N set by the window below) and fires a buy attempt once at least this many of them were upticks -- e.g. 7 out of a window of 10 means 7 of the last 10 price changes moved up. Catches a steady, low-volatility grind upward that may never rack up a large percentage price gain, using the two triggers together rather than either alone.')">i</button></div>
+          <div class="setting-desc">How many of the last N price changes (window below) must be upticks</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.on_deck_up_ticks_needed"
+               value="{{ cfg.research.on_deck_up_ticks_needed }}" min="1" max="50">
+        <div class="default-label">default<br><span class="default-val">7</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">No-Dip Up-Tick Window <button type="button" class="info-btn" onclick="showInfo(event,'How many of the most recent price changes to look at for the No-Dip Up-Ticks Needed trigger above -- e.g. 10 means the last 10 tick-to-tick moves. A candidate needs at least this many recorded changes before the trigger can fire at all.')">i</button></div>
+          <div class="setting-desc">How many recent price changes the up-tick trigger looks at</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.on_deck_up_ratio_window"
+               value="{{ cfg.research.on_deck_up_ratio_window }}" min="3" max="50">
+        <div class="default-label">default<br><span class="default-val">10</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck History Window (days) <button type="button" class="info-btn" onclick="showInfo(event,'How many days of price history an On Deck candidate keeps for the retracement check (finding the previous peak and low to measure the dip against). Large, slower-moving stocks can take multiple days or weeks to bottom and recover, so a single trading day is often too short a window to catch the real peak and low. History rolls off past this many days; the candidate itself can still remain on the list indefinitely as long as conviction holds up.')">i</button></div>
+          <div class="setting-desc">Rolling window of price history used to find the peak and low for the retracement check</div>
+        </div>
+        <input type="number" class="setting-input" name="research.on_deck_history_days"
+               value="{{ cfg.research.on_deck_history_days }}" min="1" max="180">
+        <div class="default-label">default<br><span class="default-val">30</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Max Size <button type="button" class="info-btn" onclick="showInfo(event,'Caps how many candidates stay tracked on On Deck, and is also the setpoint the system actively refills back up to during the day as slots open (see On Deck Backfill below). Does NOT limit scanning or analysis -- quick_screen and Claude still evaluate the full universe every pre-open regardless. Weakest-ranked candidates (same conviction + margin-of-safety + R/R-above-gate score used elsewhere) are dropped when over this number. This is the main lever for managing daily Claude cost, since every candidate kept on the list gets re-analyzed at pre-open, midday, and potentially again any time a slot opens for backfill.')">i</button></div>
+          <div class="setting-desc">Max On Deck candidates kept after ranking; also the setpoint backfill refills to</div>
+        </div>
+        <input type="number" class="setting-input" name="research.on_deck_max_size"
+               value="{{ cfg.research.on_deck_max_size }}" min="1" max="200">
+        <div class="default-label">default<br><span class="default-val">5</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Backfill <button type="button" class="info-btn" onclick="showInfo(event,'When a slot opens up on On Deck during the day (a buy, or a candidate failing a persist-check), automatically pulls in the best-ranked On Shore candidate to fill it. Once On Deck is full, also actively compares the best eligible On Shore candidate against On Deck\'s own current weakest member and swaps it in if it leads by at least the Swap Margin below -- so the best candidates stay on On Deck rather than whoever got there first. Every addition (fill or swap) gets one fresh Claude re-check before joining -- never reuses several-hours-old On Shore data directly, since a thesis can go stale over the course of a day. This is real, recurring Claude spend beyond the existing pre-open/midday cost. Turn off to leave open slots unfilled and skip swaps entirely until the next scheduled pre-open scan.')">i</button></div>
+          <div class="setting-desc">Auto-refill On Deck to its Max Size, and swap in stronger On Shore candidates once full (real added Claude cost)</div>
+        </div>
+        <select class="setting-input" name="research.on_deck_backfill_enabled">
+          <option value="true" {% if cfg.research.on_deck_backfill_enabled %}selected{% endif %}>Enabled</option>
+          <option value="false" {% if not cfg.research.on_deck_backfill_enabled %}selected{% endif %}>Disabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">On</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Swap Margin <button type="button" class="info-btn" onclick="showInfo(event,'How much stronger (on the same composite conviction + margin-of-safety + R/R-above-gate score used for ranking everywhere else) an On Shore candidate must be than On Deck\'s current weakest member before it swaps in, once On Deck is full. Exists to prevent thrashing -- R/R shifts continuously with live price, so without a real margin, ordinary noise could flip candidates in and out (and burn a real Claude call) on every single 60-second check. A higher number means fewer, more decisive swaps; a lower number swaps more readily.')">i</button></div>
+          <div class="setting-desc">Min. score lead an On Shore candidate needs over On Deck's weakest member to swap in</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.on_deck_swap_margin"
+               value="{{ cfg.research.on_deck_swap_margin }}" min="0" max="20">
+        <div class="default-label">default<br><span class="default-val">2.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Backfill Retry Cooldown (min) <button type="button" class="info-btn" onclick="showInfo(event,'After a backfill candidate fails a fresh re-check (no longer qualifies, or falls outside the R/R band), skip re-trying it for this many minutes. It is the top-ranked On Shore candidate by definition, so without this it gets retried -- a real Claude call -- on literally every 60-second check until it either stabilizes back into range or something else outranks it.')">i</button></div>
+          <div class="setting-desc">Minutes to wait before re-trying a backfill candidate that just failed</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.on_deck_backfill_retry_cooldown_minutes"
+               value="{{ cfg.research.on_deck_backfill_retry_cooldown_minutes }}" min="0" max="60">
+        <div class="default-label">default<br><span class="default-val">5</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Auto Deep Dive <button type="button" class="info-btn" onclick="showInfo(event,'When enabled, every stock that newly enters On Deck automatically gets one real Deep Dive (the richer Sonnet-tier analysis — DCF-style valuation, competitive moat, growth outlook, catalysts, bull/base/bear scenarios) instead of just the lighter quick-scan summary. Fires once per entry event only, not on every twice-daily re-analysis, so cost stays bounded by On Deck Max Size. Display-only — never affects the R/R buy-gate math, which stays driven by the quick-scan tier’s own fair value either way. Disable if you want to keep Deep Dives strictly manual (the dashboard’s Deep Dive button always works regardless of this setting).')">i</button></div>
+          <div class="setting-desc">Auto-run a real Deep Dive once when a stock newly joins On Deck</div>
+        </div>
+        <select class="setting-input" name="research.on_deck_auto_deep_dive">
+          <option value="true" {% if cfg.research.on_deck_auto_deep_dive %}selected{% endif %}>Enabled</option>
+          <option value="false" {% if not cfg.research.on_deck_auto_deep_dive %}selected{% endif %}>Disabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Enabled</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Block Breakout % <button type="button" class="info-btn" onclick="showInfo(event,'When you manually remove an On Deck candidate (the card\'s ✕ button), it stays blocked until you unblock it -- or automatically, for free, once price breaks out above the recent high it had at removal time by this many percent. Checked once per minute per blocked ticker off a live quote, no Claude call involved. Applies regardless of whether the removal dialog\'s own time-based block has expired yet.')">i</button></div>
+          <div class="setting-desc">% above its recent high a manually-removed candidate must break out to auto-restore</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.on_deck_block_breakout_pct"
+               value="{{ cfg.research.on_deck_block_breakout_pct }}" min="0.1" max="20">
+        <div class="default-label">default<br><span class="default-val">2.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Position Deep Dive <button type="button" class="info-btn" onclick="showInfo(event,'When enabled, every currently HELD position periodically gets a real Deep Dive (Sonnet-tier — DCF-style valuation, competitive moat, growth outlook, catalysts, bull/base/bear scenarios), visible in the position detail view. Display/context only — does NOT drive any automatic sell decision; that stays governed entirely by the existing hourly quick-scan HOLD/SELL signal. A separate, deliberately isolated loop from the hourly position monitor, so this addition can never risk that critical loop. Off by default (2026-08-04) — this recurring per-holding Claude cost was not buying any real risk management, since it never drove a sell decision.')">i</button></div>
+          <div class="setting-desc">Periodic Deep Dive on every held position (display only, does not drive selling) — off by default</div>
+        </div>
+        <select class="setting-input" name="research.position_deep_dive_enabled">
+          <option value="true" {% if cfg.research.position_deep_dive_enabled %}selected{% endif %}>Enabled</option>
+          <option value="false" {% if not cfg.research.position_deep_dive_enabled %}selected{% endif %}>Disabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Disabled</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Position Deep Dive Interval (hours) <button type="button" class="info-btn" onclick="showInfo(event,'How often the periodic position Deep Dive fires, in hours. Default 3 gives roughly 2 refreshes during a normal 6.5-hour trading day. Independent of the hourly quick-scan position monitor, which always runs every hour regardless of this setting.')">i</button></div>
+          <div class="setting-desc">Hours between periodic Deep Dive refreshes on held positions</div>
+        </div>
+        <input type="number" step="0.5" class="setting-input" name="research.position_deep_dive_interval_hours"
+               value="{{ cfg.research.position_deep_dive_interval_hours }}" min="1" max="24">
+        <div class="default-label">default<br><span class="default-val">3</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Position Monitor Interval (min) <button type="button" class="info-btn" onclick="showInfo(event,'How often (in minutes) an underwater or flat position gets a periodic re-check during market hours. A comfortably profitable position (see Profitable Skip % below) is intentionally skipped by this periodic cycle -- its downside is already mechanically protected by the trailing stop, so it instead gets event-triggered re-analysis (see the settings below) only when price actually nears its stop or next target. Shorter intervals are more responsive but use more compute.')">i</button></div>
+          <div class="setting-desc">How often underwater/flat positions get a periodic re-check (profitable positions use event triggers instead)</div>
+        </div>
+        <input type="number" class="setting-input" name="research.position_monitor_interval_minutes"
+               value="{{ cfg.research.position_monitor_interval_minutes }}" min="15" max="240">
+        <div class="default-label">default<br><span class="default-val">120 min</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Profitable Skip % <button type="button" class="info-btn" onclick="showInfo(event,'A held position at or above this unrealized gain % is considered comfortably profitable and skipped by the periodic Position Monitor Interval above -- its downside is already handled by the trailing stop, so a periodic thesis re-check there only adds false-positive-sell risk with no offsetting benefit. It gets event-triggered re-analysis instead (see below).')">i</button></div>
+          <div class="setting-desc">Unrealized gain % above which a position is skipped by the periodic monitor</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.position_monitor_profitable_skip_pct"
+               value="{{ cfg.research.position_monitor_profitable_skip_pct }}" min="0" max="50">
+        <div class="default-label">default<br><span class="default-val">2.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Event Trigger Proximity % <button type="button" class="info-btn" onclick="showInfo(event,'For a profitable, periodic-monitor-skipped position: how close price must get to the trailing stop or the next take-profit target (as a %) before firing a real, one-off re-analysis outside the normal periodic cycle. Catches a position approaching a real decision point without waiting for the next scheduled check.')">i</button></div>
+          <div class="setting-desc">How close price must get to the stop/next target to trigger an event re-check</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.position_monitor_event_proximity_pct"
+               value="{{ cfg.research.position_monitor_event_proximity_pct }}" min="0.1" max="20">
+        <div class="default-label">default<br><span class="default-val">2.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Event Trigger Cooldown (min) <button type="button" class="info-btn" onclick="showInfo(event,'Per-ticker rate limit on the event-triggered re-analysis above (both the profitable-side proximity trigger and the underwater-side loss trigger below) -- prevents a real Claude call firing repeatedly while price hovers right at the trigger threshold.')">i</button></div>
+          <div class="setting-desc">Minutes between repeat event-triggered re-checks on the same position</div>
+        </div>
+        <input type="number" class="setting-input" name="research.position_monitor_event_cooldown_minutes"
+               value="{{ cfg.research.position_monitor_event_cooldown_minutes }}" min="1" max="240">
+        <div class="default-label">default<br><span class="default-val">60 min</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Loss Trigger % <button type="button" class="info-btn" onclick="showInfo(event,'A held position that crosses this far negative (unrealized loss %) fires an immediate event-triggered re-analysis, independent of the periodic cycle and independent of whether Trailing Stop is enabled -- only depends on P&amp;L. Catches a position sinking fast without waiting for the next scheduled check.')">i</button></div>
+          <div class="setting-desc">Unrealized loss % that triggers an immediate re-check</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.position_monitor_loss_trigger_pct"
+               value="{{ cfg.research.position_monitor_loss_trigger_pct }}" min="0.1" max="50">
+        <div class="default-label">default<br><span class="default-val">3.0%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Loss Retrigger % <button type="button" class="info-btn" onclick="showInfo(event,'A position already in cooldown from a loss-trigger re-check (above) that sinks at least this much further past whatever loss level last fired bypasses the cooldown and fires again immediately -- a materially deeper loss is treated as a new situation, not the same one the cooldown protects against re-firing on.')">i</button></div>
+          <div class="setting-desc">Additional loss % past the last trigger that bypasses the cooldown</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.position_monitor_loss_retrigger_pct"
+               value="{{ cfg.research.position_monitor_loss_retrigger_pct }}" min="0.1" max="20">
+        <div class="default-label">default<br><span class="default-val">1.0%</span></div>
+      </div>
+      <div class="setting-row" style="align-items:start;">
+        <div>
+          <div class="setting-label">Universe Indexes <button type="button" class="info-btn" onclick="showInfo(event,'Which stock indexes make up the pre-open scan universe. Each checked index adds its constituents to the pool of ~1,500+ stocks screened overnight. More indexes = more opportunities but longer scan time and higher Claude API cost. S&P 500+400+600 gives broad market coverage. Nasdaq 100 adds high-momentum tech names. Dow Jones 30 is blue-chip only and adds minimal unique stocks.')">i</button></div>
+          <div class="setting-desc">Which index constituents are included in the pre-open universe scan</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;padding:4px 0;">
+          {% set uidx = cfg.research.universe_indexes if cfg.research.universe_indexes else ['S&P 500', 'S&P 400', 'S&P 600'] %}
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;color:var(--text-primary);">
+            <input type="checkbox" class="universe-cb" value="S&P 500" {% if 'S&P 500' in uidx %}checked{% endif %} style="accent-color:var(--accent);width:14px;height:14px;">
+            S&amp;P 500 <span style="color:var(--text-muted);font-size:11px;">(~500, large-cap)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;color:var(--text-primary);">
+            <input type="checkbox" class="universe-cb" value="S&P 400" {% if 'S&P 400' in uidx %}checked{% endif %} style="accent-color:var(--accent);width:14px;height:14px;">
+            S&amp;P 400 <span style="color:var(--text-muted);font-size:11px;">(~400, mid-cap)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;color:var(--text-primary);">
+            <input type="checkbox" class="universe-cb" value="S&P 600" {% if 'S&P 600' in uidx %}checked{% endif %} style="accent-color:var(--accent);width:14px;height:14px;">
+            S&amp;P 600 <span style="color:var(--text-muted);font-size:11px;">(~600, small-cap)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;color:var(--text-primary);">
+            <input type="checkbox" class="universe-cb" value="Nasdaq 100" {% if 'Nasdaq 100' in uidx %}checked{% endif %} style="accent-color:var(--accent);width:14px;height:14px;">
+            Nasdaq 100 <span style="color:var(--text-muted);font-size:11px;">(tech / growth)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;color:var(--text-primary);">
+            <input type="checkbox" class="universe-cb" value="Dow Jones 30" {% if 'Dow Jones 30' in uidx %}checked{% endif %} style="accent-color:var(--accent);width:14px;height:14px;">
+            Dow Jones 30 <span style="color:var(--text-muted);font-size:11px;">(blue-chip only)</span>
+          </label>
+        </div>
+        <div class="default-label">default<br><span class="default-val">S&amp;P 500+400+600+Nasdaq 100+Dow Jones 30</span></div>
+      </div>
+
+      <div class="setting-row" style="grid-template-columns: 1fr auto 90px;">
+        <div>
+          <div class="setting-label">Scan Times (ET) <button type="button" class="info-btn" onclick="showInfo(event,'The two scheduled times each trading day (Eastern Time) the auto-scan loop fires — neither buys directly anymore (real buying happens continuously via the On Deck promotion pipeline whenever a candidate clears its gates). The first slot is a heartbeat/trigger point; the second also fires the midday On Deck re-analysis, refreshing conviction/R/R on every current On Deck candidate. A third late-day scan was intentionally removed as redundant with the next pre-open scan.')">i</button></div>
+          <div class="setting-desc">Two daily scan times in Eastern Time (HH:MM)</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          {% set scan_times = cfg.research.scan_times or ['09:45','12:30'] %}
+          <input type="time" class="setting-input scan-time" name="research.scan_time_0" value="{{ scan_times[0] if scan_times|length > 0 else '09:45' }}" style="width:90px;">
+          <input type="time" class="setting-input scan-time" name="research.scan_time_1" value="{{ scan_times[1] if scan_times|length > 1 else '12:30' }}" style="width:90px;">
+        </div>
+        <div class="default-label">default<br><span class="default-val">09:45, 12:30</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Mid-Day Re-Scan <button type="button" class="info-btn" onclick="showInfo(event,'When Enabled, two additional scan times each day re-run the free quick-screen check against the full universe and spend a real Claude call only on stocks not already analyzed today by any other pass -- catches a stock that develops a qualifying setup after the morning pre-open scan.')">i</button></div>
+          <div class="setting-desc">Catch new setups during the day with two extra scan passes</div>
+        </div>
+        <select class="setting-input" name="research.midday_scan_enabled">
+          <option value="false" {% if not cfg.research.midday_scan_enabled %}selected{% endif %}>Disabled</option>
+          <option value="true" {% if cfg.research.midday_scan_enabled %}selected{% endif %}>Enabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">On</span></div>
+      </div>
+      <div class="setting-row" style="grid-template-columns: 1fr auto 90px;">
+        <div>
+          <div class="setting-label">Mid-Day Re-Scan Times (ET) <button type="button" class="info-btn" onclick="showInfo(event,'The two times each trading day the mid-day re-scan fires. Only tickers not already analyzed today by any other pass get a real Claude call, so this stays cheap regardless of how many stocks pass the free quick-screen check.')">i</button></div>
+          <div class="setting-desc">Two daily re-scan times in Eastern Time (HH:MM)</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          {% set midday_scan_times = cfg.research.midday_scan_times or ['10:30','13:30'] %}
+          <input type="time" class="setting-input midday-scan-time" name="research.midday_scan_time_0" value="{{ midday_scan_times[0] if midday_scan_times|length > 0 else '10:30' }}" style="width:90px;">
+          <input type="time" class="setting-input midday-scan-time" name="research.midday_scan_time_1" value="{{ midday_scan_times[1] if midday_scan_times|length > 1 else '13:30' }}" style="width:90px;">
+        </div>
+        <div class="default-label">default<br><span class="default-val">10:30, 13:30</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Pre-Open Scan (hrs before open) <button type="button" class="info-btn" onclick="showInfo(event,'How many hours before the 9:30 AM ET market open the overnight universe screen fires. At 1.5 hours, it runs at 8:00 AM. This scan screens 1,500+ stocks and populates On Deck and On Shore with the day\'s real candidates. Weekends and market holidays are automatically skipped.')">i</button></div>
+          <div class="setting-desc">Hours before market open to run the overnight universe scan</div>
+        </div>
+        <input type="number" class="setting-input" name="research.pre_open_batch_hours"
+               value="{{ cfg.research.pre_open_batch_hours }}" min="1" max="8">
+        <div class="default-label">default<br><span class="default-val">1.5 hrs</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Auto-Buy Cutoff Time (ET) <button type="button" class="info-btn" onclick="showInfo(event,'No automated On Deck promotion (a real buy) can execute after this time of day, Eastern Time -- enforced in _attempt_near_miss_promotion, the function behind every live continuous buy. A candidate that clears every gate after this time is simply left on the list, unbought, for the day. Manual buys are not affected.')">i</button></div>
+          <div class="setting-desc">No automated buy fires after this Eastern Time, each trading day</div>
+        </div>
+        <input type="time" class="setting-input" name="research.auto_buy_cutoff_time"
+               value="{{ cfg.research.auto_buy_cutoff_time }}">
+        <div class="default-label">default<br><span class="default-val">15:30</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ON DECK CHART DISPLAY -->
+  <div class="section">
+    <div class="section-title">On Deck Chart Display</div>
+    <div class="settings-grid">
+      <div class="setting-row" style="align-items:start; grid-template-columns: 1fr 360px 90px;">
+        <div>
+          <div class="setting-label">Chart Elements <button type="button" class="info-btn" onclick="showInfo(event,'Which overlays appear on the On Deck R/R chart (both the compact card view and the expanded full-detail view). All are on by default. Turning any of these off only changes what is drawn -- the underlying price history, R/R calculation, and hover tooltip are unaffected either way.')">i</button></div>
+          <div class="setting-desc">Choose which overlays appear on the On Deck price/R-R chart</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;padding:4px 0;">
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;color:var(--text-primary);white-space:nowrap;">
+            <input type="checkbox" class="setting-input" name="dashboard.chart_show_price" {% if cfg.dashboard.chart_show_price %}checked{% endif %} style="accent-color:var(--accent);width:14px;height:14px;flex-shrink:0;">
+            Price line <span style="color:var(--text-muted);font-size:11px;">(expanded view, own scale)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;color:var(--text-primary);white-space:nowrap;">
+            <input type="checkbox" class="setting-input" name="dashboard.chart_show_gate" {% if cfg.dashboard.chart_show_gate %}checked{% endif %} style="accent-color:var(--accent);width:14px;height:14px;flex-shrink:0;">
+            R/R gate line <span style="color:var(--text-muted);font-size:11px;">(required threshold)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;color:var(--text-primary);white-space:nowrap;">
+            <input type="checkbox" class="setting-input" name="dashboard.chart_show_targets" {% if cfg.dashboard.chart_show_targets %}checked{% endif %} style="accent-color:var(--accent);width:14px;height:14px;flex-shrink:0;">
+            Target lines <span style="color:var(--text-muted);font-size:11px;">(retracement / AI entry)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;color:var(--text-primary);white-space:nowrap;">
+            <input type="checkbox" class="setting-input" name="dashboard.chart_show_highlow" {% if cfg.dashboard.chart_show_highlow %}checked{% endif %} style="accent-color:var(--accent);width:14px;height:14px;flex-shrink:0;">
+            High/low price labels <span style="color:var(--text-muted);font-size:11px;">(expanded view only)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;color:var(--text-primary);white-space:nowrap;">
+            <input type="checkbox" class="setting-input" name="dashboard.chart_show_markers" {% if cfg.dashboard.chart_show_markers %}checked{% endif %} style="accent-color:var(--accent);width:14px;height:14px;flex-shrink:0;">
+            Per-point markers <span style="color:var(--text-muted);font-size:11px;">(expanded view only)</span>
+          </label>
+        </div>
+        <div class="default-label">default<br><span class="default-val">4/5 on</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- API KEYS — rows rendered server-side so they always appear on fresh install -->
+  <div class="section">
+    <div class="section-title">API Keys</div>
+    <div class="settings-grid" id="keys-grid">
+      {% for key, info in api_keys.items() %}
+      <div class="setting-row" id="key-row-{{ key }}">
+        <div>
+          <div class="setting-label">{{ info.label }}</div>
+          <div class="setting-desc">{{ key }}</div>
+        </div>
+        {% if info.is_set %}
+        <span style="color:var(--green);font-size:11px;">● set</span>
+        {% else %}
+        <span style="color:var(--text-muted);font-size:11px;">not set</span>
+        {% endif %}
+        <button type="button"
+                style="padding:5px 14px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-secondary);cursor:pointer;font-size:12px;"
+                onclick="openKeyModal('{{ key }}')">Edit</button>
+      </div>
+      {% endfor %}
+    </div>
+    <span id="keys-status" style="font-size:12px;color:var(--text-muted);display:block;margin-top:8px;"></span>
+  </div>
+
+  <!-- Key edit modal -->
+  <div class="key-modal-overlay" id="keyModalOverlay" onclick="closeKeyModal(event)">
+    <div class="key-modal" id="keyModal">
+      <h3 id="keyModalTitle">Edit Key</h3>
+      <label id="keyModalLabel">API Key</label>
+      <input type="text" id="keyModalInput" autocomplete="off" spellcheck="false">
+      <div id="keyModalSecretRow" style="display:none">
+        <label>Secret Key</label>
+        <input type="text" id="keyModalSecretInput" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="key-modal-btns">
+        <button class="reset-btn" onclick="closeKeyModal()">Cancel</button>
+        <button class="save-btn" onclick="saveKeyModal()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI MODELS -->
+  <div class="section">
+    <div class="section-title">AI Models</div>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Quick Scan Model <button type="button" class="info-btn" onclick="showInfo(event,'Every real buy decision runs on this model: On Deck promotion attempts, On Shore backfill/swap re-checks, and live signal tracking. NOT the pre-open universe scan or the mid-day re-scan — those run on Pre-Open Scan Model below (Quick Scan Model is only used as their rare sequential fallback if the Batch API stalls). The old separate \"Scan Now\" re-vet was retired (2026-08-03); the dashboard\'s Full Scan button now runs the full pre-open pipeline instead, also under Pre-Open Scan Model. Haiku 4.5 is strongly recommended for cost — it is fast and cheap while still producing solid BUY/HOLD/SELL signals.')">i</button></div>
+          <div class="setting-desc">Model used for the live On Deck buy pipeline (promotions, backfill/swap, signal tracking) — not the universe scans, see Pre-Open Scan Model</div>
+        </div>
+        <select class="setting-input" name="research.model_quick_scan">
+          <option value="claude-haiku-4-5" {% if cfg.research.model_quick_scan == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
+          <option value="claude-sonnet-5" {% if cfg.research.model_quick_scan == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
+          <option value="claude-opus-4-8" {% if cfg.research.model_quick_scan == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
+          <option value="claude-fable-5" {% if cfg.research.model_quick_scan == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Haiku</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Deep Dive Model <button type="button" class="info-btn" onclick="showInfo(event,'The Claude model used for in-depth research on buy candidates. This runs once per buy signal and is the final AI quality gate before money is spent. Sonnet 5 gives strong analysis at a good cost.')">i</button></div>
+          <div class="setting-desc">Model used for deep analysis before each buy decision</div>
+        </div>
+        <select class="setting-input" name="research.model_deep_dive">
+          <option value="claude-haiku-4-5" {% if cfg.research.model_deep_dive == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
+          <option value="claude-sonnet-5" {% if cfg.research.model_deep_dive == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced (Recommended)</option>
+          <option value="claude-opus-4-8" {% if cfg.research.model_deep_dive == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
+          <option value="claude-fable-5" {% if cfg.research.model_deep_dive == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Sonnet 5</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Deeper Dive Model <button type="button" class="info-btn" onclick="showInfo(event,'The Claude model used for the user-triggered Deeper Dive — an extended institutional-grade analysis with peer comparison, management quality, macro sensitivity, historical patterns, and probability-weighted expected returns. Opus 4.8 is strongly recommended here since this runs rarely and the extra reasoning power meaningfully improves the output quality.')">i</button></div>
+          <div class="setting-desc">Model for the manual Deeper Dive (peer comparison, macro, expected returns)</div>
+        </div>
+        <select class="setting-input" name="research.model_deeper_dive">
+          <option value="claude-haiku-4-5" {% if (cfg.research.model_deeper_dive|default('claude-opus-4-8')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
+          <option value="claude-sonnet-5" {% if (cfg.research.model_deeper_dive|default('claude-opus-4-8')) == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
+          <option value="claude-opus-4-8" {% if (cfg.research.model_deeper_dive|default('claude-opus-4-8')) == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful (Recommended)</option>
+          <option value="claude-fable-5" {% if (cfg.research.model_deeper_dive|default('claude-opus-4-8')) == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Opus 4.8</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Pre-Open Scan Model <button type="button" class="info-btn" onclick="showInfo(event,'The Claude model used for the overnight universe screen that runs before the market opens, screening 1,500+ stocks to find the best candidates for the day. Also used by the two mid-day re-scan times below (same batch-scan machinery) and by the dashboard\'s Full Scan button (which runs this exact same pipeline on demand). Because of the volume, Haiku 4.5 is strongly recommended — using a heavier model here can cost 10–20× more per day with minimal quality gain.')">i</button></div>
+          <div class="setting-desc">Model used for the pre-open scan, the mid-day re-scans, and the Full Scan button — the overnight 1,500+ stock universe screen</div>
+        </div>
+        <select class="setting-input" name="research.model_pre_open_scan">
+          <option value="claude-haiku-4-5" {% if cfg.research.model_pre_open_scan == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
+          <option value="claude-sonnet-5" {% if cfg.research.model_pre_open_scan == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
+          <option value="claude-opus-4-8" {% if cfg.research.model_pre_open_scan == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
+          <option value="claude-fable-5" {% if cfg.research.model_pre_open_scan == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Haiku</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Position Monitor Model <button type="button" class="info-btn" onclick="showInfo(event,'The Claude model used for the hourly re-analysis of every held position — the sell-decision engine. Split off from Quick Scan Model (2026-07-24) so this can be tuned independently.')">i</button></div>
+          <div class="setting-desc">Model used for the hourly sell-decision re-check on holdings</div>
+        </div>
+        <select class="setting-input" name="research.model_position_monitor">
+          <option value="claude-haiku-4-5" {% if (cfg.research.model_position_monitor|default('claude-haiku-4-5')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
+          <option value="claude-sonnet-5" {% if (cfg.research.model_position_monitor|default('claude-haiku-4-5')) == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
+          <option value="claude-opus-4-8" {% if (cfg.research.model_position_monitor|default('claude-haiku-4-5')) == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
+          <option value="claude-fable-5" {% if (cfg.research.model_position_monitor|default('claude-haiku-4-5')) == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Haiku</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Dip-Entry Model <button type="button" class="info-btn" onclick="showInfo(event,'The Claude model used for the one-time AI dip-entry recommendation, fired when a tracked On Deck candidate shows a real, already-recovering price dip. Split off from Quick Scan Model (2026-07-24).')">i</button></div>
+          <div class="setting-desc">Model used for the AI dip-entry price recommendation</div>
+        </div>
+        <select class="setting-input" name="research.model_dip_entry">
+          <option value="claude-haiku-4-5" {% if (cfg.research.model_dip_entry|default('claude-haiku-4-5')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
+          <option value="claude-sonnet-5" {% if (cfg.research.model_dip_entry|default('claude-haiku-4-5')) == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
+          <option value="claude-opus-4-8" {% if (cfg.research.model_dip_entry|default('claude-haiku-4-5')) == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
+          <option value="claude-fable-5" {% if (cfg.research.model_dip_entry|default('claude-haiku-4-5')) == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Haiku</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Periodic Deep Dive Model (Holdings) <button type="button" class="info-btn" onclick="showInfo(event,'The Claude model used for the automatic deep dive on every held position, roughly every 3 hours during market hours. Split off from Deep Dive Model (2026-07-24) so this recurring cost can be tuned separately from manual Deep Dive clicks.')">i</button></div>
+          <div class="setting-desc">Model used for the automatic periodic deep dive on holdings</div>
+        </div>
+        <select class="setting-input" name="research.model_periodic_deep_dive">
+          <option value="claude-haiku-4-5" {% if (cfg.research.model_periodic_deep_dive|default('claude-haiku-4-5')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
+          <option value="claude-sonnet-5" {% if (cfg.research.model_periodic_deep_dive|default('claude-haiku-4-5')) == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
+          <option value="claude-opus-4-8" {% if (cfg.research.model_periodic_deep_dive|default('claude-haiku-4-5')) == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
+          <option value="claude-fable-5" {% if (cfg.research.model_periodic_deep_dive|default('claude-haiku-4-5')) == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Haiku</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Portfolio Health Model <button type="button" class="info-btn" onclick="showInfo(event,'The Claude model used for the on-demand Portfolio Health Assessment (opens only when you view that modal — no background job calls it). Split off from Deep Dive Model (2026-07-24).')">i</button></div>
+          <div class="setting-desc">Model used for the Portfolio Health Assessment modal</div>
+        </div>
+        <select class="setting-input" name="research.model_portfolio_health">
+          <option value="claude-haiku-4-5" {% if (cfg.research.model_portfolio_health|default('claude-haiku-4-5')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
+          <option value="claude-sonnet-5" {% if (cfg.research.model_portfolio_health|default('claude-haiku-4-5')) == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
+          <option value="claude-opus-4-8" {% if (cfg.research.model_portfolio_health|default('claude-haiku-4-5')) == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
+          <option value="claude-fable-5" {% if (cfg.research.model_portfolio_health|default('claude-haiku-4-5')) == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Haiku</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TRADING -->
+  <div class="section">
+    <div class="section-title">Trading</div>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Paper Trading Mode <button type="button" class="info-btn" onclick="showInfo(event,'When enabled, all orders are sent to Alpaca\'s paper trading environment — no real money is used. Disable only when you are confident the system is performing correctly and you are ready for live trading. Switching modes while positions are open may cause account state mismatches between paper and live accounts.')">i</button></div>
+          <div class="setting-desc">Route all orders to Alpaca paper trading (no real money)</div>
+          <div style="margin-top:6px;padding:7px 10px;border-radius:6px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.35);font-size:11px;color:#f59e0b;line-height:1.5;">
+            ⚠ Disabling this switches to <strong>live trading with real money</strong>. Ensure the system is fully validated before going live. The broker connection will be re-initialized immediately on save.
+          </div>
+        </div>
+        <select class="setting-input" name="trading.paper_trading">
+          <option value="true" {% if cfg.trading.paper_trading %}selected{% endif %}>Paper (Simulated)</option>
+          <option value="false" {% if not cfg.trading.paper_trading %}selected{% endif %}>Live (Real Money)</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Paper</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Broker <button type="button" class="info-btn" onclick="showInfo(event,'The brokerage integration used to place orders. Alpaca is the primary supported broker and provides full fractional share, paper trading, and order management support. Robinhood support is experimental. Changing the broker requires a server restart to reconnect with new credentials.')">i</button></div>
+          <div class="setting-desc">Brokerage used for order execution</div>
+        </div>
+        <select class="setting-input" name="trading.broker">
+          <option value="alpaca" {% if cfg.trading.broker == 'alpaca' %}selected{% endif %}>Alpaca</option>
+          <option value="robinhood" {% if cfg.trading.broker == 'robinhood' %}selected{% endif %}>Robinhood (experimental)</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Alpaca</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Auto Execute Trades <button type="button" class="info-btn" onclick="showInfo(event,'When enabled, buy and sell signals are automatically executed as market orders without any manual confirmation. When disabled, signals are generated and logged but no orders are placed — useful for monitoring the system in observation mode before trusting it with live or paper trades.')">i</button></div>
+          <div class="setting-desc">Automatically place orders when a signal is generated</div>
+        </div>
+        <select class="setting-input" name="trading.auto_execute">
+          <option value="true" {% if cfg.trading.auto_execute %}selected{% endif %}>Enabled</option>
+          <option value="false" {% if not cfg.trading.auto_execute %}selected{% endif %}>Disabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">On</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Wash-Sale Rebuy Cooldown (days) <button type="button" class="info-btn" onclick="showInfo(event,'Blocks any buy (automated On Deck promotion or manual) of a ticker within this many days of a losing sale on that same ticker, so the realized loss stays immediately usable at tax time (IRC §1091) instead of deferred. Only relevant if you’re a taxable individual/retail account subject to the US wash-sale rule — set to 0 to disable entirely (e.g. a business/institutional account, a tax-advantaged account, or trading outside the US, where this rule may not apply to you). Applies to both automated and manual buys.')">i</button></div>
+          <div class="setting-desc">Days to block rebuying a ticker after a loss on it — 0 disables the block</div>
+        </div>
+        <input type="number" class="setting-input" name="research.wash_sale_cooldown_days"
+               value="{{ cfg.research.wash_sale_cooldown_days }}" min="0" max="365">
+        <div class="default-label">default<br><span class="default-val">31</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SYSTEM -->
+  <div class="section">
+    <div class="section-title">System</div>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Ticker Tape Crypto Count <button type="button" class="info-btn" onclick="showInfo(event,'How many of the top 5 cryptocurrencies (BTC, ETH, SOL, XRP, ADA) show on the ticker tape strip at the top of the dashboard, alongside the stock indexes and commodities. Set to 0 to show none. Display only — has no effect on trading, On Deck, or any analysis.')">i</button></div>
+          <div class="setting-desc">Number of top cryptos shown on the ticker tape (0 = none)</div>
+        </div>
+        <input type="number" class="setting-input" name="dashboard.ticker_tape_crypto_count"
+               value="{{ cfg.dashboard.ticker_tape_crypto_count }}" min="0" max="5">
+        <div class="default-label">default<br><span class="default-val">1</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Restart Server</div>
+          <div class="setting-desc">Kills and re-spawns the trading process (~5 sec downtime).</div>
+          <div style="margin-top:6px;padding:7px 10px;border-radius:6px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.35);font-size:11px;color:#f59e0b;line-height:1.5;">
+            ⚠ Warning — any active scan, deep dive, or open position sync will be abruptly interrupted. Pending orders in Alpaca are unaffected, but local state (e.g. in-progress take-profit checks) will reset. Only restart if the system appears stuck or after a code update.
+          </div>
+        </div>
+        <button type="button" class="save-btn" style="background:#b45309;border-color:#b45309;padding:7px 20px;flex-shrink:0;" onclick="restartServer()">↺ Restart</button>
+        <div class="default-label"></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Recalibrate Drawdown Baseline</div>
+          <div class="setting-desc">Resets the drawdown high-water mark to the real, current Alpaca balance.</div>
+          <div style="margin-top:6px;padding:7px 10px;border-radius:6px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.35);font-size:11px;color:#f59e0b;line-height:1.5;">
+            ⚠ The drawdown high-water mark only ever ratchets up and nothing resets it automatically — a manual balance change (a deposit, withdrawal, or a deliberate paper-account reset) reads as a catastrophic trading loss and can permanently halt all automated buying. Only use this if a halt genuinely doesn't reflect real trading losses — it fetches your real current Alpaca equity and starts drawdown tracking fresh from there. Does not touch anything else (positions, cash, Day P/L).
+          </div>
+        </div>
+        <button type="button" class="save-btn" style="background:#b45309;border-color:#b45309;padding:7px 20px;flex-shrink:0;" onclick="recalibrateDrawdownBaseline()">⟳ Recalibrate</button>
+        <div class="default-label"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Sticky footer -->
+<div class="footer-bar">
+  <button class="reset-btn" onclick="resetChanges()">Reset Changes</button>
+  <button class="save-btn" id="saveBtn" onclick="saveSettings()">Save Settings</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// Info popup
+function showInfo(evt, text) {
+  evt.stopPropagation();
+  const pop = document.getElementById('info-popup');
+  pop.textContent = text;
+  const rect = evt.target.getBoundingClientRect();
+  const left = Math.min(rect.right + 10, window.innerWidth - 320);
+  const top  = Math.min(Math.max(8, rect.top - 20), window.innerHeight - 220);
+  pop.style.left = left + 'px';
+  pop.style.top  = top + 'px';
+  pop.classList.add('active');
+}
+document.addEventListener('click', () => document.getElementById('info-popup').classList.remove('active'));
+
+const DEFAULTS = {
+  // Snapshotted 2026-07-23 from the live settings.yaml at the user's request -- these are
+  // no longer factory baselines, they're a frozen copy of the values that were live and
+  // working well at the time of the snapshot. Deliberately static: editing a setting later
+  // does NOT move its own "default" -- these only change if this snapshot is intentionally
+  // redone.
+  'take_profit.stop_loss_pct': 5.0,
+  'research.ai_chosen_stop_tp_enabled': 'false',
+  'research.ai_stop_loss_min_pct': 2.0,
+  'research.ai_stop_loss_max_pct': 10.0,
+  'take_profit.t1_pct': 5.0,
+  'take_profit.t2_pct': 7.0,
+  'take_profit.t3_pct': 9.0,
+  'take_profit.final_tranche_trail_pct': 0.5,
+  'take_profit.dollar_target_enabled': 'false',
+  'take_profit.dollar_target_amount': 30.0,
+  'take_profit.dollar_target_trail_pct': 1.0,
+  'portfolio.max_positions': 15,
+  'portfolio.initial_capital': 10000,
+  'risk_management.max_position_pct': 7.0,
+  'risk_management.starting_position_pct': 3.0,
+  'risk_management.min_cash_reserve_pct': 2.0,
+  'risk_management.daily_loss_limit_pct': 2.0,
+  'risk_management.max_loss_per_trade_pct': 2.0,
+  'risk_management.sector_concentration_enabled': 'true',
+  'risk_management.max_sector_positions': 3,
+  'risk_management.drawdown_halt_pct': 5.0,
+  'risk_management.drawdown_defensive_pct': 10.0,
+  'risk_management.drawdown_exit_review_pct': 15.0,
+  'risk_management.trailing_stop_enabled': 'true',
+  'risk_management.trailing_stop_follow_tp_targets': 'false',
+  'risk_management.protection_gap_alert_delay_seconds': 30,
+  'research.min_conviction_score': 6.8,
+  'research.on_deck_conviction_band': 0.2,
+  'research.on_deck_removal_conviction': 3,
+  'research.min_risk_reward_ratio': 2.1,
+  'research.on_deck_rr_floor_margin': -0.4,
+  'research.on_deck_rr_conviction_step': 0.1,
+  'research.on_deck_rr_floor': 1.5,
+  'research.long_term_trend_years': 5,
+  'research.on_deck_entry_mode': 'ai',
+  'research.on_deck_ai_entry_low_refresh_pct': 1.0,
+  'research.on_deck_ai_entry_arm_band_pct': 2.0,
+  'research.on_deck_retracement_pct': 20.0,
+  'research.on_deck_recovery_retry_pct': 2.0,
+  'research.on_deck_max_dip_low_age_days': 14,
+  'research.on_deck_no_dip_pct_gain': 10.0,
+  'research.on_deck_up_ticks_needed': 7,
+  'research.on_deck_up_ratio_window': 10,
+  'research.on_deck_history_days': 30,
+  'research.on_deck_max_size': 5,
+  'research.on_deck_backfill_enabled': 'true',
+  'research.on_deck_swap_margin': 2.0,
+  'research.on_deck_backfill_retry_cooldown_minutes': 5,
+  'research.wash_sale_cooldown_days': 31,
+  'research.on_deck_auto_deep_dive': 'true',
+  'research.on_deck_block_breakout_pct': 2.0,
+  'research.position_deep_dive_enabled': 'true',
+  'research.position_deep_dive_interval_hours': 3,
+  'research.position_monitor_interval_minutes': 120,
+  'research.position_monitor_profitable_skip_pct': 2.0,
+  'research.position_monitor_event_proximity_pct': 2.0,
+  'research.position_monitor_event_cooldown_minutes': 60,
+  'research.position_monitor_loss_trigger_pct': 3.0,
+  'research.position_monitor_loss_retrigger_pct': 1.0,
+  'research.scan_time_0': '09:45',
+  'research.scan_time_1': '12:30',
+  'research.midday_scan_enabled': 'true',
+  'research.midday_scan_time_0': '10:30',
+  'research.midday_scan_time_1': '13:30',
+  'research.pre_open_batch_hours': 1.5,
+  'research.auto_buy_cutoff_time': '15:30',
+  'trading.paper_trading': 'true',
+  'trading.broker': 'alpaca',
+  'trading.auto_execute': 'true',
+  'research.model_quick_scan': 'claude-haiku-4-5',
+  'research.model_deep_dive': 'claude-sonnet-5',
+  'research.model_deeper_dive': 'claude-opus-4-8',
+  'research.model_pre_open_scan': 'claude-haiku-4-5',
+  'research.model_position_monitor': 'claude-haiku-4-5',
+  'research.model_dip_entry': 'claude-haiku-4-5',
+  'research.model_periodic_deep_dive': 'claude-haiku-4-5',
+  'research.model_portfolio_health': 'claude-haiku-4-5',
+  'dashboard.ticker_tape_crypto_count': 1,
+  'dashboard.chart_show_price': false,
+  'dashboard.chart_show_gate': true,
+  'dashboard.chart_show_targets': true,
+  'dashboard.chart_show_highlow': true,
+  'dashboard.chart_show_markers': true,
+};
+
+// Track original values to detect changes. Checkboxes (added 2026-07-18, On Deck chart
+// display toggles) store/compare .checked instead of .value -- a checkbox's .value is just
+// its static "on" attribute regardless of checked state, so treating it like every other
+// .setting-input here would never detect a real change. change is the right event for a
+// checkbox (input doesn't fire reliably for a mouse-toggled checkbox in every browser).
+const originals = {};
+document.querySelectorAll('.setting-input').forEach(el => {
+  const isCb = el.type === 'checkbox';
+  originals[el.name] = isCb ? el.checked : el.value;
+  el.addEventListener(isCb ? 'change' : 'input', () => {
+    const cur = isCb ? el.checked : el.value;
+    el.classList.toggle('changed', cur !== originals[el.name]);
+  });
+});
+
+const DEFAULT_UNIVERSE = ['S&P 500', 'S&P 400', 'S&P 600', 'Nasdaq 100', 'Dow Jones 30'];
+function resetChanges() {
+  if (!confirm('Reset all settings to factory defaults? This will overwrite your custom values — you will still need to click Save to make it permanent.')) return;
+  document.querySelectorAll('.setting-input').forEach(el => {
+    if (el.type === 'checkbox') {
+      el.checked = el.name in DEFAULTS ? DEFAULTS[el.name] : originals[el.name];
+    } else if (el.name in DEFAULTS) {
+      el.value = DEFAULTS[el.name];
+    } else {
+      el.value = originals[el.name];
+    }
+    el.classList.remove('changed');
+  });
+  document.querySelectorAll('.universe-cb').forEach(cb => {
+    cb.checked = DEFAULT_UNIVERSE.includes(cb.value);
+  });
+}
+
+function showToast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = `toast show ${type}`;
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+async function saveSettings() {
+  const btn = document.getElementById('saveBtn');
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+
+  const payload = {};
+  document.querySelectorAll('.setting-input').forEach(el => {
+    payload[el.name] = el.type === 'checkbox' ? (el.checked ? 'true' : 'false') : el.value;
+  });
+
+  // Collect checked universe indexes
+  const universeIndexes = [];
+  document.querySelectorAll('.universe-cb:checked').forEach(cb => universeIndexes.push(cb.value));
+  payload['research.universe_indexes'] = JSON.stringify(universeIndexes);
+
+  // Combine the two scan time inputs into a JSON array
+  const scanTimes = [];
+  ['research.scan_time_0','research.scan_time_1'].forEach(k => {
+    if (payload[k]) scanTimes.push(payload[k]);
+    delete payload[k];
+  });
+  if (scanTimes.length) payload['research.scan_times'] = JSON.stringify(scanTimes);
+
+  // Combine the two mid-day re-scan time inputs into a JSON array
+  const middayScanTimes = [];
+  ['research.midday_scan_time_0','research.midday_scan_time_1'].forEach(k => {
+    if (payload[k]) middayScanTimes.push(payload[k]);
+    delete payload[k];
+  });
+  if (middayScanTimes.length) payload['research.midday_scan_times'] = JSON.stringify(middayScanTimes);
+
+  try {
+    const resp = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      document.querySelectorAll('.setting-input').forEach(el => {
+        originals[el.name] = el.type === 'checkbox' ? el.checked : el.value;
+        el.classList.remove('changed');
+      });
+      showToast('Settings saved', 'success');
+    } else {
+      showToast(data.detail || 'Save failed', 'error');
+    }
+  } catch {
+    showToast('Network error', 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = 'Save Settings';
+}
+
+const KEY_NAMES = {
+  'ANTHROPIC_API_KEY': 'Anthropic API Key',
+  'ALPACA_API_KEY':    'Alpaca API Key',
+  'ALPACA_BASE_URL':   'Alpaca Base URL',
+  'FINNHUB_API_KEY':   'Finnhub API Key',
+  'NEWSAPI_API_KEY':   'NewsAPI Key',
+};
+const KEY_SECRETS = { 'ALPACA_API_KEY': 'ALPACA_SECRET_KEY' };
+
+let _keyData = {};
+let _editingKey = null;
+
+async function loadApiKeys() {
+  // Refresh status dots after a save — rows are already rendered server-side
+  try {
+    const resp = await fetch('/api/keys/masked');
+    if (!resp.ok) return;
+    _keyData = await resp.json();
+    Object.entries(KEY_NAMES).forEach(([k]) => {
+      const row = document.getElementById('key-row-' + k);
+      if (!row) return;
+      const dot = row.querySelector('span');
+      if (!dot) return;
+      const isSet = !!_keyData[k];
+      dot.style.color = isSet ? 'var(--green)' : 'var(--text-muted)';
+      dot.textContent = isSet ? '● set' : 'not set';
+    });
+  } catch (e) { /* ignore — server-side rows already visible */ }
+}
+
+// Server-rendered key values available for pre-filling edit modal
+const SERVER_KEY_VALUES = {
+  {% for key, info in api_keys.items() %}'{{ key }}': '{{ info.value }}',
+  {% endfor %}
+};
+function openKeyModal(k) {
+  _editingKey = k;
+  document.getElementById('keyModalTitle').textContent = 'Edit — ' + KEY_NAMES[k];
+  document.getElementById('keyModalLabel').textContent = k;
+  document.getElementById('keyModalInput').value = _keyData[k] || SERVER_KEY_VALUES[k] || '';
+  const secretKey = KEY_SECRETS[k];
+  const secretRow = document.getElementById('keyModalSecretRow');
+  if (secretKey) {
+    secretRow.style.display = 'block';
+    secretRow.querySelector('label').textContent = secretKey;
+    document.getElementById('keyModalSecretInput').value = _keyData[secretKey] || '';
+  } else {
+    secretRow.style.display = 'none';
+  }
+  document.getElementById('keyModalOverlay').classList.add('active');
+  document.getElementById('keyModalInput').focus();
+}
+
+function closeKeyModal(e) {
+  if (e && e.target !== document.getElementById('keyModalOverlay')) return;
+  document.getElementById('keyModalOverlay').classList.remove('active');
+  _editingKey = null;
+}
+
+async function saveKeyModal() {
+  if (!_editingKey) return;
+  const payload = {};
+  const val = document.getElementById('keyModalInput').value.trim();
+  if (val) payload[_editingKey] = val;
+  const secretKey = KEY_SECRETS[_editingKey];
+  if (secretKey) {
+    const sv = document.getElementById('keyModalSecretInput').value.trim();
+    if (sv) payload[secretKey] = sv;
+  }
+  if (!Object.keys(payload).length) { closeKeyModal(); return; }
+  const resp = await fetch('/api/keys', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const status = document.getElementById('keys-status');
+  if (resp.ok) {
+    Object.assign(_keyData, payload);
+    status.style.color = 'var(--green)';
+    status.textContent = 'Key saved';
+    closeKeyModal();
+    loadApiKeys();
+  } else {
+    status.style.color = 'var(--red)';
+    status.textContent = 'Failed to save';
+  }
+  setTimeout(() => status.textContent = '', 3000);
+}
+loadApiKeys();
+
+async function restartServer() {
+  if (!confirm('Restart the server? Active scans will be interrupted (~5 sec downtime).')) return;
+  await fetch('/api/restart', {method:'POST'});
+  document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#0a0e17;color:#f59e0b;font-size:18px;font-family:sans-serif">Restarting… refreshing in 8 seconds</div>';
+  setTimeout(() => location.href = '/', 8000);
+}
+
+// 2026-08-08, GitHub #46 -- explicit, confirmable recovery for a false-positive
+// drawdown halt (peak_value only ratchets up, nothing resets it automatically).
+async function recalibrateDrawdownBaseline() {
+  if (!confirm('Reset the drawdown baseline to your real current Alpaca balance?\n\n'
+    + 'Only do this if a drawdown halt does NOT reflect real trading losses (e.g. you '
+    + 'manually changed the account balance). This does not touch positions, cash, or '
+    + 'any other setting.')) return;
+  try {
+    const resp = await fetch('/api/recalibrate-drawdown-baseline', {method: 'POST'});
+    const data = await resp.json();
+    if (data.status === 'ok') {
+      showToast(
+        `Baseline reset: $${data.old_peak_value.toFixed(2)} → $${data.new_peak_value.toFixed(2)} `
+        + `(${data.old_drawdown_state} → ${data.new_drawdown_state})`, 'success');
+    } else {
+      showToast(data.message || 'Recalibration failed', 'error');
+    }
+  } catch (e) {
+    showToast('Network error', 'error');
+  }
+}
+
+// Theme toggle (2026-07-28) -- per-device only, see the inline <head> script for the
+// initial-load detection this button state mirrors.
+function setTheme(theme) {
+  localStorage.setItem('theme', theme);
+  document.documentElement.setAttribute('data-theme', theme);
+  updateThemeButtons(theme);
+}
+function updateThemeButtons(theme) {
+  document.getElementById('themeBtnDark').classList.toggle('active', theme === 'dark');
+  document.getElementById('themeBtnLight').classList.toggle('active', theme === 'light');
+}
+updateThemeButtons(document.documentElement.getAttribute('data-theme'));
+</script>
+</body>
+</html>
