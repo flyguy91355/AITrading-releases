@@ -2638,7 +2638,17 @@ function renderRRSparklineLWC(container, points, targets, gate, convictionOk, cl
   gate = gate != null ? gate : _MIN_RR_GATE;
   clearColor = clearColor || '#00e691';
   const last = valid[valid.length - 1].rr;
-  const color = (last >= gate && convictionOk) ? clearColor : '#ff3b5c';
+  // Fixed 2026-08-12, owner report: this used to require `last >= gate` (fully crossed)
+  // to show clearColor, which directly contradicted the R/R badge text right next to
+  // it -- that badge already colors green for anything in the qualifying WATCH range
+  // (_rrInQualifyingRange: floor <= rr <= gate), not just fully-crossed candidates. A
+  // candidate genuinely in-range read as a rejected/bad pick on the chart while its own
+  // badge said the opposite. Now uses the same floor _rrInQualifyingRange uses, so
+  // anything from the floor upward (the whole qualifying range, AND anywhere above the
+  // gate) reads as clearColor; only genuinely below the floor (or conviction not OK)
+  // still shows red.
+  const floor = _ON_DECK_RR_FLOOR_MARGIN != null ? gate + _ON_DECK_RR_FLOOR_MARGIN : -Infinity;
+  const color = (last >= floor && convictionOk) ? clearColor : '#ff3b5c';
   const data = valid.map(p => ({ time: p.t, value: p.rr }));
   const result = renderLightweightChart(container, [
     { type: 'area', data, color, topColor: color, bottomColor: 'transparent' },
