@@ -7,6 +7,16 @@
 # "severity: <level>" line prepended -- src/update/release_client.py's
 # parse_release_notes() reads this line to set the severity shown on any
 # install's dashboard.
+#
+# 2026-08-12 fix: this script used to ONLY tag whatever already happened to be
+# sitting in AITrading-releases' own git history -- it never actually synced
+# fresh code there. Several rounds of real fixes went out this way, tagged as
+# if they were included, while the releases repo silently stayed on its
+# original bootstrap snapshot the whole time (caught before anyone applied
+# one of the stale tags). Now always pushes a fresh mirror of the same
+# allow-listed paths is_path_updatable() (src/update/apply.py) permits an
+# apply to touch, before ever creating the tag -- so a cut release can no
+# longer silently point at stale code.
 
 set -euo pipefail
 
@@ -35,6 +45,33 @@ if [ -z "$RELEASES_REPO" ]; then
     echo "Could not read update.releases_repo from config/settings.yaml"
     exit 1
 fi
+
+echo "Syncing a fresh code snapshot to $RELEASES_REPO before tagging..."
+CLONE_DIR=$(mktemp -d)
+trap 'rm -rf "$CLONE_DIR"' EXIT
+
+git clone --quiet "https://github.com/${RELEASES_REPO}.git" "$CLONE_DIR"
+find "$CLONE_DIR" -mindepth 1 -maxdepth 1 -not -name '.git' -exec rm -rf {} +
+
+FILELIST=$(mktemp)
+git ls-files -- src/ web/ scripts/ requirements.txt requirements-lock.txt start.py > "$FILELIST"
+while IFS= read -r f; do
+    mkdir -p "$CLONE_DIR/$(dirname "$f")"
+    cp "$f" "$CLONE_DIR/$f"
+done < "$FILELIST"
+rm -f "$FILELIST"
+
+pushd "$CLONE_DIR" > /dev/null
+git add -A
+if git diff --cached --quiet; then
+    echo "No code changes since the last release sync -- releases repo already current."
+else
+    git -c user.email="flyguy91355@gmail.com" -c user.name="flyguy91355" \
+        commit --quiet -m "Sync $(date -u +%Y-%m-%d) for $VERSION_TAG"
+    git push --quiet origin main
+    echo "Pushed fresh code snapshot."
+fi
+popd > /dev/null
 
 BODY_FILE=$(mktemp)
 echo "severity: $SEVERITY" > "$BODY_FILE"
