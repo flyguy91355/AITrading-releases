@@ -154,6 +154,7 @@ TODAY'S DATE: {current_date} — every catalyst timeframe or referenced event mu
 STOCK: {ticker} — {company_name}
 CURRENT PRICE: ${current_price:.2f}
 INITIAL SCREEN SIGNAL: {signal} (Conviction: {conviction}/10)
+INITIAL SCREEN FAIR VALUE ESTIMATE: ${prior_fair_value:.2f} (margin of safety {prior_mos:.1f}%) — your own quick-scan estimate for this same stock, moments ago. Refine this with the full valuation work below rather than deriving an unrelated new estimate from scratch; a material change from this number should be explainable by something specific in your reasoning, not an unexplained jump.
 
 ── FUNDAMENTAL DATA ──
 {fundamental_summary}
@@ -220,6 +221,7 @@ Rules:
 - STRONG SELL if significant downside risk, broken thesis, or structural headwinds
 - probability_pct across all three scenarios must sum to 100
 - Every numeric field you output (stop_loss, entry_price, entry_zone_low, entry_zone_high) must be used consistently everywhere else in your response, including inside enhanced_reasoning — never state a different number in your narrative than what you output in these fields.
+- fair_value_estimate must be the actual output of the valuation methodology you describe in valuation_analysis — never state one intrinsic value range or figure in valuation_analysis and then output a different number in the fair_value_estimate field.
 
 Respond with ONLY the JSON object, no other text.
 """
@@ -1448,6 +1450,8 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             current_price=quote.price,
             signal=report.signal.value,
             conviction=report.conviction_score,
+            prior_fair_value=report.fair_value_estimate,
+            prior_mos=report.margin_of_safety_pct,
             fundamental_summary=report.fundamental_summary,
             insider_summary=report.insider_summary,
             news_summary=report.news_summary,
