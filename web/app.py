@@ -5171,6 +5171,40 @@ class DashboardState:
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
                 return
 
+            # Above-gate ambiguity check at the actual buy trigger (2026-08-13, owner
+            # design after the OXY incident) -- clearing the gate here can mean a genuine
+            # opportunity, or the same ambiguity _on_deck_ai_gate_above_gate already
+            # judges for retention/backfill: a tight stop sitting close to price
+            # mechanically inflating the ratio without the setup actually improving. That
+            # judgment already ran on OXY itself twice the same morning (both declines,
+            # at persist-check and at an On Shore backfill check) but never at the actual
+            # moment of spending real money -- the highest-stakes place to ask it.
+            # fail_default=False: a call failure blocks the buy rather than letting a
+            # missing AI judgment wave one through, same AI Data Integrity principle as
+            # every other real trading figure in this codebase. Not an eviction on "no" --
+            # treated the same as any other gate failure in this function (this specific
+            # attempt didn't land, the candidate keeps watching); _refresh_nm_from_report
+            # resets the uptick streak so it can't immediately re-fire on the same
+            # unchanged setup next tick.
+            if _on_deck_rr_above_gate(rr, min_rr):
+                still_good_buy, reasoning = await self._on_deck_ai_gate_above_gate(
+                    ticker=ticker, company_name=report.company_name, thesis=report.thesis,
+                    price=report.entry_price, fair_value_estimate=fair_value,
+                    stop_loss=report.stop_loss, rr=rr, required_rr=min_rr,
+                    conviction_score=report.conviction_score, fail_default=False,
+                )
+                if not still_good_buy:
+                    entry = self.add_ai_log(ticker, "ON_DECK",
+                        f"R/R {rr:.2f} above its own gate ({min_rr:.2f}) at the buy trigger "
+                        f"— AI judged it's not a genuine opportunity: {reasoning}", "warning")
+                    await self.broadcast({"type": "ai_log", "entry": entry})
+                    self._record_promotion_attempt(
+                        ticker, dip_low,
+                        f"R/R above gate, AI declined at buy trigger ({rr:.2f} > {min_rr:.2f})",
+                        conviction=report.conviction_score, rr=rr, price=report.entry_price)
+                    _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
+                    return
+
             if ticker in self.portfolio.positions:  # re-check post-await race
                 return
 
@@ -5854,32 +5888,38 @@ Respond with ONLY the summary text, no preamble, no markdown."""
     ) -> tuple[bool, str]:
         """Shared AI judgment for a candidate whose R/R sits above its own real gate
         (2026-08-05, owner design). Used for RETENTION (an already-listed candidate
-        found above gate at persist-check) and for exactly ONE admission path --
+        found above gate at persist-check), for one admission path --
         `_backfill_on_deck_from_on_shore` -- the only one where a candidate genuinely
         has a track record of being watched rise past its own gate while listed
-        before getting bumped for an unrelated reason. Deliberately NOT used at the
-        other 3 admission sites (a fresh universe-scan result, the startup cache
-        restore, the on-demand Settings-triggered refill): a candidate found above
-        its own gate there has zero track record, and owner explicitly wants those
-        excluded mechanically, no AI call, no exception -- "ai is for a stock that
-        has risen up past the gate," not one that simply happened to already be
-        above it the first time it was ever looked at.
+        before getting bumped for an unrelated reason, and, as of 2026-08-13, for
+        the actual PROMOTION/BUY TRIGGER itself (`_attempt_near_miss_promotion`) --
+        see that call site's own comment for the OXY incident that prompted
+        extending this here: the identical ambiguity this function already judged
+        for admission/retention was, until this date, never asked at the one moment
+        that actually spends real money. Deliberately NOT used at the other 3
+        admission sites (a fresh universe-scan result, the startup cache restore,
+        the on-demand Settings-triggered refill): a candidate found above its own
+        gate there has zero track record, and owner explicitly wants those excluded
+        mechanically, no AI call, no exception -- "ai is for a stock that has risen
+        up past the gate," not one that simply happened to already be above it the
+        first time it was ever looked at.
 
         R/R above the gate is ambiguous on its own -- it can mean genuine
-        undervaluation, or it can simply mean price kept falling toward the stop,
-        which mechanically inflates the ratio without the setup improving. Owner
-        explicitly rejected a hardcoded numeric ceiling for "how far above is too
-        far" ("i dont know when it would not be a good buy.. maybe something for ai
-        to choose"), so this asks Claude directly, with real reasoning, rather than
-        gating on a margin.
+        undervaluation, or it can simply mean price kept falling toward the stop
+        (or, per the OXY incident, a fresh re-analysis simply plants a tight stop
+        right under a recent low), which mechanically inflates the ratio without
+        the setup improving. Owner explicitly rejected a hardcoded numeric ceiling
+        for "how far above is too far" ("i dont know when it would not be a good
+        buy.. maybe something for ai to choose"), so this asks Claude directly,
+        with real reasoning, rather than gating on a margin.
 
         fail_default controls what happens on any call failure (no API key,
         malformed response, API error) -- the caller passes True for retention (fail
-        toward keeping the status quo of being listed) and False for the one
-        admission call site (fail toward keeping the status quo of NOT being
-        listed), so a failure never actively changes anything either direction --
-        same AI Data Integrity principle as every other real trading figure in this
-        codebase."""
+        toward keeping the status quo of being listed) and False for both admission
+        call sites and the buy trigger (fail toward keeping the status quo of NOT
+        being listed / NOT buying), so a failure never actively changes anything or
+        spends money either direction -- same AI Data Integrity principle as every
+        other real trading figure in this codebase."""
         retention = await self.research_engine.recommend_on_deck_retention(
             ticker=ticker, company_name=company_name, thesis=thesis, price=price,
             fair_value_estimate=fair_value_estimate, stop_loss=stop_loss, rr=rr,
