@@ -652,6 +652,14 @@ tbody tr:hover { background: var(--bg-card-hover); }
 .trade-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 200; }
 .trade-modal-overlay.active { display: flex; }
 .trade-modal { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; width: 420px; max-width: 90vw; }
+/* Loading spinner (2026-08-14, owner request) -- shown immediately when a popup starts
+   fetching, replaced once real content arrives. Several popups used to fetch first and
+   only open/update afterward, so clicking one visibly did nothing for however long the
+   real network call took -- this exists so there's always some visible feedback that
+   something is happening, not just a delay with no signal either way. */
+.spinner-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 48px 12px; color: var(--text-muted); font-size: 13px; }
+.spinner { width: 32px; height: 32px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spinner-spin 0.8s linear infinite; }
+@keyframes spinner-spin { to { transform: rotate(360deg); } }
 .trade-modal h3 { margin-bottom: 16px; }
 .trade-field { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); }
 .trade-field label { color: var(--text-secondary); }
@@ -1902,6 +1910,12 @@ async function fetchPerformanceSparklines() {
   } catch (e) { console.error('fetchPerformanceSparklines:', e); }
 }
 
+// Shared loading-spinner markup (2026-08-14) -- see the .spinner-wrap/.spinner CSS
+// comment for why this exists. label is optional context text under the spinner.
+function spinnerHtml(label) {
+  return `<div class="spinner-wrap"><div class="spinner"></div>${label ? `<div>${label}</div>` : ''}</div>`;
+}
+
 function fmtWeekRange(startIso, endIso) {
   const opts = { month: 'short', day: 'numeric' };
   const start = new Date(startIso + 'T00:00:00');
@@ -2003,21 +2017,37 @@ function renderWinLossList(data) {
 }
 
 async function openWinLossPopup() {
-  let data = {};
-  try {
-    const resp = await fetch('/api/win-loss-trades');
-    data = await resp.json();
-  } catch (e) { console.error('openWinLossPopup:', e); }
   document.getElementById('ddModalTicker').textContent = 'Win Rate — Closed Trades';
   document.getElementById('ddModalBizSummary').innerHTML = '';
   document.getElementById('ddRunDiveBtn').style.display = 'none';
   document.getElementById('ddRerunBtn').style.display = 'none';
   document.getElementById('ddDiveAgainBtn').style.display = 'none';
-  document.getElementById('ddModalBody').innerHTML = renderWinLossList(data);
+  document.getElementById('ddModalBody').innerHTML = spinnerHtml();
   document.getElementById('deepDiveModal').classList.add('active');
+
+  let data = {};
+  try {
+    const resp = await fetch('/api/win-loss-trades');
+    data = await resp.json();
+  } catch (e) { console.error('openWinLossPopup:', e); }
+  document.getElementById('ddModalBody').innerHTML = renderWinLossList(data);
 }
 
 async function openPerformancePopup(kind) {
+  document.getElementById('ddModalBizSummary').innerHTML = '';
+  document.getElementById('ddRunDiveBtn').style.display = 'none';
+  document.getElementById('ddRerunBtn').style.display = 'none';
+  document.getElementById('ddDiveAgainBtn').style.display = 'none';
+  document.getElementById('ddModalBody').innerHTML = spinnerHtml();
+  // Width and .active both set immediately, before either branch's fetch below, so the
+  // modal (and a visible spinner inside it) appears the instant this is called instead of
+  // however long the real network call takes (2026-08-14 owner report: popups showed
+  // nothing at all during that wait, reading as "not working"). Same 860px both branches
+  // already used post-fetch -- setting it upfront doesn't change anything either branch
+  // does once its own data arrives, just moves the modal's own appearance earlier.
+  document.querySelector('#deepDiveModal .trade-modal').style.width = '860px';
+  document.getElementById('deepDiveModal').classList.add('active');
+
   if (kind === 'week') {
     let weeks = [];
     try {
@@ -2026,43 +2056,28 @@ async function openPerformancePopup(kind) {
       weeks = data.weeks || [];
     } catch (e) { console.error('openPerformancePopup(week):', e); }
     document.getElementById('ddModalTicker').textContent = 'Week P/L — Weekly Breakdown';
-    document.getElementById('ddModalBizSummary').innerHTML = '';
-    document.getElementById('ddRunDiveBtn').style.display = 'none';
-    document.getElementById('ddRerunBtn').style.display = 'none';
-    document.getElementById('ddDiveAgainBtn').style.display = 'none';
     document.getElementById('ddModalBody').innerHTML = renderWeeklyPnlList(weeks);
-    // Widen the shared modal -- the default 600px (sized for text-heavy research/deep-dive
-    // content) truncated the $ figure on the right of each week's row (owner report,
-    // 2026-08-07). Same 860px used by the day/total/ytd chart popups below, for consistency.
-    document.querySelector('#deepDiveModal .trade-modal').style.width = '860px';
-    document.getElementById('deepDiveModal').classList.add('active');
     return;
   }
   const titles = {day: 'Day P/L — Today vs. Market', total: 'Total P/L — Since Inception vs. Market', ytd: 'YTD P/L — Year to Date vs. Market'};
+  document.getElementById('ddModalTicker').textContent = titles[kind];
   let data;
   try {
     const url = kind === 'day' ? '/api/performance-today' : `/api/performance-history?range=${kind === 'ytd' ? 'ytd' : 'all'}`;
     const resp = await fetch(url);
     data = await resp.json();
-  } catch (e) { console.error('openPerformancePopup:', e); return; }
-
-  if (!data.points || data.points.length < 2) {
-    document.getElementById('ddModalTicker').textContent = titles[kind];
-    document.getElementById('ddModalBizSummary').innerHTML = '';
-    document.getElementById('ddRunDiveBtn').style.display = 'none';
-    document.getElementById('ddRerunBtn').style.display = 'none';
-    document.getElementById('ddDiveAgainBtn').style.display = 'none';
+  } catch (e) {
+    console.error('openPerformancePopup:', e);
     document.getElementById('ddModalBody').innerHTML =
-      '<div style="color:var(--text-muted);font-size:12px;padding:12px;text-align:center;">Not enough history yet -- check back after the next daily snapshot.</div>';
-    document.getElementById('deepDiveModal').classList.add('active');
+      '<div style="color:var(--text-muted);font-size:12px;padding:12px;text-align:center;">Failed to load — try again.</div>';
     return;
   }
 
-  document.getElementById('ddModalTicker').textContent = titles[kind];
-  document.getElementById('ddModalBizSummary').innerHTML = '';
-  document.getElementById('ddRunDiveBtn').style.display = 'none';
-  document.getElementById('ddRerunBtn').style.display = 'none';
-  document.getElementById('ddDiveAgainBtn').style.display = 'none';
+  if (!data.points || data.points.length < 2) {
+    document.getElementById('ddModalBody').innerHTML =
+      '<div style="color:var(--text-muted);font-size:12px;padding:12px;text-align:center;">Not enough history yet -- check back after the next daily snapshot.</div>';
+    return;
+  }
   // Annualized extrapolation (2026-07-21) -- was only ever shown in the small stat card
   // underneath, never in this popup itself, which is the more natural place to look for it
   // right next to the actual chart it's extrapolated from. Total/YTD only, matching the
@@ -2092,17 +2107,11 @@ async function openPerformancePopup(kind) {
       market-cap-tier composition, reconstructed day-by-day since inception.
       Hover the chart to see the exact value and date at any point.
     </div>`;
-  // Widen the shared modal for this one popup -- 600px (the default, sized for text-heavy
-  // research/deep-dive content) crushed the richer chart added 2026-07-21 (SVG version) /
-  // 2026-07-27 (Lightweight Charts version). Reset by closeDeepDiveModal() so every other
-  // caller of this same modal is unaffected.
-  document.querySelector('#deepDiveModal .trade-modal').style.width = '860px';
-  // The modal must be visible (.active, display:flex) BEFORE the chart is created --
-  // #deepDiveModal is display:none until this class is added, so perfChartContainer's
-  // clientWidth would read 0 (falling back to renderLightweightChart's 100px default,
-  // a narrow chart crushed into the left edge of the modal) if rendered any earlier
-  // (2026-07-27, caught live via screenshot).
-  document.getElementById('deepDiveModal').classList.add('active');
+  // Width and .active are already set at the top of this function now (2026-08-14) --
+  // both still need to happen before the chart renders below, which they do, just
+  // earlier than this line. perfChartContainer still only exists in the DOM from the
+  // innerHTML assignment just above, so the chart itself still can't render any sooner
+  // than this regardless.
   renderPerfLightweightChart(document.getElementById('perfChartContainer'), data.points, {height: 340});
 
   // Running per-day P/L history, Day P/L popup only (2026-08-14 owner request) --
@@ -4137,7 +4146,7 @@ async function clickStock(ticker) {
 async function openPortfolioSummary() {
   document.getElementById('portfolioSummaryModal').classList.add('active');
   const body = document.getElementById('portfolioSummaryBody');
-  body.innerHTML = 'Loading...';
+  body.innerHTML = spinnerHtml();
 
   let summary;
   try {
@@ -4244,16 +4253,29 @@ function _onDeckOrShore(ticker) {
 async function appendOnDeckChart(ticker) {
   const which = _onDeckOrShore(ticker);
   if (!which) return;
+  const body = document.getElementById('ddModalBody');
+  if (!body) return;
+  // Placeholder inserted immediately, before the fetch below, so the modal (already open
+  // and showing the rest of the report synchronously from clickStock) doesn't just have a
+  // silent gap where the chart will eventually appear (2026-08-14 owner report). Replaced
+  // in place, not a second insertAdjacentHTML -- this function only ever appends once per
+  // modal open, so there's exactly one placeholder to find and swap out below.
+  body.insertAdjacentHTML('afterbegin', `<div id="onDeckChartSlot-${ticker}">${spinnerHtml()}</div>`);
+
   let data;
   try {
     const url = which.source === 'ondeck' ? `/api/near-miss/${ticker}/history` : `/api/today-scan-rejects/${ticker}/history`;
     const resp = await fetch(url);
-    if (!resp.ok) return;  // candidate may have just been bought/removed — fail quietly
+    if (!resp.ok) { document.getElementById(`onDeckChartSlot-${ticker}`)?.remove(); return; }
     data = await resp.json();
-  } catch (e) { console.error('appendOnDeckChart:', e); return; }
+  } catch (e) {
+    console.error('appendOnDeckChart:', e);
+    document.getElementById(`onDeckChartSlot-${ticker}`)?.remove();
+    return;
+  }
 
-  const body = document.getElementById('ddModalBody');
-  if (!body) return;
+  const slot = document.getElementById(`onDeckChartSlot-${ticker}`);
+  if (!slot) return;  // modal was closed (or reopened for a different ticker) before this resolved
   // dipEntrySummary reads last_price/direction/streak/ai_entry_low_ref, none of which this
   // history endpoint returns (it's just the chart series) — reuse nearMissData[ticker], the
   // exact same object the card already rendered from, rather than duplicating those fields
@@ -4276,7 +4298,7 @@ async function appendOnDeckChart(ticker) {
       <div id="rrChartContainer-${ticker}" style="cursor:pointer;" onclick="openChartExpand('${ticker}')"></div>
       <div style="font-size:11.5px;color:var(--text-secondary);margin-top:10px;line-height:1.5;">${summaryHtml}</div>
     </div>`;
-  body.insertAdjacentHTML('afterbegin', chartHtml);
+  slot.outerHTML = chartHtml;
   renderRRLightweightChart(document.getElementById(`rrChartContainer-${ticker}`), data.points, data.min_rr, targets, Object.assign({height: 140}, rrOpts));
 }
 
@@ -4284,6 +4306,10 @@ async function openChartExpand(ticker) {
   if (positionData[ticker]) return openPositionChartExpand(ticker);
   const which = _onDeckOrShore(ticker);
   if (!which) return;
+  document.getElementById('chartExpandTitle').textContent = ticker;
+  document.getElementById('chartExpandBody').innerHTML = spinnerHtml();
+  document.getElementById('chartExpandModal').style.display = 'flex';
+
   let data;
   try {
     const url = which.source === 'ondeck' ? `/api/near-miss/${ticker}/history` : `/api/today-scan-rejects/${ticker}/history`;
@@ -4306,10 +4332,6 @@ async function openChartExpand(ticker) {
     <div id="rrExpandChartContainer"></div>
     <div style="font-size:13px;color:var(--text-secondary);margin-top:16px;line-height:1.6;max-width:900px;">${summaryHtml}</div>
   `;
-  // Modal must be visible BEFORE the chart mounts (2026-07-27 lesson from the P/L popup
-  // width bug, see this plan's Global Constraints) -- style.display='flex' now runs before
-  // the render call, not after.
-  document.getElementById('chartExpandModal').style.display = 'flex';
   renderRRLightweightChart(document.getElementById('rrExpandChartContainer'), data.points, data.min_rr, targets, Object.assign({expanded: true, height: 520}, rrOpts));
 }
 
@@ -4317,6 +4339,10 @@ async function openChartExpand(ticker) {
 // a price chart (renderPositionChartSVG) with real entry/stop/TP reference lines instead of
 // the R/R chart, matching the compact chart already shown in showPositionDetail.
 async function openPositionChartExpand(ticker) {
+  document.getElementById('chartExpandTitle').textContent = ticker;
+  document.getElementById('chartExpandBody').innerHTML = spinnerHtml();
+  document.getElementById('chartExpandModal').style.display = 'flex';
+
   let data;
   try {
     const resp = await fetch(`/api/position/${ticker}/history`);
@@ -4338,9 +4364,6 @@ async function openPositionChartExpand(ticker) {
     <div id="positionExpandChartContainer"></div>
     ${summaryHtml ? `<div style="font-size:13px;color:var(--text-secondary);margin-top:16px;line-height:1.6;max-width:900px;">${summaryHtml}</div>` : ''}
   `;
-  // Modal must be visible BEFORE the chart mounts -- same fix as openChartExpand (Task 2,
-  // Step 3) applied here too.
-  document.getElementById('chartExpandModal').style.display = 'flex';
   const entryTime = data.opened_at ? Math.floor(parseUtcTimestamp(data.opened_at).getTime() / 1000) : null;
   renderPositionLightweightChart(document.getElementById('positionExpandChartContainer'), data.points, refLines, { height: 520, entryTime });
 }

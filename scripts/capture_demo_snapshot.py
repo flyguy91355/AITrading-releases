@@ -2,16 +2,24 @@
 """Captures a full JSON snapshot of the live dashboard's real data for the
 investor demo -- see
 docs/superpowers/specs/2026-08-14-interactive-demo-design.md for the full
-design. Run manually whenever the demo needs refreshing; never scheduled.
+design.
 
-Usage: python3 scripts/capture_demo_snapshot.py <dashboard-password>
+Usage: python3 scripts/capture_demo_snapshot.py [dashboard-password]
+The password can be passed explicitly (interactive/manual use) or omitted,
+in which case it's read from DASHBOARD_PASSWORD in the repo-root .env
+(2026-08-14, added specifically so a scheduled/unattended refresh -- see
+CronCreate in this same session -- doesn't need a human present to type
+it in each time; the CLI arg still works for a one-off manual run).
 Writes: data/demo_snapshot.json (refuses to write if the sensitive-data
 scan below finds a match -- see scan_for_sensitive_data).
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 import requests
 
@@ -92,11 +100,20 @@ def capture_all(session: requests.Session) -> dict:
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python3 scripts/capture_demo_snapshot.py <dashboard-password>")
+    load_dotenv()
+    if len(sys.argv) == 2:
+        password = sys.argv[1]
+    elif len(sys.argv) == 1:
+        password = os.getenv("DASHBOARD_PASSWORD", "")
+        if not password:
+            print("No password given and DASHBOARD_PASSWORD not set in .env")
+            print("Usage: python3 scripts/capture_demo_snapshot.py [dashboard-password]")
+            sys.exit(1)
+    else:
+        print("Usage: python3 scripts/capture_demo_snapshot.py [dashboard-password]")
         sys.exit(1)
 
-    session = login(sys.argv[1])
+    session = login(password)
     snapshot = capture_all(session)
 
     blob = json.dumps(snapshot)
