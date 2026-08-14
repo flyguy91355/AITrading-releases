@@ -4790,10 +4790,35 @@ function showDeepDiveModal(ticker, dd) {
 // plain HTTP over Tailscale, not HTTPS yet, so that call can silently fail here. Falls back
 // to the older textarea+execCommand('copy') approach, which works over plain HTTP, if the
 // modern API throws or isn't present at all.
+// A .pl-row (Week P/L, Day P/L, Win/Loss, and the position price ladder all share
+// this shape -- see .pos-detail-ladder's own CSS comment) lays its cells out with
+// flexbox, but every flex item is treated as its own block-level box for innerText
+// purposes regardless of its original <span> display value -- so plain innerText
+// puts each cell (date, %, $) on its own line instead of the single readable row
+// the page actually shows. Joins each row's direct children with wide spacing on
+// one line instead (2026-08-14, owner report: "when I copy. looks like crap").
+function plRowToCopyLine(row) {
+  return Array.from(row.children)
+    .map(c => c.textContent.trim())
+    .filter(Boolean)
+    .join('    ');
+}
+
 function copyDeepDiveContent() {
   const body = document.getElementById('ddModalBody');
   const ticker = document.getElementById('ddModalTicker').textContent || '';
-  const text = `${ticker}\n\n${body.innerText}`;
+  const lines = [];
+  body.childNodes.forEach(node => {
+    if (node.nodeType !== 1) return;
+    const ladder = node.classList && node.classList.contains('pos-detail-ladder') ? node : null;
+    if (ladder) {
+      ladder.querySelectorAll('.pl-row').forEach(row => lines.push(plRowToCopyLine(row)));
+    } else {
+      const t = node.innerText.trim();
+      if (t) lines.push(t);
+    }
+  });
+  const text = `${ticker}\n\n${lines.join('\n')}`;
   const btn = document.getElementById('ddCopyBtn');
   const showCopied = () => {
     if (!btn) return;
