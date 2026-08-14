@@ -1931,6 +1931,45 @@ function renderWeeklyPnlList(weeks) {
   return `<div class="pos-detail-ladder">${rows}</div>`;
 }
 
+// Short numeric label for .pl-label (which uppercases + min-widths its content,
+// tuned for "Wk 33"-style short labels) and a fuller weekday/date string for
+// .pl-price (which doesn't uppercase), mirroring exactly how renderWeeklyPnlList
+// splits "Wk 33" from its own longer date-range text above.
+function fmtDayShortLabel(iso) {
+  const d = new Date(iso + 'T00:00:00');
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+function fmtDayFullLabel(iso) {
+  const opts = { weekday: 'short', month: 'short', day: 'numeric' };
+  return new Date(iso + 'T00:00:00').toLocaleDateString('en-US', opts);
+}
+
+// Daily P/L history list (2026-08-14, owner request: "a running history of every
+// days P/L") -- same shape as renderWeeklyPnlList above, one row per trading day
+// instead of per ISO week. Appended below the existing Day P/L chart in
+// openPerformancePopup('day'), not a replacement for it.
+function renderDailyPnlList(days) {
+  if (!days || days.length === 0) {
+    return '<div style="color:var(--text-muted);font-size:12px;padding:12px;text-align:center;">Not enough history yet -- check back after the next daily snapshot.</div>';
+  }
+  const maxAbsPct = Math.max(...days.map(d => Math.abs(d.pnl_pct || 0)), 0.01);
+  const rows = days.map(d => {
+    const barPct = Math.min(Math.abs(d.pnl_pct || 0) / maxAbsPct * 100, 100);
+    const color = d.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    const rowCls = d.is_current ? 'pl-row pl-current' : 'pl-row';
+    const pctStr = d.pnl_pct != null ? fmtPct(d.pnl_pct, true) : '—';
+    return `<div class="${rowCls}">
+      <span class="pl-label">${fmtDayShortLabel(d.date)}</span>
+      <span class="pl-price">${fmtDayFullLabel(d.date)}${d.is_current ? ' (in progress)' : ''}</span>
+      <div class="pl-bar-wrap"><div class="pl-bar" style="width:${barPct}%;background:${color}"></div></div>
+      <span class="pl-pct" style="color:${color}">${pctStr}</span>
+      <span class="pl-desc" style="color:${color}">${fmt$(d.pnl, true)}</span>
+    </div>`;
+  }).join('');
+  return `<div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;margin:14px 0 6px;">Daily History — Since Inception</div>
+    <div class="pos-detail-ladder">${rows}</div>`;
+}
+
 function renderWinLossList(data) {
   const trades = data.trades || [];
   const summary = `
@@ -2066,6 +2105,18 @@ async function openPerformancePopup(kind) {
   // (2026-07-27, caught live via screenshot).
   document.getElementById('deepDiveModal').classList.add('active');
   renderPerfLightweightChart(document.getElementById('perfChartContainer'), data.points, {height: 340});
+
+  // Running per-day P/L history, Day P/L popup only (2026-08-14 owner request) --
+  // additive below the chart above, not a replacement for it. Fetched separately
+  // since it's independent of the chart's own data and shouldn't block the modal
+  // opening or the chart rendering.
+  if (kind === 'day') {
+    try {
+      const dResp = await fetch('/api/daily-pnl-history');
+      const dData = await dResp.json();
+      document.getElementById('ddModalBody').insertAdjacentHTML('beforeend', renderDailyPnlList(dData.days));
+    } catch (e) { console.error('openPerformancePopup(day history):', e); }
+  }
 }
 
 function renderPositions(positions) {

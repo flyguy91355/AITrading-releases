@@ -1801,6 +1801,46 @@ class DashboardState:
         buckets.sort(key=lambda b: (b["iso_year"], b["iso_week"]), reverse=True)
         return buckets
 
+    def _daily_pnl_buckets(self) -> list[dict]:
+        """Backs the Day P/L popup's running per-day history list (2026-08-14, owner
+        request: "a running history of every days P/L... backdate all the way to
+        inception"). Same day-over-day-diff shape as _weekly_pnl_buckets() above, just
+        against consecutive performance_history entries instead of ISO week boundaries
+        -- each settled day's P&L is that day's own portfolio_value minus the PRIOR
+        entry's (the very first entry in the file diffs against initial_capital, same
+        "no earlier snapshot yet" fallback _week_start_value uses).
+
+        Deliberately reads the full, unfiltered performance_history list, no recent-
+        window truncation -- checked live (2026-08-14) whether Alpaca's own portfolio-
+        history API could backfill further back than this file's own first entry
+        (2026-07-13): it can, down to 2026-07-07, but everything before
+        _LIVE_ACCOUNT_START (2026-07-12, the Sunday before that first Monday) is the
+        already-documented pre-migration dev/test window this codebase filters out
+        everywhere else -- so this file's own first entry already IS genuine day one,
+        nothing to backfill.
+
+        Today itself is intentionally NOT included here -- it's still in progress and
+        has no settled performance_history entry yet; the live figure for "today"
+        comes from Portfolio.day_pnl/day_pnl_pct directly (the same numbers already
+        driving the Day P/L tile), stitched in by the caller so today always shows
+        instantly rather than only appearing after tonight's snapshot job runs."""
+        if not self.performance_history:
+            return []
+        entries_sorted = sorted(self.performance_history, key=lambda p: p["date"])
+        buckets = []
+        prev_value = self.portfolio.initial_capital
+        for entry in entries_sorted:
+            value = entry["portfolio_value"]
+            pnl = value - prev_value
+            buckets.append({
+                "date": entry["date"],
+                "pnl": round(pnl, 2),
+                "pnl_pct": round(pnl / prev_value * 100, 2) if prev_value else None,
+            })
+            prev_value = value
+        buckets.reverse()
+        return buckets
+
     def _week_pnl(self) -> tuple[float | None, float | None]:
         """Live P&L for the CURRENT ISO calendar week -- same (pnl, pnl_pct) shape
         as before, but "week" now means a real Monday-Sunday ISO week (matching
@@ -8437,6 +8477,31 @@ async def get_weekly_pnl_history():
     current-week figure on, so the tile and this popup can never disagree
     about week boundaries or baseline values."""
     return {"weeks": state._weekly_pnl_buckets()}
+
+
+@app.get("/api/daily-pnl-history")
+async def get_daily_pnl_history():
+    """Backs the Day P/L popup's running per-day history list (2026-08-14) -- one
+    entry per settled trading day since genuine live-trading inception, newest
+    first, plus today's own still-live figure (Portfolio.day_pnl/day_pnl_pct, the
+    same numbers the Day P/L tile itself already shows) stitched on as the first
+    entry so today is never missing just because tonight's snapshot hasn't run
+    yet. See _daily_pnl_buckets()'s own docstring for why this doesn't need any
+    further backdating."""
+    days = state._daily_pnl_buckets()
+    today_str = state._now_et().strftime("%Y-%m-%d")
+    day_start = state.portfolio.day_start_value
+    today_entry = {
+        "date": today_str,
+        "pnl": round(state.portfolio.day_pnl, 2),
+        "pnl_pct": round((state.portfolio.day_pnl / day_start * 100) if day_start else 0, 2),
+        "is_current": True,
+    }
+    if days and days[0]["date"] == today_str:
+        days[0] = today_entry
+    else:
+        days.insert(0, today_entry)
+    return {"days": days}
 
 
 @app.get("/api/performance-today")
