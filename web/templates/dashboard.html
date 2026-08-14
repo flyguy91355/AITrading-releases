@@ -4804,21 +4804,65 @@ function plRowToCopyLine(row) {
     .join('    ');
 }
 
+function _escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// HTML twin of plRowToCopyLine (2026-08-14, owner follow-up: "format it to look
+// like what I see... with the graph and the numbers green and red"). Reads each
+// cell's OWN already-rendered inline color and (for .pl-bar-wrap, only present on
+// lists that still show one -- Week P/L, not the Day P/L list per the owner's own
+// earlier request to drop it there) its real bar width/color, rather than
+// hardcoding either -- so this stays a faithful mirror of whatever a given list
+// actually shows on screen, no per-list special-casing needed. Renders as a
+// <table> (not flex/grid) since that's what pastes reliably into Gmail/Outlook/
+// Google Docs -- rich-text paste targets have long had much better fidelity with
+// table markup than flexbox for exactly this kind of copied content.
+function plRowToCopyHtmlRow(row) {
+  const cells = Array.from(row.children).map(c => {
+    if (c.classList.contains('pl-bar-wrap')) {
+      const bar = c.querySelector('.pl-bar');
+      const width = bar ? bar.style.width : '0%';
+      const bg = bar ? bar.style.background : '#999';
+      return `<td style="padding:3px 10px;"><div style="width:60px;height:5px;background:#2a3a4e;border-radius:2px;overflow:hidden;"><div style="width:${width};height:100%;background:${bg};"></div></div></td>`;
+    }
+    const text = c.textContent.trim();
+    if (!text) return '';
+    const styleParts = [];
+    if (c.style.color) styleParts.push(`color:${c.style.color}`);
+    if (c.classList.contains('pl-label')) styleParts.push('font-weight:700', 'text-transform:uppercase');
+    const align = (c.classList.contains('pl-pct') || c.classList.contains('pl-desc')) ? 'text-align:right;' : '';
+    return `<td style="padding:3px 10px;${align}${styleParts.join(';')}">${_escHtml(text)}</td>`;
+  }).join('');
+  return `<tr>${cells}</tr>`;
+}
+
 function copyDeepDiveContent() {
   const body = document.getElementById('ddModalBody');
   const ticker = document.getElementById('ddModalTicker').textContent || '';
   const lines = [];
+  const htmlParts = [`<div style="font-family:sans-serif;"><h3>${_escHtml(ticker)}</h3>`];
   body.childNodes.forEach(node => {
     if (node.nodeType !== 1) return;
     const ladder = node.classList && node.classList.contains('pos-detail-ladder') ? node : null;
     if (ladder) {
-      ladder.querySelectorAll('.pl-row').forEach(row => lines.push(plRowToCopyLine(row)));
+      const rows = ladder.querySelectorAll('.pl-row');
+      rows.forEach(row => lines.push(plRowToCopyLine(row)));
+      const rowsHtml = Array.from(rows).map(plRowToCopyHtmlRow).join('');
+      htmlParts.push(`<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;">${rowsHtml}</table>`);
     } else {
       const t = node.innerText.trim();
-      if (t) lines.push(t);
+      if (t) {
+        lines.push(t);
+        htmlParts.push(`<div>${_escHtml(t).replace(/\n/g, '<br>')}</div>`);
+      }
     }
   });
+  htmlParts.push('</div>');
   const text = `${ticker}\n\n${lines.join('\n')}`;
+  const html = htmlParts.join('');
   const btn = document.getElementById('ddCopyBtn');
   const showCopied = () => {
     if (!btn) return;
@@ -4843,7 +4887,24 @@ function copyDeepDiveContent() {
     }
     document.body.removeChild(ta);
   };
-  if (navigator.clipboard && navigator.clipboard.writeText) {
+  // Rich (HTML + plain-text) clipboard write when available -- pasting into a
+  // rich-text target (email, Docs, Slack) then keeps the real colors and bar,
+  // not just the numbers. Falls back to plain-text-only for anything that
+  // doesn't support multi-format ClipboardItem (older Safari, non-browser
+  // contexts) -- same fallback chain as before this change, just one tier richer.
+  if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+    const item = new ClipboardItem({
+      'text/html': new Blob([html], { type: 'text/html' }),
+      'text/plain': new Blob([text], { type: 'text/plain' }),
+    });
+    navigator.clipboard.write([item]).then(showCopied).catch(() => {
+      if (navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(showCopied).catch(fallbackCopy);
+      } else {
+        fallbackCopy();
+      }
+    });
+  } else if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(showCopied).catch(fallbackCopy);
   } else {
     fallbackCopy();
