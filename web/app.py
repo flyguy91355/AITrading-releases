@@ -8442,14 +8442,31 @@ async def _live_benchmark_classifications(holdings_value: dict) -> dict:
 async def _fetch_today_etf_bars(classifications: dict) -> dict:
     """Shared by get_performance_history's live "today" stitch and
     get_performance_today -- today's intraday closes for every sector/cap-tier
-    ETF actually needed by the currently-classified holdings."""
+    ETF actually needed by the currently-classified holdings.
+
+    Fetched concurrently, not one at a time (fixed 2026-08-14, owner report:
+    the Day P/L popup "takes a long time to open, always has") -- each ETF's
+    get_historical() call is already a real live yfinance fetch wrapped in
+    asyncio.to_thread, so awaiting them in a plain for-loop serialized every
+    single one; a live-timed real request measured 28.3s for this popup before
+    the fix. asyncio.gather runs every ETF's fetch concurrently instead,
+    turning that into roughly the time of the single slowest fetch. A failed
+    fetch degrades that one ETF to an empty bar list rather than taking down
+    the whole batch -- this loop had no per-ETF error handling before this
+    fix, unlike get_performance_today's own sibling loop below, which already
+    had it."""
     sector_etfs = {c[0] for c in classifications.values() if c[0]}
     cap_tier_etfs = {c[1] for c in classifications.values()}
-    bars = {}
-    for etf in sector_etfs | cap_tier_etfs:
-        history = await state.market_data.get_historical(etf, period="1d", interval="1h")
-        bars[etf] = [(row["date"] + "T" + str(row["timestamp"]), row["close"]) for row in history]
-    return bars
+
+    async def _fetch_one(etf: str):
+        try:
+            history = await state.market_data.get_historical(etf, period="1d", interval="1h")
+        except Exception:
+            history = []
+        return etf, [(row["date"] + "T" + str(row["timestamp"]), row["close"]) for row in history]
+
+    results = await asyncio.gather(*(_fetch_one(etf) for etf in sector_etfs | cap_tier_etfs))
+    return dict(results)
 
 
 @app.get("/api/win-loss-trades")
@@ -8537,13 +8554,20 @@ async def get_performance_today():
         classifications = await _live_benchmark_classifications(holdings_value)
         sector_etfs = {c[0] for c in classifications.values() if c[0]}
         cap_tier_etfs = {c[1] for c in classifications.values()}
-        etf_series: dict[str, list[dict]] = {}
-        for etf in sector_etfs | cap_tier_etfs:
+
+        # Concurrent, not sequential (fixed 2026-08-14, owner report: "takes a
+        # long time to open, always has") -- see _fetch_today_etf_bars's own
+        # docstring above for the live-measured 28.3s this loop's sequential
+        # version produced. Same per-ETF-failure-degrades-to-[] semantics as
+        # before, just no longer serialized.
+        async def _fetch_one_15m(etf: str):
             try:
-                hist = await state.market_data.get_historical(etf, period="1d", interval="15m")
+                return etf, await state.market_data.get_historical(etf, period="1d", interval="15m")
             except Exception:
-                hist = []
-            etf_series[etf] = hist
+                return etf, []
+
+        etf_series: dict[str, list[dict]] = dict(await asyncio.gather(
+            *(_fetch_one_15m(etf) for etf in sector_etfs | cap_tier_etfs)))
     except Exception as e:
         logger.warning("Failed to build composition-weighted intraday series: %s", e)
         classifications, etf_series = {}, {}
