@@ -8512,22 +8512,31 @@ async def get_daily_pnl_history():
     first, plus today's own still-live figure (Portfolio.day_pnl/day_pnl_pct, the
     same numbers the Day P/L tile itself already shows) stitched on as the first
     entry so today is never missing just because tonight's snapshot hasn't run
-    yet. See _daily_pnl_buckets()'s own docstring for why this doesn't need any
-    further backdating."""
+    yet -- but only when today is actually a trading day (fixed 2026-08-15); a
+    holiday/weekend "today" contributes no row at all rather than a noisy $0.00
+    placeholder for a day the market never opened. See _daily_pnl_buckets()'s own
+    docstring for why this doesn't need any further backdating."""
     days = state._daily_pnl_buckets()
     today_str = state._now_et().strftime("%Y-%m-%d")
     day_start = state.portfolio.day_start_value
-    # is_current was unconditionally True (fixed 2026-08-15, same class of bug as the
-    # Week P/L "in progress" fix just above/before this) -- on a holiday or weekend,
-    # today's row still showed "(in progress)" even though the market's closed and
-    # nothing can move it any further today. Same real-trading-day check this codebase
-    # already uses for the pre-open batch/daily report triggers.
+    # Same real-trading-day check this codebase already uses for the pre-open batch/
+    # daily report triggers. Originally only gated is_current (fixed 2026-08-15), but
+    # the owner pointed out a further problem the same evening: stitching in a $0.00
+    # "today" row for a day the market never even opened is just noise, not useful
+    # history -- "it shouldnt show any saturday as saturday is not a market day." Now
+    # skips the stitch entirely on a non-trading day, so the list simply starts from
+    # the most recent real settled trading day instead of a placeholder. The daily
+    # snapshot itself only ever fires on real trading days (same gate), so a settled
+    # entry for today can never already exist in `days` when today isn't one --
+    # nothing to preserve by still checking days[0]["date"] == today_str here.
     today_is_trading_day = not state._is_holiday and state._now_et().weekday() < 5
+    if not today_is_trading_day:
+        return {"days": days}
     today_entry = {
         "date": today_str,
         "pnl": round(state.portfolio.day_pnl, 2),
         "pnl_pct": round((state.portfolio.day_pnl / day_start * 100) if day_start else 0, 2),
-        "is_current": today_is_trading_day,
+        "is_current": True,
     }
     if days and days[0]["date"] == today_str:
         days[0] = today_entry
