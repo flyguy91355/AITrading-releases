@@ -8517,11 +8517,17 @@ async def get_daily_pnl_history():
     days = state._daily_pnl_buckets()
     today_str = state._now_et().strftime("%Y-%m-%d")
     day_start = state.portfolio.day_start_value
+    # is_current was unconditionally True (fixed 2026-08-15, same class of bug as the
+    # Week P/L "in progress" fix just above/before this) -- on a holiday or weekend,
+    # today's row still showed "(in progress)" even though the market's closed and
+    # nothing can move it any further today. Same real-trading-day check this codebase
+    # already uses for the pre-open batch/daily report triggers.
+    today_is_trading_day = not state._is_holiday and state._now_et().weekday() < 5
     today_entry = {
         "date": today_str,
         "pnl": round(state.portfolio.day_pnl, 2),
         "pnl_pct": round((state.portfolio.day_pnl / day_start * 100) if day_start else 0, 2),
-        "is_current": True,
+        "is_current": today_is_trading_day,
     }
     if days and days[0]["date"] == today_str:
         days[0] = today_entry
