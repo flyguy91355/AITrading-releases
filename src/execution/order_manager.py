@@ -9,7 +9,6 @@ from zoneinfo import ZoneInfo
 
 from src.execution.broker import Broker, Order, OrderSide, OrderType, OrderStatus
 from src.execution.alpaca_broker import AlpacaBroker
-from src.execution.robinhood_broker import RobinhoodBroker
 from src.decision.portfolio import Portfolio, Position
 
 logger = logging.getLogger(__name__)
@@ -239,8 +238,6 @@ class OrderManager:
         broker_name = self.config["trading"]["broker"]
         if broker_name == "alpaca":
             self.broker = AlpacaBroker(self.config)
-        elif broker_name == "robinhood":
-            self.broker = RobinhoodBroker(self.config)
         else:
             raise ValueError(f"Unknown broker: {broker_name}")
         await self.broker.connect()
@@ -1917,9 +1914,9 @@ class OrderManager:
                         # dropped to 1.854 because an earlier order from the SAME cascade
                         # had already filled -- producing a stop-fallback sized for
                         # shares that no longer existed and a rejected "cannot be sold
-                        # short" TP. get_position (Alpaca-specific -- not on the shared
-                        # Broker ABC since RobinhoodBroker has no equivalent) gives one
-                        # final, real-time qty check; it only CORRECTS a stale local
+                        # short" TP. get_position (Alpaca-specific, not part of the
+                        # shared Broker ABC) gives one final, real-time qty check;
+                        # it only CORRECTS a stale local
                         # count, never skips the placement outright based on
                         # qty_available -- Alpaca's exact settlement-lag timing isn't
                         # fully documented, and the existing insufficient-qty/

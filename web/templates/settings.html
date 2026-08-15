@@ -1187,17 +1187,6 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">Broker <button type="button" class="info-btn" onclick="showInfo(event,'The brokerage integration used to place orders. Alpaca is the primary supported broker and provides full fractional share, paper trading, and order management support. Robinhood support is experimental. Changing the broker requires a server restart to reconnect with new credentials.')">i</button></div>
-          <div class="setting-desc">Brokerage used for order execution</div>
-        </div>
-        <select class="setting-input" name="trading.broker">
-          <option value="alpaca" {% if cfg.trading.broker == 'alpaca' %}selected{% endif %}>Alpaca</option>
-          <option value="robinhood" {% if cfg.trading.broker == 'robinhood' %}selected{% endif %}>Robinhood (experimental)</option>
-        </select>
-        <div class="default-label">default<br><span class="default-val">Alpaca</span></div>
-      </div>
-      <div class="setting-row">
-        <div>
           <div class="setting-label">Auto Execute Trades <button type="button" class="info-btn" onclick="showInfo(event,'When enabled, buy and sell signals are automatically executed as market orders without any manual confirmation. When disabled, signals are generated and logged but no orders are placed — useful for monitoring the system in observation mode before trusting it with live or paper trades.')">i</button></div>
           <div class="setting-desc">Automatically place orders when a signal is generated</div>
         </div>
@@ -1354,7 +1343,6 @@ const DEFAULTS = {
   'research.pre_open_batch_hours': 1.5,
   'research.auto_buy_cutoff_time': '15:30',
   'trading.paper_trading': 'true',
-  'trading.broker': 'alpaca',
   'trading.auto_execute': 'true',
   'research.model_quick_scan': 'claude-haiku-4-5',
   'research.model_deep_dive': 'claude-sonnet-5',

@@ -106,8 +106,8 @@ class AlpacaBroker(Broker):
         """Returns a real-time Alpaca trade_updates WebSocket Stream, or None if
         credentials aren't available. Not part of the abstract Broker interface (same
         precedent as get_closed_orders) -- OrderManager accesses this defensively via
-        getattr, so a broker implementation without stream support (e.g.
-        RobinhoodBroker) needs no changes.
+        getattr, so a future broker implementation without stream support needs no
+        changes.
 
         Sourced from this project's own ALPACA_API_KEY/ALPACA_SECRET_KEY/ALPACA_BASE_URL
         env vars (2026-07-24) -- NOT the alpaca-trade-api SDK's own default env var
