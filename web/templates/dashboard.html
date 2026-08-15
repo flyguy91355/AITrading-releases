@@ -1939,7 +1939,7 @@ function renderWeeklyPnlList(weeks) {
       <span class="pl-price">${dateRange}${w.is_current ? ' (in progress)' : ''}</span>
       <div class="pl-bar-wrap"><div class="pl-bar" style="width:${barPct}%;background:${color}"></div></div>
       <span class="pl-pct" style="color:${color}">${pctStr}</span>
-      <span class="pl-desc">${fmt$(w.pnl, true)}</span>
+      <span class="pl-desc" style="color:var(--text-primary)">${fmt$(w.pnl, true)}</span>
     </div>`;
   }).join('');
   return `<div class="pos-detail-ladder">${rows}</div>`;
