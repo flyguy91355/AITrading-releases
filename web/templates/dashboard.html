@@ -2074,10 +2074,22 @@ async function openPerformancePopup(kind) {
   }
 
   if (!data.points || data.points.length < 2) {
+    // 2026-08-15 owner report: on a day with no intraday chart data (e.g. a market
+    // holiday -- Alpaca's own portfolio-history endpoint posts zero new equity points
+    // when nothing's trading, so /api/performance-today correctly returns []), this
+    // used to `return` here before ever reaching the daily-history-list fetch below --
+    // hiding a list that has its own real, independent data ready to show. For 'day'
+    // specifically, show this chart-only empty message (worded for the actual likely
+    // cause, not a generic "not enough history" that implied a timing/accumulation
+    // issue) and fall through to the list fetch instead of bailing out entirely.
+    // total/ytd have no separate list to fall through to, so they keep the early return.
+    const chartEmptyMsg = kind === 'day'
+      ? 'No intraday chart data yet today — this is expected on a market holiday or before the first data point posts. Daily history below still reflects real closed days.'
+      : 'Not enough history yet -- check back after the next daily snapshot.';
     document.getElementById('ddModalBody').innerHTML =
-      '<div style="color:var(--text-muted);font-size:12px;padding:12px;text-align:center;">Not enough history yet -- check back after the next daily snapshot.</div>';
-    return;
-  }
+      `<div style="color:var(--text-muted);font-size:12px;padding:12px;text-align:center;">${chartEmptyMsg}</div>`;
+    if (kind !== 'day') return;
+  } else {
   // Annualized extrapolation (2026-07-21) -- was only ever shown in the small stat card
   // underneath, never in this popup itself, which is the more natural place to look for it
   // right next to the actual chart it's extrapolated from. Total/YTD only, matching the
@@ -2113,6 +2125,7 @@ async function openPerformancePopup(kind) {
   // innerHTML assignment just above, so the chart itself still can't render any sooner
   // than this regardless.
   renderPerfLightweightChart(document.getElementById('perfChartContainer'), data.points, {height: 340});
+  }
 
   // Running per-day P/L history, Day P/L popup only (2026-08-14 owner request) --
   // additive below the chart above, not a replacement for it. Fetched separately
