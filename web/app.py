@@ -1782,7 +1782,16 @@ class DashboardState:
             iso_year, iso_week, _ = d.isocalendar()
             groups[(iso_year, iso_week)].append(p)
 
-        current_key = self._now_et().date().isocalendar()[:2]
+        today = self._now_et().date()
+        current_key = today.isocalendar()[:2]
+        # weekday() < 5 (Mon=0..Fri=4) -- fixed 2026-08-15, owner report: the ISO week
+        # doesn't calendar-roll to the next one until Monday, so a plain iso-week-number
+        # match kept showing "(in progress)" all through Saturday/Sunday even though the
+        # market only trades Mon-Fri and nothing can change that week's P&L again until
+        # the next trading week starts. "In progress" now means "this ISO week AND
+        # today's still a weekday" -- turns off at midnight Friday night, not at the
+        # actual ISO week boundary (midnight Sunday).
+        is_current_week_and_weekday = today.weekday() < 5
         buckets = []
         for (iso_year, iso_week), entries in groups.items():
             entries_sorted = sorted(entries, key=lambda p: p["date"])
@@ -1796,7 +1805,7 @@ class DashboardState:
                 "end_date": entries_sorted[-1]["date"],
                 "pnl": round(pnl, 2),
                 "pnl_pct": round(pnl / start_value * 100, 2) if start_value else None,
-                "is_current": (iso_year, iso_week) == current_key,
+                "is_current": (iso_year, iso_week) == current_key and is_current_week_and_weekday,
             })
         buckets.sort(key=lambda b: (b["iso_year"], b["iso_week"]), reverse=True)
         return buckets
