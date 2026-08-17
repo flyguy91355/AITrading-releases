@@ -8028,6 +8028,47 @@ async def get_today_scan_reject_history(ticker: str):
     }
 
 
+@app.get("/api/stock-chart/{ticker}")
+async def get_stock_chart(ticker: str):
+    """Daily OHLCV + technicals for any ticker — backs the candlestick chart in the
+    manual Deep Dive modal.  Works for any ticker the owner types, not just held
+    positions.  ref_lines come from the most-recent cached research report when one
+    exists, so entry/stop/TP/fair-value price lines show up automatically."""
+    ticker = ticker.upper()
+    try:
+        bars, technicals = await asyncio.gather(
+            state.market_data.get_historical(ticker, period="1y", interval="1d"),
+            state.market_data.get_technicals(ticker),
+        )
+    except Exception as e:
+        logger.warning("stock_chart failed for %s: %s", ticker, e)
+        return {"points": [], "technicals": None, "ref_lines": None}
+    points = [
+        {"time": b["date"], "open": b["open"], "high": b["high"],
+         "low": b["low"], "close": b["close"], "volume": b["volume"]}
+        for b in bars
+    ]
+    report = state.research_reports.get(ticker)
+    ref_lines = None
+    if report:
+        ref_lines = {
+            "entry": report.get("entry_price"),
+            "stop": report.get("stop_loss"),
+            "take_profits": report.get("take_profit_targets") or [],
+            "fair_value": report.get("fair_value_estimate"),
+        }
+    return {
+        "points": points,
+        "technicals": {
+            "sma_50": technicals.sma_50,
+            "sma_200": technicals.sma_200,
+            "support_level": technicals.support_level,
+            "resistance_level": technicals.resistance_level,
+        } if technicals else None,
+        "ref_lines": ref_lines,
+    }
+
+
 @app.get("/api/position/{ticker}/history")
 async def get_position_history(ticker: str):
     """Price-over-time chart data for a currently HELD position (2026-07-20) — deliberately a

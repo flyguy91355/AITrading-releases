@@ -1419,6 +1419,7 @@ function handleMessage(msg) {
       if (_manualDDTicker && msg.ticker === _manualDDTicker) {
         _manualDDTicker = null;
         showDeepDiveModal(msg.ticker, msg.report);
+        appendDeepDiveChart(msg.ticker, msg.report);
       }
       break;
     case 'deep_dive_failed':
@@ -1874,6 +1875,105 @@ function renderPortfolioValueChart(container, history, opts) {
     { type: 'area', data: valueData, color: PERF_PORTFOLIO_COLOR, priceScaleId: 'right' },
     { type: 'line', data: pctData, color: _lwcColor('--cyan'), priceScaleId: 'left', lineWidth: 1 },
   ], opts);
+}
+
+// Rolling close-price SMA used by the candlestick chart below.
+function rollingSma(points, period) {
+  if (points.length < period) return [];
+  const out = [];
+  let sum = 0;
+  for (let i = 0; i < points.length; i++) {
+    sum += points[i].close;
+    if (i >= period) sum -= points[i - period].close;
+    if (i >= period - 1) out.push({ time: points[i].time, value: sum / period });
+  }
+  return out;
+}
+
+// Full candlestick chart: real OHLCV candles, volume histogram, rolling SMA50/SMA200
+// overlays, and named price lines for every level that drives the buy decision
+// (entry, stop, TP1-3, fair value, support, resistance).  Used by the manual Deep
+// Dive modal — the same visual language as AICryptoTrading's per-asset modal chart.
+function renderDetailedStockChart(containerId, legendId, points, technicals, refLines) {
+  const el = document.getElementById(containerId);
+  const legendEl = document.getElementById(legendId);
+  if (!el || !legendEl) return;
+  if (el._lwcChart) { el._lwcChart.remove(); el._lwcChart = null; }
+  legendEl.innerHTML = '';
+  if (typeof LightweightCharts === 'undefined' || !points || points.length < 2) {
+    el.innerHTML = '<div style="padding:40px 0;text-align:center;color:var(--text-muted);">No price history available</div>';
+    return;
+  }
+  const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+  const chart = LightweightCharts.createChart(el, {
+    width: el.clientWidth, height: el.clientHeight,
+    layout: { background: { color: 'transparent' }, textColor: isDark ? '#9ca3af' : '#4b5563' },
+    grid: { vertLines: { color: isDark ? '#1f2937' : '#e5e7eb' }, horzLines: { color: isDark ? '#1f2937' : '#e5e7eb' } },
+    rightPriceScale: { borderColor: isDark ? '#2a3a4e' : '#d8dee6' },
+    timeScale: { borderColor: isDark ? '#2a3a4e' : '#d8dee6', timeVisible: false, rightOffset: 8 },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  const candleSeries = chart.addCandlestickSeries({
+    upColor: '#10b981', downColor: '#ef4444', borderVisible: false,
+    wickUpColor: '#10b981', wickDownColor: '#ef4444', priceScaleId: 'right',
+  });
+  candleSeries.priceScale().applyOptions({ scaleMargins: { top: 0.06, bottom: 0.22 } });
+  candleSeries.setData(points.map(p => ({ time: p.time, open: p.open, high: p.high, low: p.low, close: p.close })));
+  const volSeries = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'vol', color: isDark ? '#374151' : '#c5ccd6' });
+  volSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  volSeries.setData(points.map(p => ({
+    time: p.time, value: p.volume,
+    color: p.close >= p.open ? 'rgba(16,185,129,0.5)' : 'rgba(239,68,68,0.5)',
+  })));
+  const legend = [];
+  const sma50 = rollingSma(points, 50);
+  if (sma50.length) {
+    chart.addLineSeries({ color: '#f59e0b', lineWidth: 1.5, priceScaleId: 'right', priceLineVisible: false, lastValueVisible: false }).setData(sma50);
+    legend.push(['#f59e0b', 'SMA 50']);
+  }
+  const sma200 = rollingSma(points, 200);
+  if (sma200.length) {
+    chart.addLineSeries({ color: '#8b5cf6', lineWidth: 1.5, priceScaleId: 'right', priceLineVisible: false, lastValueVisible: false }).setData(sma200);
+    legend.push(['#8b5cf6', 'SMA 200']);
+  }
+  const priceLine = (price, color, title, lineStyle) => {
+    if (price == null || price <= 0) return;
+    candleSeries.createPriceLine({ price, color, lineWidth: 1, lineStyle: lineStyle ?? LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title });
+    legend.push([color, `${title} $${Number(price).toFixed(2)}`]);
+  };
+  if (refLines) {
+    priceLine(refLines.entry,    '#3b82f6', 'Entry',      LightweightCharts.LineStyle.Solid);
+    priceLine(refLines.stop,     '#ef4444', 'Stop',       LightweightCharts.LineStyle.Solid);
+    (refLines.takeProfits || []).forEach((tp, i) => priceLine(tp, '#10b981', `TP${i + 1}`));
+    priceLine(refLines.fairValue, '#06b6d4', 'Fair Value');
+  }
+  if (technicals) {
+    priceLine(technicals.support_level,    isDark ? '#6b7280' : '#9ca3af', 'Support');
+    priceLine(technicals.resistance_level, isDark ? '#6b7280' : '#9ca3af', 'Resistance');
+  }
+  chart.timeScale().fitContent();
+  el._lwcChart = chart;
+  legendEl.innerHTML = legend.map(([c, t]) =>
+    `<span style="display:inline-flex;align-items:center;gap:3px;font-size:10px;color:var(--text-muted);">` +
+    `<span style="display:inline-block;width:10px;height:3px;border-radius:2px;background:${c};"></span>${t}</span>`
+  ).join('');
+}
+
+// Fetches OHLCV for ticker and mounts the candlestick chart into the slot that
+// showDeepDiveModal already rendered at the top of ddModalBody.
+async function appendDeepDiveChart(ticker, report) {
+  try {
+    const resp = await fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`);
+    const data = await resp.json();
+    if (!data.points || data.points.length < 2) return;
+    const rl = data.ref_lines || {};
+    renderDetailedStockChart('ddCandleChart', 'ddCandleLegend', data.points, data.technicals, {
+      entry:      rl.entry,
+      stop:       rl.stop,
+      takeProfits: rl.take_profits || [],
+      fairValue:  rl.fair_value,
+    });
+  } catch (e) { console.error('appendDeepDiveChart:', ticker, e); }
 }
 
 // Unambiguous text readout under each sparkline (2026-07-21, real user confusion caught
@@ -4081,6 +4181,7 @@ function onDDHistorySelect(sel) {
   const ticker = sel.value;
   if (!ticker) return;
   showDeepDiveModal(ticker, deepDiveReports[ticker]);
+  appendDeepDiveChart(ticker, deepDiveReports[ticker]);
   sel.value = '';
 }
 
@@ -4754,6 +4855,14 @@ function showDeepDiveModal(ticker, dd) {
   const ts = tsRaw ? new Date(tsRaw).toLocaleString() : null;
 
   document.getElementById('ddModalBody').innerHTML = `
+    <!-- Candlestick chart slot — filled async by appendDeepDiveChart after the modal opens -->
+    <div style="margin-bottom:14px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px;">
+        <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;">Price Chart</div>
+        <div id="ddCandleLegend" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+      </div>
+      <div id="ddCandleChart" style="width:100%;height:280px;border-radius:6px;overflow:hidden;"></div>
+    </div>
     ${ts ? `<div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;">Report generated: ${ts}</div>` : ''}
     <!-- Signal banner -->
     <div style="display:flex;align-items:center;gap:14px;padding:12px 14px;background:${sc.bg};border:1px solid ${sc.border};border-radius:8px;margin-bottom:14px;">
@@ -4950,6 +5059,8 @@ function copyDeepDiveContent() {
 function closeDeepDiveModal() {
   const m = document.getElementById('deepDiveModal');
   m.classList.remove('active');
+  const candleEl = document.getElementById('ddCandleChart');
+  if (candleEl && candleEl._lwcChart) { candleEl._lwcChart.remove(); candleEl._lwcChart = null; }
   // Defensive: this modal has two openers (showResearchModal, showDeepDiveModal) that must
   // both use classList so this one classList-only close actually works. One of them used to
   // set style.display='flex' directly instead (fixed 2026-07-18) -- an inline style always
