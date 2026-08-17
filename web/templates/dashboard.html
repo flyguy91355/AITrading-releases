@@ -1951,6 +1951,19 @@ function renderDetailedStockChart(containerId, legendId, points, technicals, ref
     priceLine(technicals.support_level,    isDark ? '#6b7280' : '#9ca3af', 'Support');
     priceLine(technicals.resistance_level, isDark ? '#6b7280' : '#9ca3af', 'Resistance');
   }
+  // Entry-date dot marker — shown when the caller passes refLines.entryTime as an ISO
+  // string (e.g. "2026-08-05T13:47:55").  Picks the first daily candle whose date is
+  // on or after the entry date, so the dot always lands on a real candle.
+  if (refLines && refLines.entryTime) {
+    const entryDate = refLines.entryTime.substring(0, 10);
+    const matchPt = points.find(p => p.time >= entryDate);
+    if (matchPt) {
+      candleSeries.setMarkers([{
+        time: matchPt.time, position: 'inBar', color: '#3b82f6', shape: 'circle', text: 'Entry', size: 1,
+      }]);
+    }
+  }
+
   chart.timeScale().fitContent();
   el._lwcChart = chart;
   legendEl.innerHTML = legend.map(([c, t]) =>
@@ -3689,21 +3702,35 @@ async function showPositionDetail(ticker) {
   // for On Deck/On Shore's appendOnDeckChart -- so the rest of the detail view (which is
   // already fully known synchronously) never waits on a network round trip.
   try {
-    const resp = await fetch(`/api/position/${ticker}/history`);
+    const candleModeMini = localStorage.getItem('posChartStyleMini') === 'candlestick';
     const container = document.getElementById('posChartContainer');
     if (!container) return;
-    if (!resp.ok) {
+    const [histResp, ohlcvResp] = await Promise.all([
+      fetch(`/api/position/${ticker}/history`),
+      candleModeMini ? fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`) : Promise.resolve(null),
+    ]);
+    if (!histResp.ok) {
       container.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:12px;text-align:center;">Chart unavailable.</div>';
       return;
     }
-    const data = await resp.json();
-    const refLines = [{ price: data.entry_price, label: 'Entry', color: '#7dd3fc' }];
+    const data = await histResp.json();
     const effStop = (data.trailing_stop && data.trailing_stop > data.stop_loss) ? data.trailing_stop : data.stop_loss;
-    if (effStop > 0) refLines.push({ price: effStop, label: data.trailing_stop && data.trailing_stop > data.stop_loss ? 'Trail Stop' : 'Stop', color: '#ff3b5c' });
-    (data.take_profit_targets || []).forEach((t, i) => refLines.push({ price: t, label: `T${i+1}`, color: '#00e691' }));
-    container.innerHTML = `<div id="posChartMount"></div><div style="text-align:right;font-size:10px;color:var(--text-muted);margin-top:2px;">${dateRangeCaption(data.points)}</div>`;
-    const entryTime = data.opened_at ? Math.floor(parseUtcTimestamp(data.opened_at).getTime() / 1000) : null;
-    renderPositionLightweightChart(document.getElementById('posChartMount'), data.points, refLines, { height: 220, entryTime });
+    if (candleModeMini && ohlcvResp && ohlcvResp.ok) {
+      const ohlcv = await ohlcvResp.json();
+      container.innerHTML = `<div id="posChartMount" style="width:100%;height:220px;border-radius:6px;overflow:hidden;"></div><div id="posChartLegend" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:3px;"></div>`;
+      renderDetailedStockChart('posChartMount', 'posChartLegend', ohlcv.points, ohlcv.technicals, {
+        entry: data.entry_price, stop: effStop > 0 ? effStop : null,
+        takeProfits: data.take_profit_targets || [], fairValue: null,
+        entryTime: data.opened_at,
+      });
+    } else {
+      const refLines = [{ price: data.entry_price, label: 'Entry', color: '#7dd3fc' }];
+      if (effStop > 0) refLines.push({ price: effStop, label: data.trailing_stop && data.trailing_stop > data.stop_loss ? 'Trail Stop' : 'Stop', color: '#ff3b5c' });
+      (data.take_profit_targets || []).forEach((t, i) => refLines.push({ price: t, label: `T${i+1}`, color: '#00e691' }));
+      container.innerHTML = `<div id="posChartMount"></div><div style="text-align:right;font-size:10px;color:var(--text-muted);margin-top:2px;">${dateRangeCaption(data.points)}</div>`;
+      const entryTime = data.opened_at ? Math.floor(parseUtcTimestamp(data.opened_at).getTime() / 1000) : null;
+      renderPositionLightweightChart(document.getElementById('posChartMount'), data.points, refLines, { height: 220, entryTime });
+    }
 
     const brDiv = document.getElementById('posBuyReasoning');
     if (brDiv && data.ai_entry_reasoning) {
@@ -4457,29 +4484,48 @@ async function openPositionChartExpand(ticker) {
   document.getElementById('chartExpandBody').innerHTML = spinnerHtml();
   document.getElementById('chartExpandModal').style.display = 'flex';
 
-  let data;
+  const candleModeFull = localStorage.getItem('posChartStyleFull') === 'candlestick';
+  let data, ohlcv = null;
   try {
-    const resp = await fetch(`/api/position/${ticker}/history`);
-    if (!resp.ok) return;
-    data = await resp.json();
+    const [histResp, ohlcvResp] = await Promise.all([
+      fetch(`/api/position/${ticker}/history`),
+      candleModeFull ? fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`) : Promise.resolve(null),
+    ]);
+    if (!histResp.ok) return;
+    data = await histResp.json();
+    if (candleModeFull && ohlcvResp && ohlcvResp.ok) ohlcv = await ohlcvResp.json();
   } catch (e) { console.error('openPositionChartExpand:', e); return; }
 
-  const refLines = [{ price: data.entry_price, label: 'Entry', color: '#7dd3fc' }];
   const effStop = (data.trailing_stop && data.trailing_stop > data.stop_loss) ? data.trailing_stop : data.stop_loss;
-  if (effStop > 0) refLines.push({ price: effStop, label: data.trailing_stop && data.trailing_stop > data.stop_loss ? 'Trail Stop' : 'Stop', color: '#ff3b5c' });
-  (data.take_profit_targets || []).forEach((t, i) => refLines.push({ price: t, label: `T${i+1}`, color: '#00e691' }));
-
   const summaryHtml = data.ai_entry_reasoning
     ? `${data.ai_entry_price != null ? `AI-recommended entry <strong style="color:var(--text-primary)">$${Number(data.ai_entry_price).toFixed(2)}</strong> — ` : ''}${data.ai_entry_reasoning}`
     : '';
-  document.getElementById('chartExpandTitle').textContent = `${ticker} — Full Price History (${(data.points||[]).length} points)`;
-  document.getElementById('chartExpandBody').innerHTML = `
-    ${positionRefLinesLegendHtml(refLines)}
-    <div id="positionExpandChartContainer"></div>
-    ${summaryHtml ? `<div style="font-size:13px;color:var(--text-secondary);margin-top:16px;line-height:1.6;max-width:900px;">${summaryHtml}</div>` : ''}
-  `;
-  const entryTime = data.opened_at ? Math.floor(parseUtcTimestamp(data.opened_at).getTime() / 1000) : null;
-  renderPositionLightweightChart(document.getElementById('positionExpandChartContainer'), data.points, refLines, { height: 520, entryTime });
+
+  if (candleModeFull && ohlcv && (ohlcv.points || []).length >= 2) {
+    document.getElementById('chartExpandTitle').textContent = `${ticker} — Daily Candlestick`;
+    document.getElementById('chartExpandBody').innerHTML = `
+      <div id="positionExpandLegend" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;"></div>
+      <div id="positionExpandChartContainer" style="height:520px;border-radius:6px;overflow:hidden;"></div>
+      ${summaryHtml ? `<div style="font-size:13px;color:var(--text-secondary);margin-top:16px;line-height:1.6;max-width:900px;">${summaryHtml}</div>` : ''}
+    `;
+    renderDetailedStockChart('positionExpandChartContainer', 'positionExpandLegend', ohlcv.points, ohlcv.technicals, {
+      entry: data.entry_price, stop: effStop > 0 ? effStop : null,
+      takeProfits: data.take_profit_targets || [], fairValue: null,
+      entryTime: data.opened_at,
+    });
+  } else {
+    const refLines = [{ price: data.entry_price, label: 'Entry', color: '#7dd3fc' }];
+    if (effStop > 0) refLines.push({ price: effStop, label: data.trailing_stop && data.trailing_stop > data.stop_loss ? 'Trail Stop' : 'Stop', color: '#ff3b5c' });
+    (data.take_profit_targets || []).forEach((t, i) => refLines.push({ price: t, label: `T${i+1}`, color: '#00e691' }));
+    document.getElementById('chartExpandTitle').textContent = `${ticker} — Full Price History (${(data.points||[]).length} points)`;
+    document.getElementById('chartExpandBody').innerHTML = `
+      ${positionRefLinesLegendHtml(refLines)}
+      <div id="positionExpandChartContainer"></div>
+      ${summaryHtml ? `<div style="font-size:13px;color:var(--text-secondary);margin-top:16px;line-height:1.6;max-width:900px;">${summaryHtml}</div>` : ''}
+    `;
+    const entryTime = data.opened_at ? Math.floor(parseUtcTimestamp(data.opened_at).getTime() / 1000) : null;
+    renderPositionLightweightChart(document.getElementById('positionExpandChartContainer'), data.points, refLines, { height: 520, entryTime });
+  }
 }
 
 function closeChartExpand() {

@@ -323,6 +323,26 @@ input[type=time].setting-input { font-family: monospace; }
           <button type="button" class="theme-toggle-btn" id="themeBtnLight" onclick="setTheme('light')">☀️ Light</button>
         </div>
       </div>
+      <div class="setting-row" style="grid-template-columns: 1fr auto;">
+        <div>
+          <div class="setting-label">Position Chart — Compact</div>
+          <div class="setting-desc">Chart style for the compact price chart inside the position detail panel. Candlestick shows daily OHLCV candles + SMA50/200; Line shows the intraday close series. This device only, applies instantly.</div>
+        </div>
+        <div class="theme-toggle">
+          <button type="button" class="theme-toggle-btn" id="posChartMiniLine" onclick="setPosChartStyle('mini','line')">📈 Line</button>
+          <button type="button" class="theme-toggle-btn" id="posChartMiniCandle" onclick="setPosChartStyle('mini','candlestick')">🕯 Candlestick</button>
+        </div>
+      </div>
+      <div class="setting-row" style="grid-template-columns: 1fr auto;">
+        <div>
+          <div class="setting-label">Position Chart — Expanded</div>
+          <div class="setting-desc">Chart style for the full-size expanded position chart (the ⤢ expand button). Candlestick shows daily OHLCV candles + SMA50/200; Line shows the intraday close series. This device only, applies instantly.</div>
+        </div>
+        <div class="theme-toggle">
+          <button type="button" class="theme-toggle-btn" id="posChartFullLine" onclick="setPosChartStyle('full','line')">📈 Line</button>
+          <button type="button" class="theme-toggle-btn" id="posChartFullCandle" onclick="setPosChartStyle('full','candlestick')">🕯 Candlestick</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1581,6 +1601,23 @@ function updateThemeButtons(theme) {
   document.getElementById('themeBtnLight').classList.toggle('active', theme === 'light');
 }
 updateThemeButtons(document.documentElement.getAttribute('data-theme'));
+
+function setPosChartStyle(which, style) {
+  const key = which === 'mini' ? 'posChartStyleMini' : 'posChartStyleFull';
+  localStorage.setItem(key, style);
+  updatePosChartButtons(which, style);
+}
+function updatePosChartButtons(which, style) {
+  if (which === 'mini') {
+    document.getElementById('posChartMiniLine').classList.toggle('active', style === 'line');
+    document.getElementById('posChartMiniCandle').classList.toggle('active', style === 'candlestick');
+  } else {
+    document.getElementById('posChartFullLine').classList.toggle('active', style === 'line');
+    document.getElementById('posChartFullCandle').classList.toggle('active', style === 'candlestick');
+  }
+}
+updatePosChartButtons('mini', localStorage.getItem('posChartStyleMini') || 'line');
+updatePosChartButtons('full', localStorage.getItem('posChartStyleFull') || 'line');
 </script>
 </body>
 </html>
