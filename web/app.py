@@ -7659,7 +7659,7 @@ async def apply_update():
 
             if needs_pip_install:
                 pip_result = subprocess.run(
-                    ["pip", "install", "-r", "requirements.txt"],
+                    [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
                     cwd=_INSTALL_ROOT,
                     capture_output=True,
                     text=True,
