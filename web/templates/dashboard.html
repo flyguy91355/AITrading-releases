@@ -1890,6 +1890,20 @@ function rollingSma(points, period) {
   return out;
 }
 
+// SMA for intraday position-history points ({t: unix-timestamp, price}).
+// Used to overlay short-term trend lines on the 30-day intraday position chart.
+function _posSmaData(pts, period) {
+  if (pts.length < period) return [];
+  const out = [];
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    sum += pts[i].price;
+    if (i >= period) sum -= pts[i - period].price;
+    if (i >= period - 1) out.push({ time: pts[i].t, value: sum / period });
+  }
+  return out;
+}
+
 // Full candlestick chart: real OHLCV candles, volume histogram, rolling SMA50/SMA200
 // overlays, and named price lines for every level that drives the buy decision
 // (entry, stop, TP1-3, fair value, support, resistance).  Used by the manual Deep
@@ -3705,9 +3719,11 @@ async function showPositionDetail(ticker) {
     const candleModeMini = localStorage.getItem('posChartStyleMini') === 'candlestick';
     const container = document.getElementById('posChartContainer');
     if (!container) return;
+    // Always fetch both — ohlcv powers candlestick mode AND gives technicals for
+    // SMA/support/resistance overlays in line mode.
     const [histResp, ohlcvResp] = await Promise.all([
       fetch(`/api/position/${ticker}/history`),
-      candleModeMini ? fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`) : Promise.resolve(null),
+      fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`),
     ]);
     if (!histResp.ok) {
       container.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:12px;text-align:center;">Chart unavailable.</div>';
@@ -3715,10 +3731,11 @@ async function showPositionDetail(ticker) {
     }
     const data = await histResp.json();
     const effStop = (data.trailing_stop && data.trailing_stop > data.stop_loss) ? data.trailing_stop : data.stop_loss;
-    if (candleModeMini && ohlcvResp && ohlcvResp.ok) {
-      const ohlcv = await ohlcvResp.json();
+    const ohlcv = (ohlcvResp && ohlcvResp.ok) ? await ohlcvResp.json() : null;
+    const ohlcvPoints = ohlcv && ohlcv.points && ohlcv.points.length >= 2 ? ohlcv.points : null;
+    if (candleModeMini && ohlcvPoints) {
       container.innerHTML = `<div id="posChartMount" style="width:100%;height:220px;border-radius:6px;overflow:hidden;"></div><div id="posChartLegend" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:3px;"></div>`;
-      renderDetailedStockChart('posChartMount', 'posChartLegend', ohlcv.points, ohlcv.technicals, {
+      renderDetailedStockChart('posChartMount', 'posChartLegend', ohlcvPoints, ohlcv.technicals, {
         entry: data.entry_price, stop: effStop > 0 ? effStop : null,
         takeProfits: data.take_profit_targets || [], fairValue: null,
         entryTime: data.opened_at,
@@ -3729,7 +3746,24 @@ async function showPositionDetail(ticker) {
       (data.take_profit_targets || []).forEach((t, i) => refLines.push({ price: t, label: `T${i+1}`, color: '#00e691' }));
       container.innerHTML = `<div id="posChartMount"></div><div style="text-align:right;font-size:10px;color:var(--text-muted);margin-top:2px;">${dateRangeCaption(data.points)}</div>`;
       const entryTime = data.opened_at ? Math.floor(parseUtcTimestamp(data.opened_at).getTime() / 1000) : null;
-      renderPositionLightweightChart(document.getElementById('posChartMount'), data.points, refLines, { height: 220, entryTime });
+      const lwcRes = renderPositionLightweightChart(document.getElementById('posChartMount'), data.points, refLines, { height: 220, entryTime });
+      // SMA overlays — computed from the same intraday points the chart already plots,
+      // so the periods reflect bars (each ~15 min) not days.
+      if (lwcRes) {
+        const ipts = (data.points || []).filter(p => p.price != null);
+        [{ n: 50, color: '#f59e0b' }, { n: 200, color: '#8b5cf6' }].forEach(({ n, color }) => {
+          if (ipts.length < n) return;
+          const smaData = _posSmaData(ipts, n);
+          if (smaData.length) lwcRes.chart.addLineSeries({ color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }).setData(smaData);
+        });
+        // Support/resistance from daily technicals as faint reference lines.
+        if (ohlcv && ohlcv.technicals) {
+          const tech = ohlcv.technicals;
+          const mainS = lwcRes.series[0];
+          if (tech.support_level > 0) mainS.createPriceLine({ price: tech.support_level, color: '#4b5563', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'Sup', axisLabelVisible: false });
+          if (tech.resistance_level > 0) mainS.createPriceLine({ price: tech.resistance_level, color: '#4b5563', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'Res', axisLabelVisible: false });
+        }
+      }
     }
 
     const brDiv = document.getElementById('posBuyReasoning');
@@ -4489,26 +4523,27 @@ async function openPositionChartExpand(ticker) {
   try {
     const [histResp, ohlcvResp] = await Promise.all([
       fetch(`/api/position/${ticker}/history`),
-      candleModeFull ? fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`) : Promise.resolve(null),
+      fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`),
     ]);
     if (!histResp.ok) return;
     data = await histResp.json();
-    if (candleModeFull && ohlcvResp && ohlcvResp.ok) ohlcv = await ohlcvResp.json();
+    if (ohlcvResp && ohlcvResp.ok) ohlcv = await ohlcvResp.json();
   } catch (e) { console.error('openPositionChartExpand:', e); return; }
 
   const effStop = (data.trailing_stop && data.trailing_stop > data.stop_loss) ? data.trailing_stop : data.stop_loss;
   const summaryHtml = data.ai_entry_reasoning
     ? `${data.ai_entry_price != null ? `AI-recommended entry <strong style="color:var(--text-primary)">$${Number(data.ai_entry_price).toFixed(2)}</strong> — ` : ''}${data.ai_entry_reasoning}`
     : '';
+  const ohlcvPoints = ohlcv && ohlcv.points && ohlcv.points.length >= 2 ? ohlcv.points : null;
 
-  if (candleModeFull && ohlcv && (ohlcv.points || []).length >= 2) {
+  if (candleModeFull && ohlcvPoints) {
     document.getElementById('chartExpandTitle').textContent = `${ticker} — Daily Candlestick`;
     document.getElementById('chartExpandBody').innerHTML = `
       <div id="positionExpandLegend" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;"></div>
       <div id="positionExpandChartContainer" style="height:520px;border-radius:6px;overflow:hidden;"></div>
       ${summaryHtml ? `<div style="font-size:13px;color:var(--text-secondary);margin-top:16px;line-height:1.6;max-width:900px;">${summaryHtml}</div>` : ''}
     `;
-    renderDetailedStockChart('positionExpandChartContainer', 'positionExpandLegend', ohlcv.points, ohlcv.technicals, {
+    renderDetailedStockChart('positionExpandChartContainer', 'positionExpandLegend', ohlcvPoints, ohlcv.technicals, {
       entry: data.entry_price, stop: effStop > 0 ? effStop : null,
       takeProfits: data.take_profit_targets || [], fairValue: null,
       entryTime: data.opened_at,
@@ -4524,7 +4559,21 @@ async function openPositionChartExpand(ticker) {
       ${summaryHtml ? `<div style="font-size:13px;color:var(--text-secondary);margin-top:16px;line-height:1.6;max-width:900px;">${summaryHtml}</div>` : ''}
     `;
     const entryTime = data.opened_at ? Math.floor(parseUtcTimestamp(data.opened_at).getTime() / 1000) : null;
-    renderPositionLightweightChart(document.getElementById('positionExpandChartContainer'), data.points, refLines, { height: 520, entryTime });
+    const lwcRes = renderPositionLightweightChart(document.getElementById('positionExpandChartContainer'), data.points, refLines, { height: 520, entryTime });
+    if (lwcRes) {
+      const ipts = (data.points || []).filter(p => p.price != null);
+      [{ n: 50, color: '#f59e0b' }, { n: 200, color: '#8b5cf6' }].forEach(({ n, color }) => {
+        if (ipts.length < n) return;
+        const smaData = _posSmaData(ipts, n);
+        if (smaData.length) lwcRes.chart.addLineSeries({ color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }).setData(smaData);
+      });
+      if (ohlcv && ohlcv.technicals) {
+        const tech = ohlcv.technicals;
+        const mainS = lwcRes.series[0];
+        if (tech.support_level > 0) mainS.createPriceLine({ price: tech.support_level, color: '#4b5563', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'Sup', axisLabelVisible: false });
+        if (tech.resistance_level > 0) mainS.createPriceLine({ price: tech.resistance_level, color: '#4b5563', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, title: 'Res', axisLabelVisible: false });
+      }
+    }
   }
 }
 
