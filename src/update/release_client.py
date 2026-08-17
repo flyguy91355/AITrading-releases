@@ -38,9 +38,15 @@ def fetch_latest_release(repo: str, http_get=None) -> dict:
     response.raise_for_status()
     data = response.json()
     severity, notes = parse_release_notes(data.get("body", ""))
+    tag = data["tag_name"]
+    # Use the direct github.com archive URL rather than the API tarball_url —
+    # api.github.com/tarball/... counts against the unauthenticated 60 req/hr
+    # rate limit; the github.com/archive URL bypasses it entirely for public repos.
+    download_url = f"https://github.com/{repo}/archive/refs/tags/{tag}.tar.gz"
     return {
-        "tag_name": data["tag_name"],
+        "tag_name": tag,
         "severity": severity,
         "notes": notes,
         "tarball_url": data["tarball_url"],
+        "download_url": download_url,
     }

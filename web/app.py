@@ -7632,7 +7632,7 @@ async def apply_update():
         with tempfile.TemporaryDirectory() as tmp_dir:
             archive_path = str(Path(tmp_dir) / "release.tar.gz")
             try:
-                response = requests.get(release["tarball_url"], timeout=60)
+                response = requests.get(release["download_url"], timeout=60)
                 response.raise_for_status()
                 Path(archive_path).write_bytes(response.content)
             except Exception as exc:
