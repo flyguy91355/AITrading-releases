@@ -4672,14 +4672,31 @@ class DashboardState:
                     # barely changes tick to tick. A "still good" verdict (or a not-yet-due
                     # cooldown) falls through to the entry-price trigger logic below exactly as
                     # before -- this only ever short-circuits the loop on eviction.
+                    #
+                    # Also checks _on_deck_backfill_above_gate_cooldown, not just this path's
+                    # own dict (fixed 2026-08-18, cost audit) -- this path and the On Shore
+                    # backfill path (_try_add_inner below) ask the identical real question
+                    # ("is this candidate, now above its own gate, still a good buy") but
+                    # previously tracked their cooldowns in two entirely separate dicts. If
+                    # this loop evicted a candidate for being above gate, it could land back
+                    # on On Shore and get immediately re-asked the same just-answered question
+                    # through the backfill path's own cooldown, which had no record of this
+                    # loop's very recent ask. Now stores a cooldown-UNTIL timestamp in
+                    # tz-aware ET (self._now_et()), matching the backfill dict's own
+                    # representation, instead of the previous naive-local "last checked" time
+                    # -- comparing a naive and a tz-aware datetime directly raises TypeError,
+                    # so unifying the representation was required to safely check both dicts
+                    # together, not just a style preference.
                     if _on_deck_rr_above_gate(rr, min_rr):
                         cooldown_min = self.config["research"].get(
                             "on_deck_above_gate_recheck_cooldown_minutes", 20)
-                        last_checked = self._on_deck_above_gate_cooldown.get(ticker)
-                        due = (last_checked is None
-                               or (datetime.now() - last_checked).total_seconds() >= cooldown_min * 60)
+                        now_et = self._now_et()
+                        due = not (
+                            _on_deck_cooldown_active(self._on_deck_above_gate_cooldown, ticker, now_et)
+                            or _on_deck_cooldown_active(
+                                self._on_deck_backfill_above_gate_cooldown, ticker, now_et))
                         if due:
-                            self._on_deck_above_gate_cooldown[ticker] = datetime.now()
+                            self._on_deck_above_gate_cooldown[ticker] = now_et + timedelta(minutes=cooldown_min)
                             still_good_buy, reasoning = await self._on_deck_ai_gate_above_gate(
                                 ticker=ticker, company_name=nm.get("company_name", ""),
                                 thesis=nm.get("thesis", ""), price=price,
@@ -6195,7 +6212,15 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 and not _on_deck_cooldown_active(
                     self._on_deck_backfill_reject_cooldown, ticker, _now_backfill)
                 and not _on_deck_cooldown_active(
-                    self._on_deck_backfill_above_gate_cooldown, ticker, _now_backfill))
+                    self._on_deck_backfill_above_gate_cooldown, ticker, _now_backfill)
+                # Also checks the continuous above-gate loop's own cooldown (fixed
+                # 2026-08-18, cost audit) -- see near_miss_monitor_loop's matching
+                # comment. Without this, a candidate that loop just evicted for being
+                # above gate (and asked Claude about) could be immediately reconsidered
+                # here as a fresh backfill candidate, re-asking the identical question
+                # this dict has no record of.
+                and not _on_deck_cooldown_active(
+                    self._on_deck_above_gate_cooldown, ticker, _now_backfill))
         ]
         if not candidates:
             return
