@@ -2906,20 +2906,61 @@ function renderRRSparklineLWC(container, points, targets, gate, convictionOk, cl
   return result;
 }
 
-// Card-level mini PRICE chart (2026-08-18, replaces the small R/R sparkline previously
-// mounted here) -- owner wanted the card's small chart box to show actual price action,
-// not the R/R-over-time curve (which still exists, just moved into the modal you get by
-// clicking into a card). No gate/target lines here -- unlike R/R, price has no fixed
-// buy-trigger threshold to draw, so this is purely a trend indicator: green when the
-// window's last price is at or above its first, red when it's fallen.
-function renderPriceSparklineLWC(container, points) {
-  const valid = (points || []).filter(p => p.price != null);
-  if (valid.length < 2) { container.innerHTML = ''; return null; }
-  const color = valid[valid.length - 1].price >= valid[0].price ? '#00e691' : '#ff3b5c';
-  const data = valid.map(p => ({ time: p.t, value: p.price }));
-  return renderLightweightChart(container, [
-    { type: 'area', data, color, topColor: color, bottomColor: 'transparent' },
-  ], { sparkline: true, width: container.clientWidth || 100, height: container.clientHeight || 60 });
+// Card-level mini CANDLESTICK chart (2026-08-18, replaces the small R/R sparkline
+// previously mounted here) -- owner wanted the card's small chart box to show real price
+// candles, the same daily OHLCV /api/stock-chart already backs everywhere else
+// candlesticks appear in this app (Deep Dive modal, position detail), not a plain colored
+// line. A bare-bones sparkline-style candlestick chart -- no axes, no legend, no volume,
+// no SMA/price-line overlays (renderDetailedStockChart's full feature set doesn't fit a
+// 96px box) -- just the candles themselves, trimmed to the most recent ~30 trading days
+// so individual candles stay visible at this size.
+//
+// _cardCandleCache (5-minute TTL, per ticker) exists because this mounts on every card
+// grid re-render -- which happens frequently from live WS ticks -- and each card needs
+// its own real network fetch (unlike the old rr_sparkline/price_sparkline, which rode
+// along in the already-fetched /api/near-miss list payload for free). Without a cache,
+// every single re-render would refetch full daily history for every visible card.
+const _cardCandleCache = {};
+async function _getCardCandlePoints(ticker) {
+  const cached = _cardCandleCache[ticker];
+  if (cached && (Date.now() - cached.fetchedAt) < 5 * 60 * 1000) return cached.points;
+  try {
+    const resp = await fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`);
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const points = (data.points || []).slice(-30);
+    _cardCandleCache[ticker] = { points, fetchedAt: Date.now() };
+    return points;
+  } catch (e) { return null; }
+}
+function renderCardCandleLWC(container, points) {
+  if (!container) return null;
+  if (container._lwcChart) { container._lwcChart.remove(); container._lwcChart = null; }
+  if (typeof LightweightCharts === 'undefined' || !points || points.length < 2) {
+    container.innerHTML = '';
+    return null;
+  }
+  const chart = LightweightCharts.createChart(container, {
+    width: container.clientWidth || 100, height: container.clientHeight || 96,
+    layout: { background: { color: 'transparent' }, textColor: 'transparent' },
+    grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+    rightPriceScale: { visible: false, scaleMargins: { top: 0.08, bottom: 0.08 } },
+    timeScale: { visible: false },
+    crosshair: {
+      vertLine: { visible: false, labelVisible: false },
+      horzLine: { visible: false, labelVisible: false },
+    },
+    handleScroll: false, handleScale: false,
+  });
+  const series = chart.addCandlestickSeries({
+    upColor: '#00e691', downColor: '#ff3b5c', borderVisible: false,
+    wickUpColor: '#00e691', wickDownColor: '#ff3b5c',
+    priceLineVisible: false, lastValueVisible: false,
+  });
+  series.setData(points.map(p => ({ time: p.time, open: p.open, high: p.high, low: p.low, close: p.close })));
+  chart.timeScale().fitContent();
+  container._lwcChart = chart;
+  return chart;
 }
 
 // Plain-English "here's what's happening" line for the dip-entry mechanism (2026-07-18).
@@ -3306,10 +3347,11 @@ function renderNearMissGrid(data) {
   // instead of two now.
   const cards = items.map((nm, i) => renderCard(nm, i)).join('');
   document.getElementById('stockGrid').innerHTML = `<div class="stock-col">${cards}</div>`;
-  items.forEach(nm => {
+  items.forEach(async nm => {
     const el = document.getElementById('rrspark-' + nm.ticker);
     if (!el) return;
-    renderPriceSparklineLWC(el, nm.price_sparkline);
+    const points = await _getCardCandlePoints(nm.ticker);
+    renderCardCandleLWC(document.getElementById('rrspark-' + nm.ticker), points);
   });
 }
 
@@ -3394,10 +3436,11 @@ function renderTodayScanGrid(data) {
   // Single column (2026-07-27), matching renderNearMissGrid's change -- see its comment.
   const cards = items.map(renderCard).join('');
   document.getElementById('stockGrid').innerHTML = `<div class="stock-col">${cards}</div>`;
-  items.forEach(r => {
+  items.forEach(async r => {
     const el = document.getElementById('rrspark-' + r.ticker);
     if (!el) return;
-    renderPriceSparklineLWC(el, r.price_sparkline);
+    const points = await _getCardCandlePoints(r.ticker);
+    renderCardCandleLWC(document.getElementById('rrspark-' + r.ticker), points);
   });
 }
 
