@@ -405,6 +405,16 @@ def _profit_target_trail_pct(
     return dollar_target_trail_pct if profit_target_hit else graduated_pct
 
 
+def _on_deck_cooldown_active(cooldown: dict, ticker: str, now: datetime) -> bool:
+    """Whether ticker is still within a stored cooldown-until timestamp (2026-08-18) --
+    shared by both the On Deck backfill's generic reject cooldown and the longer
+    above-gate-decline cooldown, so the two checks can't drift apart on comparison
+    direction/inclusivity. A missing ticker (never cooled down) is never active. An
+    expiry exactly equal to `now` is treated as already expired (strict `>`, not `>=`),
+    matching the pre-existing `cooldown.get(ticker, now) <= now` check this replaces."""
+    return cooldown.get(ticker, now) > now
+
+
 def _dip_low_changed_meaningfully(old_low: float | None, new_low: float, refresh_pct: float) -> bool:
     """Whether new_low is a genuinely deeper dip low than old_low, worth firing a fresh AI
     dip-entry recommendation for (2026-07-23) -- a plain != comparison treated ANY drift
@@ -1437,6 +1447,24 @@ class DashboardState:
         # _on_deck_backfill_reject_cooldown just above -- a restart losing a few minutes of
         # this cooldown is a trivial cost, not worth surviving a restart for.
         self._on_deck_above_gate_cooldown: dict[str, datetime] = {}
+
+        # On Deck backfill above-gate DECLINE cooldown (2026-08-18, SNDK incident) --
+        # separate from, and much longer than, the generic reject cooldown just above.
+        # Confirmed live: SNDK got sent through the real above-gate AI retention judgment
+        # (_on_deck_ai_gate_above_gate) inside _backfill_on_deck_from_on_shore's _try_add
+        # ~23 times in one afternoon, every ~5-6 minutes, declined the same way every
+        # time ("R/R inflated by continued decline, no longer a good buy"). The generic
+        # 5-minute reject cooldown was working exactly as designed -- it just isn't a
+        # long enough gap for a stock in ongoing decline to stop being a stock in ongoing
+        # decline. A value-change threshold (like _dip_low_changed_meaningfully's) doesn't
+        # fit here the way it does for dip lows: SNDK's own R/R genuinely moved a fair
+        # amount between checks (mechanical inflation as price kept falling), yet the
+        # real answer never changed, so gating on "did R/R move enough" wouldn't have
+        # caught this. A dedicated longer cooldown, set only on an above-gate decline
+        # specifically (not on the other _try_add_inner failure reasons, which already
+        # tend to resolve faster), is the more direct fix. In-memory only, same
+        # not-worth-persisting-across-a-restart precedent as its two siblings above.
+        self._on_deck_backfill_above_gate_cooldown: dict[str, datetime] = {}
 
         self.position_monitor_interval = research_cfg.get("position_monitor_interval_minutes", 60)
         self._is_holiday: bool = False
@@ -6164,8 +6192,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 and d.get("signal") in ("BUY", "STRONG BUY")
                 and d.get("conviction", 0) >= population_floor
                 and not d.get("is_fallback", False)
-                and self._on_deck_backfill_reject_cooldown.get(
-                    ticker, _now_backfill) <= _now_backfill)
+                and not _on_deck_cooldown_active(
+                    self._on_deck_backfill_reject_cooldown, ticker, _now_backfill)
+                and not _on_deck_cooldown_active(
+                    self._on_deck_backfill_above_gate_cooldown, ticker, _now_backfill))
         ]
         if not candidates:
             return
@@ -6221,6 +6251,15 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     conviction_score=report.conviction_score, fail_default=False,
                 )
                 if not still_good_buy:
+                    # Longer, dedicated cooldown on top of the generic reject cooldown
+                    # _try_add's wrapper already applies below (2026-08-18, SNDK
+                    # incident) -- see _on_deck_backfill_above_gate_cooldown's own
+                    # comment in __init__ for why this decline specifically needs a
+                    # much longer gap before being real-Claude-re-asked again.
+                    above_gate_cooldown_min = self.config["research"].get(
+                        "on_deck_backfill_above_gate_decline_cooldown_minutes", 60)
+                    self._on_deck_backfill_above_gate_cooldown[ticker] = (
+                        self._now_et() + timedelta(minutes=above_gate_cooldown_min))
                     entry = self.add_ai_log(ticker, "ON_DECK",
                         f"On Shore backfill candidate above its own gate — AI judged it's "
                         f"no longer a good buy: {reasoning}", "warning")
@@ -7259,6 +7298,7 @@ async def save_settings(payload: dict):
         "research.on_deck_swap_margin": float,
         "research.on_deck_backfill_retry_cooldown_minutes": int,
         "research.on_deck_above_gate_recheck_cooldown_minutes": int,
+        "research.on_deck_backfill_above_gate_decline_cooldown_minutes": int,
         "research.wash_sale_cooldown_days": int,
         "research.on_deck_auto_deep_dive": lambda v: v == "true",
         "research.position_deep_dive_enabled": lambda v: v == "true",

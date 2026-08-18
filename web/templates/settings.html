@@ -829,6 +829,15 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
+          <div class="setting-label">On Shore Backfill Above-Gate Decline Cooldown (min) <button type="button" class="info-btn" onclick="showInfo(event,'When the On Shore backfill path re-checks a candidate whose fresh R/R sits above its own gate and Claude judges it no longer a good buy, this cooldown blocks re-asking that SAME candidate again for this long. Separate from, and much longer than, the generic Backfill Retry Cooldown above -- confirmed live that the 5-minute generic cooldown alone let one candidate get re-asked the identical real AI judgment over 20 times in one afternoon, always declined the same way, because a stock in ongoing decline does not stop being one within minutes.')">i</button></div>
+          <div class="setting-desc">Minutes to wait before re-asking AI about a candidate just declined for being above its gate</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.on_deck_backfill_above_gate_decline_cooldown_minutes"
+               value="{{ cfg.research.on_deck_backfill_above_gate_decline_cooldown_minutes }}" min="0" max="360">
+        <div class="default-label">default<br><span class="default-val">60</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
           <div class="setting-label">On Deck Auto Deep Dive <button type="button" class="info-btn" onclick="showInfo(event,'When enabled, every stock that newly enters On Deck automatically gets one real Deep Dive (the richer Sonnet-tier analysis — DCF-style valuation, competitive moat, growth outlook, catalysts, bull/base/bear scenarios) instead of just the lighter quick-scan summary. Fires once per entry event only, not on every twice-daily re-analysis, so cost stays bounded by On Deck Max Size. Display-only — never affects the R/R buy-gate math, which stays driven by the quick-scan tier’s own fair value either way. Disable if you want to keep Deep Dives strictly manual (the dashboard’s Deep Dive button always works regardless of this setting).')">i</button></div>
           <div class="setting-desc">Auto-run a real Deep Dive once when a stock newly joins On Deck</div>
         </div>
@@ -1354,6 +1363,7 @@ const DEFAULTS = {
   'research.on_deck_swap_margin': 2.0,
   'research.on_deck_backfill_retry_cooldown_minutes': 5,
   'research.on_deck_above_gate_recheck_cooldown_minutes': 20,
+  'research.on_deck_backfill_above_gate_decline_cooldown_minutes': 60,
   'research.wash_sale_cooldown_days': 31,
   'research.on_deck_auto_deep_dive': 'true',
   'research.on_deck_block_breakout_pct': 2.0,
