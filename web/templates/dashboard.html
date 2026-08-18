@@ -4281,12 +4281,14 @@ async function diveAgainFromModal() {
 async function clickStock(ticker) {
   if (deepDiveReports[ticker]) {
     showDeepDiveModal(ticker, deepDiveReports[ticker]);
+    appendDeepDiveChart(ticker, deepDiveReports[ticker]);
     await appendOnDeckChart(ticker);
     appendTradingViewChart(ticker);
     return;
   }
   if (researchReports[ticker]) {
     showResearchModal(ticker, researchReports[ticker]);
+    appendDeepDiveChart(ticker, researchReports[ticker]);
     await appendOnDeckChart(ticker);
     appendTradingViewChart(ticker);
     return;
@@ -4298,6 +4300,7 @@ async function clickStock(ticker) {
       const data = await resp.json();
       researchReports[ticker] = data;
       showResearchModal(ticker, data);
+      appendDeepDiveChart(ticker, data);
       await appendOnDeckChart(ticker);
       appendTradingViewChart(ticker);
       return;
@@ -4794,6 +4797,13 @@ function showResearchModal(ticker, r) {
     </div>` : '';
 
   document.getElementById('ddModalBody').innerHTML = `
+    <div style="margin-bottom:14px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px;">
+        <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;">Price Chart</div>
+        <div id="ddCandleLegend" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+      </div>
+      <div id="ddCandleChart" style="width:100%;height:280px;border-radius:6px;overflow:hidden;"></div>
+    </div>
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
       <span style="background:${sc.bg};border:1px solid ${sc.border};color:${sc.text};padding:4px 12px;border-radius:6px;font-size:13px;font-weight:700;">${sig}</span>
       <span style="color:var(--text-muted);font-size:12px;">Conviction <strong style="color:var(--text-primary);">${r.conviction ?? r.conviction_score ?? '—'}/10</strong></span>
