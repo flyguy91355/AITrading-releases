@@ -8034,6 +8034,13 @@ async def get_stock_chart(ticker: str):
     manual Deep Dive modal.  Works for any ticker the owner types, not just held
     positions.  ref_lines come from the most-recent cached research report when one
     exists, so entry/stop/TP/fair-value price lines show up automatically."""
+    import math as _math
+
+    def _fin(v):
+        """Return None for NaN/Inf (yfinance occasionally returns these); otherwise v.
+        JSON cannot serialize NaN — a single bad bar crashes the whole endpoint with 500."""
+        return None if (v is None or (isinstance(v, float) and not _math.isfinite(v))) else v
+
     ticker = ticker.upper()
     try:
         bars, technicals = await asyncio.gather(
@@ -8045,8 +8052,9 @@ async def get_stock_chart(ticker: str):
         return {"points": [], "technicals": None, "ref_lines": None}
     points = [
         {"time": b["date"], "open": b["open"], "high": b["high"],
-         "low": b["low"], "close": b["close"], "volume": b["volume"]}
+         "low": b["low"], "close": b["close"], "volume": b.get("volume", 0)}
         for b in bars
+        if all(_fin(b.get(k)) is not None for k in ("open", "high", "low", "close"))
     ]
     report = state.research_reports.get(ticker)
     ref_lines = None
@@ -8060,10 +8068,10 @@ async def get_stock_chart(ticker: str):
     return {
         "points": points,
         "technicals": {
-            "sma_50": technicals.sma_50,
-            "sma_200": technicals.sma_200,
-            "support_level": technicals.support_level,
-            "resistance_level": technicals.resistance_level,
+            "sma_50": _fin(technicals.sma_50),
+            "sma_200": _fin(technicals.sma_200),
+            "support_level": _fin(technicals.support_level),
+            "resistance_level": _fin(technicals.resistance_level),
         } if technicals else None,
         "ref_lines": ref_lines,
     }
