@@ -118,3 +118,32 @@ def rr_sparkline(
         idx = min(int((p["t"] - t_min) / bucket_width), max_points - 1)
         buckets[idx] = p  # last (most recent) sample in the bucket wins
     return [{"t": buckets[i]["t"], "rr": buckets[i]["rr"]} for i in sorted(buckets)]
+
+
+def price_sparkline(
+    price_history: list[tuple[float, float]],
+    max_points: int = 40,
+) -> list[dict]:
+    """Compact price series for the On Deck/On Shore card's mini price chart
+    (2026-08-18, replaces the card's small R/R sparkline box) -- {"t": ts, "price": price}
+    per point. Same time-bucketed downsampling as rr_sparkline (see its docstring for why
+    time-bucketing, not index-slicing, matters here -- price_history mixes sparse daily
+    backfill with dense 60s live ticks the same way), deliberately its own function rather
+    than sharing rr_sparkline's loop since this has no R/R math at all (no
+    fair_value/stop_loss_pct needed) -- it's a lightweight trend indicator on the card,
+    not a buy-trigger input.
+    """
+    points = [{"t": ts, "price": round(price, 2)} for ts, price in price_history if price > 0]
+    if len(points) <= max_points:
+        return points
+    t_min, t_max = points[0]["t"], points[-1]["t"]
+    span = t_max - t_min
+    if span <= 0:
+        step = len(points) / max_points
+        return [points[int(i * step)] for i in range(max_points)]
+    bucket_width = span / max_points
+    buckets: dict[int, dict] = {}
+    for p in points:
+        idx = min(int((p["t"] - t_min) / bucket_width), max_points - 1)
+        buckets[idx] = p
+    return [buckets[i] for i in sorted(buckets)]

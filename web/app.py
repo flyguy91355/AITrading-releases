@@ -43,7 +43,7 @@ from src.research.quick_screen import quick_screen
 # longer until the network call eventually gives up on its own, but the scan LOOP is no
 # longer blocked waiting on it.
 _QUICK_SCREEN_TIMEOUT_SECS = 15
-from src.research.rr_curve import dip_summary, rr_at_price, rr_points, rr_sparkline
+from src.research.rr_curve import dip_summary, price_sparkline, rr_at_price, rr_points, rr_sparkline
 
 
 async def _quick_screen_with_timeout(ticker: str) -> tuple[bool, str] | None:
@@ -7867,6 +7867,7 @@ async def get_near_miss():
         result[ticker] = {
             **{k: v for k, v in nm.items() if k not in ("price_history", "_debug_price_history")},
             "rr_sparkline": rr_sparkline(_chart_price_history(nm), fair_value, stop_loss_pct),
+            "price_sparkline": price_sparkline(_chart_price_history(nm)),
             "dip": dip,
             "dip_target_rr": dip_target_rr,
             "ai_entry_target_rr": ai_entry_target_rr,
@@ -7985,6 +7986,7 @@ async def get_today_scan_rejects():
             "margin_of_safety_pct": margin,
             "generated_at": r.get("generated_at", ""),
             "rr_sparkline": rr_sparkline(histories.get(ticker, []), fair_value, stop_pct),
+            "price_sparkline": price_sparkline(histories.get(ticker, [])),
             "_score": score,
         }
     # Sorted by the same tiered (is_buy_eligible, composite_score) key On Deck's own

@@ -2906,6 +2906,22 @@ function renderRRSparklineLWC(container, points, targets, gate, convictionOk, cl
   return result;
 }
 
+// Card-level mini PRICE chart (2026-08-18, replaces the small R/R sparkline previously
+// mounted here) -- owner wanted the card's small chart box to show actual price action,
+// not the R/R-over-time curve (which still exists, just moved into the modal you get by
+// clicking into a card). No gate/target lines here -- unlike R/R, price has no fixed
+// buy-trigger threshold to draw, so this is purely a trend indicator: green when the
+// window's last price is at or above its first, red when it's fallen.
+function renderPriceSparklineLWC(container, points) {
+  const valid = (points || []).filter(p => p.price != null);
+  if (valid.length < 2) { container.innerHTML = ''; return null; }
+  const color = valid[valid.length - 1].price >= valid[0].price ? '#00e691' : '#ff3b5c';
+  const data = valid.map(p => ({ time: p.t, value: p.price }));
+  return renderLightweightChart(container, [
+    { type: 'area', data, color, topColor: color, bottomColor: 'transparent' },
+  ], { sparkline: true, width: container.clientWidth || 100, height: container.clientHeight || 60 });
+}
+
 // Plain-English "here's what's happening" line for the dip-entry mechanism (2026-07-18).
 // Always shows the underlying peak/low/depth (dip_summary) regardless of entry mode, plus
 // whichever mode is active AND the other mode's number for comparison — per explicit
@@ -3274,7 +3290,7 @@ function renderNearMissGrid(data) {
         </span>
         <span class="btn-side-col">
           <span class="btn-chart-box" id="rrspark-${nm.ticker}"></span>
-          <span class="btn-chart-box-caption">${dateRangeCaption(nm.rr_sparkline)}</span>
+          <span class="btn-chart-box-caption">${dateRangeCaption(nm.price_sparkline)}</span>
         </span>
       </span>
       <span class="btn-desc-block">
@@ -3293,11 +3309,7 @@ function renderNearMissGrid(data) {
   items.forEach(nm => {
     const el = document.getElementById('rrspark-' + nm.ticker);
     if (!el) return;
-    const requiredRR = nm.required_rr != null ? nm.required_rr : _MIN_RR_GATE;
-    renderRRSparklineLWC(el, nm.rr_sparkline, nm.dip ? [
-      {rr: nm.dip_target_rr, lowT: nm.dip.low_t, color: '#60a5fa'},
-      {rr: nm.ai_entry_target_rr, lowT: nm.dip.low_t, color: '#a78bfa'},
-    ] : [], requiredRR, (nm.conviction_score || 0) >= _MIN_CONVICTION_GATE);
+    renderPriceSparklineLWC(el, nm.price_sparkline);
   });
 }
 
@@ -3370,7 +3382,7 @@ function renderTodayScanGrid(data) {
         </span>
         <span class="btn-side-col">
           <span class="btn-chart-box" id="rrspark-${r.ticker}"></span>
-          <span class="btn-chart-box-caption">${dateRangeCaption(r.rr_sparkline)}</span>
+          <span class="btn-chart-box-caption">${dateRangeCaption(r.price_sparkline)}</span>
         </span>
       </span>
       <span class="btn-desc-block">
@@ -3385,8 +3397,7 @@ function renderTodayScanGrid(data) {
   items.forEach(r => {
     const el = document.getElementById('rrspark-' + r.ticker);
     if (!el) return;
-    const requiredRR = r.required_rr != null ? r.required_rr : _MIN_RR_GATE;
-    renderRRSparklineLWC(el, r.rr_sparkline, [], requiredRR, (r.conviction_score || 0) >= _MIN_CONVICTION_GATE, '#3987e5');
+    renderPriceSparklineLWC(el, r.price_sparkline);
   });
 }
 
