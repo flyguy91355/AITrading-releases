@@ -243,16 +243,30 @@ class MarketDataFetcher:
             market_cap=_g("marketCap"),
         )
 
-    async def get_historical(self, ticker: str, period: str = "1y", interval: str = "1d") -> list[dict]:
+    async def get_historical(
+        self, ticker: str, period: str = "1y", interval: str = "1d", *, hist=None,
+    ) -> list[dict]:
         """interval (added 2026-07-18) lets a caller ask for intraday bars (e.g. "15m", "1h")
         instead of just daily closes — used by On Deck's price-history backfill to get many
         more real data points than one-per-day. "timestamp" (a real Unix epoch, taken directly
         from the tz-aware pandas index) was added alongside "date" for this — a bare
         YYYY-MM-DD string collapses every intraday bar on the same day to an identical value,
-        losing the whole point of finer granularity."""
-        hist = await asyncio.to_thread(lambda: yf.Ticker(ticker).history(period=period, interval=interval))
+        losing the whole point of finer granularity.
+
+        hist (added 2026-08-18) lets a caller that already fetched this exact
+        ticker/period/interval pass the DataFrame straight through instead of this method
+        fetching it again — /api/stock-chart used to call this and get_technicals()
+        concurrently for the identical yfinance history, doubling real network calls per
+        chart open. Optional and additive; omitting it fetches fresh exactly as before."""
+        if hist is None:
+            hist = await asyncio.to_thread(lambda: yf.Ticker(ticker).history(period=period, interval=interval))
         results = []
         for date, row in hist.iterrows():
+            # yfinance occasionally reports NaN Volume on a thin-volume/incomplete bar
+            # (int(nan) raises ValueError) -- the real OHLC price data for that bar is
+            # still good, so report volume=0 rather than losing the whole bar (or, before
+            # this fix, crashing every bar in this call).
+            volume = row["Volume"]
             results.append({
                 "date": date.strftime("%Y-%m-%d"),
                 "timestamp": date.timestamp(),
@@ -260,7 +274,7 @@ class MarketDataFetcher:
                 "high": float(row["High"]),
                 "low": float(row["Low"]),
                 "close": float(row["Close"]),
-                "volume": int(row["Volume"]),
+                "volume": 0 if (isinstance(volume, float) and math.isnan(volume)) else int(volume),
             })
         return results
 
@@ -279,8 +293,12 @@ class MarketDataFetcher:
             return []
         return hist["Close"].tail(minutes).tolist()
 
-    async def get_technicals(self, ticker: str) -> TechnicalIndicators:
-        hist = await asyncio.to_thread(lambda: yf.Ticker(ticker).history(period="1y"))
+    async def get_technicals(self, ticker: str, *, hist=None) -> TechnicalIndicators:
+        """hist (added 2026-08-18): see get_historical()'s matching parameter -- lets a
+        caller that already fetched the same 1y/1d history reuse it instead of this
+        method independently re-fetching from yfinance."""
+        if hist is None:
+            hist = await asyncio.to_thread(lambda: yf.Ticker(ticker).history(period="1y"))
 
         if hist.empty:
             return TechnicalIndicators(ticker=ticker)

@@ -1424,6 +1424,20 @@ class DashboardState:
         # restart for.
         self._on_deck_backfill_reject_cooldown: dict[str, datetime] = {}
 
+        # On Deck continuous above-gate re-check cooldown (2026-08-18, owner request) --
+        # near_miss_monitor_loop's 60s tick already sweep-evicts on the FLOOR side for free
+        # (no Claude call, just live-price math -- see the 2026-08-10 to_evict_rr_floor
+        # entry below). The ABOVE-gate side never had a continuous equivalent: a candidate
+        # that drifts above its own gate only gets AI-rejudged (_on_deck_ai_gate_above_gate)
+        # at the twice-daily persist-check, so it can sit visibly above-gate for hours with
+        # nothing re-checking it. Unlike the floor side, above-gate judgment is a real,
+        # billed Claude call, so making it continuous needs a cooldown -- without one, a
+        # candidate that stays above gate would re-fire the same judgment every single 60s
+        # tick indefinitely. In-memory only (deliberately not persisted), same precedent as
+        # _on_deck_backfill_reject_cooldown just above -- a restart losing a few minutes of
+        # this cooldown is a trivial cost, not worth surviving a restart for.
+        self._on_deck_above_gate_cooldown: dict[str, datetime] = {}
+
         self.position_monitor_interval = research_cfg.get("position_monitor_interval_minutes", 60)
         self._is_holiday: bool = False
         self._holiday_check_date: str = ""
@@ -4521,6 +4535,7 @@ class DashboardState:
                 to_promote: list[tuple[str, float]] = []
                 to_evict_stale: list[str] = []
                 to_evict_rr_floor: list[tuple[str, float, float]] = []
+                to_evict_above_gate: list[tuple[str, float, float, str]] = []
 
                 for ticker, nm in list(self.near_miss_candidates.items()):
                     if ticker in self.portfolio.positions:
@@ -4618,6 +4633,41 @@ class DashboardState:
 
                     if rr < min_rr:
                         continue
+
+                    # Continuous above-gate AI re-judgment (2026-08-18, owner request) --
+                    # mirrors the persist-check retention sweep's own above-gate check
+                    # (_on_deck_ai_gate_above_gate) below, just running every tick instead of
+                    # only 2x/day. Cooldown-gated (on_deck_above_gate_recheck_cooldown_minutes),
+                    # unlike the floor-side eviction above -- this one IS a real, billed Claude
+                    # call, so re-firing it every single tick for a candidate that just sits
+                    # above gate for hours would be real, avoidable spend for a judgment that
+                    # barely changes tick to tick. A "still good" verdict (or a not-yet-due
+                    # cooldown) falls through to the entry-price trigger logic below exactly as
+                    # before -- this only ever short-circuits the loop on eviction.
+                    if _on_deck_rr_above_gate(rr, min_rr):
+                        cooldown_min = self.config["research"].get(
+                            "on_deck_above_gate_recheck_cooldown_minutes", 20)
+                        last_checked = self._on_deck_above_gate_cooldown.get(ticker)
+                        due = (last_checked is None
+                               or (datetime.now() - last_checked).total_seconds() >= cooldown_min * 60)
+                        if due:
+                            self._on_deck_above_gate_cooldown[ticker] = datetime.now()
+                            still_good_buy, reasoning = await self._on_deck_ai_gate_above_gate(
+                                ticker=ticker, company_name=nm.get("company_name", ""),
+                                thesis=nm.get("thesis", ""), price=price,
+                                fair_value_estimate=nm["fair_value_estimate"], stop_loss=stop,
+                                rr=rr, required_rr=min_rr, conviction_score=nm["conviction_score"],
+                                fail_default=True,
+                            )
+                            # Re-fetch guard (same pattern as _compute_ai_dip_entry and the
+                            # persist-check sweep's own above-gate check): a concurrent
+                            # promotion/removal could have popped this candidate while the
+                            # real Claude call above was in flight.
+                            if ticker not in self.near_miss_candidates:
+                                continue
+                            if not still_good_buy:
+                                to_evict_above_gate.append((ticker, rr, min_rr, reasoning))
+                                continue
 
                     # Entry-price check (2026-07-18) — see this method's docstring for the
                     # full "retracement" vs "ai" design. Both modes start from the same shared
@@ -4815,6 +4865,23 @@ class DashboardState:
                         f"+ {floor_margin:.2f} margin)", "warning")
                     asyncio.create_task(self.broadcast({"type": "ai_log", "entry": entry}))
                 if to_evict_rr_floor:
+                    asyncio.create_task(
+                        asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
+
+                # Continuous above-gate AI eviction (2026-08-18) -- deferred out of the main
+                # loop above for the same reason every other eviction/promotion list here is:
+                # avoid mutating near_miss_candidates while other tickers are still being read
+                # from it in this same pass. Mirrors the persist-check sweep's own above-gate
+                # eviction message exactly (same wording, same "warning" level).
+                for ticker, rr_val, required_rr, reasoning in to_evict_above_gate:
+                    self.near_miss_candidates.pop(ticker, None)
+                    self._mark_universe_reject(ticker)
+                    entry = self.add_ai_log(ticker, "ON_DECK",
+                        f"Removed from On Deck — R/R {rr_val:.2f} above its own gate "
+                        f"({required_rr:.2f}), AI judged it's no longer a good buy: "
+                        f"{reasoning}", "warning")
+                    asyncio.create_task(self.broadcast({"type": "ai_log", "entry": entry}))
+                if to_evict_above_gate:
                     asyncio.create_task(
                         asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
 
@@ -5936,16 +6003,18 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         conviction_score: float, fail_default: bool,
     ) -> tuple[bool, str]:
         """Shared AI judgment for a candidate whose R/R sits above its own real gate
-        (2026-08-05, owner design). Used for RETENTION (an already-listed candidate
-        found above gate at persist-check), for one admission path --
-        `_backfill_on_deck_from_on_shore` -- the only one where a candidate genuinely
-        has a track record of being watched rise past its own gate while listed
-        before getting bumped for an unrelated reason, and, as of 2026-08-13, for
-        the actual PROMOTION/BUY TRIGGER itself (`_attempt_near_miss_promotion`) --
-        see that call site's own comment for the OXY incident that prompted
-        extending this here: the identical ambiguity this function already judged
-        for admission/retention was, until this date, never asked at the one moment
-        that actually spends real money. Deliberately NOT used at the other 3
+        (2026-08-05, owner design). Used for RETENTION -- both at the twice-daily
+        persist-check, and (as of 2026-08-18) continuously every 60s tick inside
+        near_miss_monitor_loop, cooldown-gated via on_deck_above_gate_recheck_cooldown_minutes
+        so the same still-above-gate candidate can't re-fire this real Claude call every
+        single tick -- for one admission path -- `_backfill_on_deck_from_on_shore` -- the
+        only one where a candidate genuinely has a track record of being watched rise past
+        its own gate while listed before getting bumped for an unrelated reason, and, as of
+        2026-08-13, for the actual PROMOTION/BUY TRIGGER itself
+        (`_attempt_near_miss_promotion`) -- see that call site's own comment for the OXY
+        incident that prompted extending this here: the identical ambiguity this function
+        already judged for admission/retention was, until this date, never asked at the one
+        moment that actually spends real money. Deliberately NOT used at the other 3
         admission sites (a fresh universe-scan result, the startup cache restore,
         the on-demand Settings-triggered refill): a candidate found above its own
         gate there has zero track record, and owner explicitly wants those excluded
@@ -7189,6 +7258,7 @@ async def save_settings(payload: dict):
         "research.on_deck_backfill_enabled": lambda v: v == "true",
         "research.on_deck_swap_margin": float,
         "research.on_deck_backfill_retry_cooldown_minutes": int,
+        "research.on_deck_above_gate_recheck_cooldown_minutes": int,
         "research.wash_sale_cooldown_days": int,
         "research.on_deck_auto_deep_dive": lambda v: v == "true",
         "research.position_deep_dive_enabled": lambda v: v == "true",
@@ -8036,6 +8106,8 @@ async def get_stock_chart(ticker: str):
     exists, so entry/stop/TP/fair-value price lines show up automatically."""
     import math as _math
 
+    import yfinance as yf
+
     def _fin(v):
         """Return None for NaN/Inf (yfinance occasionally returns these); otherwise v.
         JSON cannot serialize NaN — a single bad bar crashes the whole endpoint with 500."""
@@ -8043,9 +8115,14 @@ async def get_stock_chart(ticker: str):
 
     ticker = ticker.upper()
     try:
+        # Fetch the 1y/1d yfinance history exactly once and hand it to both calls below
+        # (fixed 2026-08-18, code-review finding) -- they used to each independently
+        # re-fetch the identical history, doubling real yfinance network calls per chart
+        # open (Deep Dive modal, position detail, every ticker switch).
+        hist = await asyncio.to_thread(lambda: yf.Ticker(ticker).history(period="1y", interval="1d"))
         bars, technicals = await asyncio.gather(
-            state.market_data.get_historical(ticker, period="1y", interval="1d"),
-            state.market_data.get_technicals(ticker),
+            state.market_data.get_historical(ticker, period="1y", interval="1d", hist=hist),
+            state.market_data.get_technicals(ticker, hist=hist),
         )
     except Exception as e:
         logger.warning("stock_chart failed for %s: %s", ticker, e)

@@ -1958,7 +1958,13 @@ function renderDetailedStockChart(containerId, legendId, points, technicals, ref
   if (refLines) {
     priceLine(refLines.entry,    '#3b82f6', 'Entry',      LightweightCharts.LineStyle.Solid);
     priceLine(refLines.stop,     '#ef4444', 'Stop',       LightweightCharts.LineStyle.Solid);
-    (refLines.takeProfits || []).forEach((tp, i) => priceLine(tp, '#10b981', `TP${i + 1}`));
+    // Label counting from the END of the array, not the start (mirrors the Price Levels
+    // ladder's own 2026-07-24 fix, showPositionDetail) -- take_profit_targets shrinks
+    // from the front as each tranche fires (T1 fires -> [T2, T3] remain), so indexing
+    // from the start relabels the survivors TP1/TP2 again on every fire. The LAST
+    // element is always the final (T3) tranche regardless of how many have already fired.
+    const tps = refLines.takeProfits || [];
+    tps.forEach((tp, i) => priceLine(tp, '#10b981', `TP${3 - (tps.length - 1 - i)}`));
     priceLine(refLines.fairValue, '#06b6d4', 'Fair Value');
   }
   if (technicals) {
@@ -1992,6 +1998,11 @@ async function appendDeepDiveChart(ticker, report) {
   try {
     const resp = await fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`);
     const data = await resp.json();
+    // Ticker guard (2026-08-18): the user may have clicked a different stock before this
+    // fetch resolved -- #ddCandleChart is a static id recreated fresh by
+    // showDeepDiveModal/showResearchModal each time, so without this check a slow-to-
+    // resolve fetch for ticker A can mount its chart into a modal now showing ticker B.
+    if (ticker !== _ddModalCurrentTicker) return;
     if (!data.points || data.points.length < 2) return;
     const rl = data.ref_lines || {};
     renderDetailedStockChart('ddCandleChart', 'ddCandleLegend', data.points, data.technicals, {
@@ -2001,6 +2012,34 @@ async function appendDeepDiveChart(ticker, report) {
       fairValue:  rl.fair_value,
     });
   } catch (e) { console.error('appendDeepDiveChart:', ticker, e); }
+}
+
+// Expand affordance for the Deep Dive/Research modal's candlestick price chart
+// (2026-08-18, owner report: "i also cant expand the candle stick charts") -- unlike the
+// R/R chart and position-detail chart, this chart never had any expand path at all.
+async function openDeepDiveChartExpand(ticker) {
+  _chartExpandCurrentTicker = ticker;
+  document.getElementById('chartExpandTitle').textContent = `${ticker} — Daily Candlestick`;
+  document.getElementById('chartExpandBody').innerHTML = spinnerHtml();
+  document.getElementById('chartExpandModal').style.display = 'flex';
+  let data;
+  try {
+    const resp = await fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`);
+    data = await resp.json();
+  } catch (e) { console.error('openDeepDiveChartExpand:', ticker, e); return; }
+  if (ticker !== _chartExpandCurrentTicker) return;
+  if (!data.points || data.points.length < 2) {
+    document.getElementById('chartExpandBody').innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted);">No price history available</div>';
+    return;
+  }
+  const rl = data.ref_lines || {};
+  document.getElementById('chartExpandBody').innerHTML = `
+    <div id="ddCandleExpandLegend" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;"></div>
+    <div id="ddCandleExpandChart" style="height:520px;border-radius:6px;overflow:hidden;"></div>
+  `;
+  renderDetailedStockChart('ddCandleExpandChart', 'ddCandleExpandLegend', data.points, data.technicals, {
+    entry: rl.entry, stop: rl.stop, takeProfits: rl.take_profits || [], fairValue: rl.fair_value,
+  });
 }
 
 // Unambiguous text readout under each sparkline (2026-07-21, real user confusion caught
@@ -3509,6 +3548,7 @@ function fmtTimeOwned(openedAt) {
 async function showPositionDetail(ticker) {
   const p = positionData[ticker];
   if (!p) return;
+  _posDetailCurrentTicker = ticker;
 
   // Prefer the richest available report, same priority clickStock already uses for On
   // Deck/On Shore stocks — a held position gets exactly as much detail as any other ticker
@@ -3719,18 +3759,27 @@ async function showPositionDetail(ticker) {
     const candleModeMini = localStorage.getItem('posChartStyleMini') === 'candlestick';
     const container = document.getElementById('posChartContainer');
     if (!container) return;
-    // Always fetch both — ohlcv powers candlestick mode AND gives technicals for
-    // SMA/support/resistance overlays in line mode.
-    const [histResp, ohlcvResp] = await Promise.all([
+    // Promise.allSettled, not Promise.all (fixed 2026-08-18) -- the stock-chart fetch is
+    // purely supplementary (candlestick mode + SMA/support/resistance overlays); a
+    // network-level failure on it alone used to fail the whole Promise.all and blank the
+    // entire chart, even when the core position-history fetch would have succeeded fine.
+    const [histResult, ohlcvResult] = await Promise.allSettled([
       fetch(`/api/position/${ticker}/history`),
       fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`),
     ]);
-    if (!histResp.ok) {
+    // Ticker guard (2026-08-18): the user may have clicked a different position before
+    // these fetches resolved -- #posChartContainer is a static id rebuilt fresh by this
+    // function's own earlier synchronous HTML, so without this check a slow-to-resolve
+    // fetch for ticker A can mount its chart into a detail panel now showing ticker B.
+    if (ticker !== _posDetailCurrentTicker) return;
+    const histResp = histResult.status === 'fulfilled' ? histResult.value : null;
+    if (!histResp || !histResp.ok) {
       container.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:12px;text-align:center;">Chart unavailable.</div>';
       return;
     }
     const data = await histResp.json();
     const effStop = (data.trailing_stop && data.trailing_stop > data.stop_loss) ? data.trailing_stop : data.stop_loss;
+    const ohlcvResp = ohlcvResult.status === 'fulfilled' ? ohlcvResult.value : null;
     const ohlcv = (ohlcvResp && ohlcvResp.ok) ? await ohlcvResp.json() : null;
     const ohlcvPoints = ohlcv && ohlcv.points && ohlcv.points.length >= 2 ? ohlcv.points : null;
     if (candleModeMini && ohlcvPoints) {
@@ -4222,6 +4271,14 @@ function updateBrokerBadge(status) {
 
 let _manualDDTicker = null;
 let _ddModalCurrentTicker = null;
+// Ticker-guard globals (2026-08-18, code-review finding) -- appendOnDeckChart already
+// guards against a stale async chart fetch overwriting a modal that's since moved on to
+// a different ticker, by re-checking a per-ticker container id after its fetch resolves.
+// showPositionDetail/openPositionChartExpand/openChartExpand mount into static
+// (non-ticker-scoped) container ids inside persistent modal shells, so they need the
+// same guard via a tracked "currently open ticker" instead.
+let _posDetailCurrentTicker = null;
+let _chartExpandCurrentTicker = null;
 
 function updateDDHistory() {
   const sel = document.getElementById('ddHistorySelect');
@@ -4484,6 +4541,7 @@ async function openChartExpand(ticker) {
   if (positionData[ticker]) return openPositionChartExpand(ticker);
   const which = _onDeckOrShore(ticker);
   if (!which) return;
+  _chartExpandCurrentTicker = ticker;
   document.getElementById('chartExpandTitle').textContent = ticker;
   document.getElementById('chartExpandBody').innerHTML = spinnerHtml();
   document.getElementById('chartExpandModal').style.display = 'flex';
@@ -4495,6 +4553,10 @@ async function openChartExpand(ticker) {
     if (!resp.ok) return;
     data = await resp.json();
   } catch (e) { console.error('openChartExpand:', e); return; }
+  // Ticker guard (2026-08-18): #chartExpandModal is a single shared modal -- without this,
+  // a slow-to-resolve fetch for a ticker the user has since navigated away from can mount
+  // its chart into a modal now showing a different ticker.
+  if (ticker !== _chartExpandCurrentTicker) return;
 
   const targets = data.dip ? [
     {rr: data.dip_target_rr, lowT: data.dip.low_t, color: '#60a5fa', label: `20% retrace $${data.dip.retracement_target.toFixed(2)}`},
@@ -4517,19 +4579,28 @@ async function openChartExpand(ticker) {
 // a price chart (renderPositionChartSVG) with real entry/stop/TP reference lines instead of
 // the R/R chart, matching the compact chart already shown in showPositionDetail.
 async function openPositionChartExpand(ticker) {
+  _chartExpandCurrentTicker = ticker;
   document.getElementById('chartExpandTitle').textContent = ticker;
   document.getElementById('chartExpandBody').innerHTML = spinnerHtml();
   document.getElementById('chartExpandModal').style.display = 'flex';
 
   const candleModeFull = localStorage.getItem('posChartStyleFull') === 'candlestick';
+  // Promise.allSettled, not Promise.all (fixed 2026-08-18, same fix as showPositionDetail's
+  // compact chart) -- the stock-chart fetch is purely supplementary; a network-level
+  // failure on it alone shouldn't fail the whole load and leave the modal stuck on its
+  // spinner when the core position-history fetch would have succeeded fine.
+  const [histResult, ohlcvResult] = await Promise.allSettled([
+    fetch(`/api/position/${ticker}/history`),
+    fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`),
+  ]);
+  // Ticker guard (2026-08-18): see openChartExpand's matching comment.
+  if (ticker !== _chartExpandCurrentTicker) return;
   let data, ohlcv = null;
   try {
-    const [histResp, ohlcvResp] = await Promise.all([
-      fetch(`/api/position/${ticker}/history`),
-      fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`),
-    ]);
-    if (!histResp.ok) return;
+    const histResp = histResult.status === 'fulfilled' ? histResult.value : null;
+    if (!histResp || !histResp.ok) return;
     data = await histResp.json();
+    const ohlcvResp = ohlcvResult.status === 'fulfilled' ? ohlcvResult.value : null;
     if (ohlcvResp && ohlcvResp.ok) ohlcv = await ohlcvResp.json();
   } catch (e) { console.error('openPositionChartExpand:', e); return; }
 
@@ -4798,11 +4869,14 @@ function showResearchModal(ticker, r) {
 
   document.getElementById('ddModalBody').innerHTML = `
     <div style="margin-bottom:14px;">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px;">
-        <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;">Price Chart</div>
-        <div id="ddCandleLegend" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px;justify-content:space-between;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;">Price Chart</div>
+          <div id="ddCandleLegend" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+        </div>
+        <div style="font-size:10px;color:var(--accent);cursor:pointer;" onclick="openDeepDiveChartExpand('${ticker}')">⤢ Expand</div>
       </div>
-      <div id="ddCandleChart" style="width:100%;height:280px;border-radius:6px;overflow:hidden;"></div>
+      <div id="ddCandleChart" style="width:100%;height:280px;border-radius:6px;overflow:hidden;cursor:pointer;" onclick="openDeepDiveChartExpand('${ticker}')"></div>
     </div>
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
       <span style="background:${sc.bg};border:1px solid ${sc.border};color:${sc.text};padding:4px 12px;border-radius:6px;font-size:13px;font-weight:700;">${sig}</span>
@@ -4962,11 +5036,14 @@ function showDeepDiveModal(ticker, dd) {
   document.getElementById('ddModalBody').innerHTML = `
     <!-- Candlestick chart slot — filled async by appendDeepDiveChart after the modal opens -->
     <div style="margin-bottom:14px;">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px;">
-        <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;">Price Chart</div>
-        <div id="ddCandleLegend" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px;justify-content:space-between;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;">Price Chart</div>
+          <div id="ddCandleLegend" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+        </div>
+        <div style="font-size:10px;color:var(--accent);cursor:pointer;" onclick="openDeepDiveChartExpand('${ticker}')">⤢ Expand</div>
       </div>
-      <div id="ddCandleChart" style="width:100%;height:280px;border-radius:6px;overflow:hidden;"></div>
+      <div id="ddCandleChart" style="width:100%;height:280px;border-radius:6px;overflow:hidden;cursor:pointer;" onclick="openDeepDiveChartExpand('${ticker}')"></div>
     </div>
     ${ts ? `<div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;">Report generated: ${ts}</div>` : ''}
     <!-- Signal banner -->
