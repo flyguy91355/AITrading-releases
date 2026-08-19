@@ -15,7 +15,12 @@ class BenchmarkStore:
         self.db_path = db_path
 
     def _connect(self):
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+        # timeout=20.0 (2026-08-19, cross-module hardening after a real
+        # sqlite3.OperationalError: database is locked crash in the sibling
+        # watchlist_manager.py connection -- see that module's matching comment) --
+        # longer retry window against the same shared, multi-writer data/aitrading.db
+        # file than the implicit 5.0s default.
+        return sqlite3.connect(self.db_path, check_same_thread=False, timeout=20.0)
 
     def initialize(self) -> None:
         with self._connect() as conn:

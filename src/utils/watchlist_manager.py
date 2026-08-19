@@ -23,7 +23,19 @@ class WatchlistManager:
         # a test calling through asyncio.to_thread, which already worked fine). Purely
         # defensive: closes off the failure mode if a future caller ever starts reusing a
         # connection object across threads.
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+        #
+        # timeout=20.0 (2026-08-19, live incident) -- this exact connection's
+        # set_scan_cursor() commit is what crashed a real pre-open batch run with
+        # sqlite3.OperationalError: database is locked, after only the implicit 5.0s
+        # default retry window. data/aitrading.db is shared across several independent
+        # async loops (position updates, ai_log persistence, trade history) with no
+        # write coordination between them, so a longer retry window gives real
+        # contention a chance to clear instead of failing fast. Matches web/app.py's
+        # own _SQLITE_TIMEOUT_SECS constant -- not imported directly since this module
+        # has no dependency on web/app.py (the reverse would be true), so the value is
+        # duplicated here with this comment rather than adding that coupling for one
+        # constant.
+        return sqlite3.connect(self.db_path, check_same_thread=False, timeout=20.0)
 
     def _init_db(self):
         with self._connect() as conn:

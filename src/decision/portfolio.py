@@ -271,7 +271,14 @@ class Portfolio:
 
     async def initialize(self):
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(self.db_path)
+        # timeout=20.0 (2026-08-19, cross-module hardening after a real
+        # sqlite3.OperationalError: database is locked crash in a sibling sync
+        # connection to this same shared data/aitrading.db file -- see
+        # src/utils/watchlist_manager.py's matching comment for the live incident).
+        # aiosqlite passes this through to the underlying sqlite3 connection's own
+        # busy-retry window, same mechanism as the sync connections elsewhere in this
+        # app -- longer than the implicit 5.0s default.
+        self._db = await aiosqlite.connect(self.db_path, timeout=20.0)
 
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS positions (

@@ -43,6 +43,20 @@ from src.research.quick_screen import quick_screen
 # longer until the network call eventually gives up on its own, but the scan LOOP is no
 # longer blocked waiting on it.
 _QUICK_SCREEN_TIMEOUT_SECS = 15
+
+# SQLite busy-retry window (2026-08-19, live incident: _run_pre_open_batch crashed with
+# sqlite3.OperationalError: database is locked ~19 minutes into a live pre-open batch
+# run, silently killing that morning's On Deck refresh -- the crashing write was a plain
+# sqlite3 connection with no explicit `timeout=`, so it only internally retried for the
+# module's implicit 5.0s default before giving up. This app has several independent
+# async loops touching the same data/aitrading.db file (position updates, ai_log
+# persistence, trade history, the watchlist cursor write that actually crashed) with no
+# coordination between them, so a 5s window can genuinely be too short under real
+# concurrent load. 20s gives real headroom without risking a hung request feeling stuck
+# to a human waiting on it. Applied everywhere this app opens a sqlite3/aiosqlite
+# connection to that shared file -- see also _ensure_wal_mode below, the other half of
+# this same fix.
+_SQLITE_TIMEOUT_SECS = 20.0
 from src.research.rr_curve import dip_summary, price_sparkline, rr_at_price, rr_points, rr_sparkline
 
 
@@ -1512,7 +1526,7 @@ class DashboardState:
 
     def _init_log_db(self):
         import sqlite3 as _sqlite3
-        with _sqlite3.connect(self._log_db_path) as conn:
+        with _sqlite3.connect(self._log_db_path, timeout=_SQLITE_TIMEOUT_SECS) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ai_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1528,7 +1542,7 @@ class DashboardState:
 
     def _load_log_from_db(self) -> list[dict]:
         import sqlite3 as _sqlite3
-        with _sqlite3.connect(self._log_db_path) as conn:
+        with _sqlite3.connect(self._log_db_path, timeout=_SQLITE_TIMEOUT_SECS) as conn:
             rows = conn.execute(
                 "SELECT timestamp, ticker, phase, content, level FROM ai_log "
                 "ORDER BY id DESC LIMIT 300"
@@ -1541,7 +1555,7 @@ class DashboardState:
     def _persist_log_entry(self, entry: dict):
         import sqlite3 as _sqlite3
         try:
-            with _sqlite3.connect(self._log_db_path) as conn:
+            with _sqlite3.connect(self._log_db_path, timeout=_SQLITE_TIMEOUT_SECS) as conn:
                 conn.execute(
                     "INSERT INTO ai_log (timestamp, ticker, phase, content, level, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
@@ -5689,7 +5703,7 @@ class DashboardState:
                         continue
 
             import sqlite3 as _sqlite3
-            with _sqlite3.connect(self._log_db_path) as conn:
+            with _sqlite3.connect(self._log_db_path, timeout=_SQLITE_TIMEOUT_SECS) as conn:
                 rows = conn.execute(
                     "SELECT timestamp, ticker, phase, content, level FROM ai_log "
                     "WHERE date(created_at) = date('now', 'localtime') "
@@ -9423,9 +9437,37 @@ async def websocket_endpoint(websocket: WebSocket):
             state.connected_clients.remove(websocket)
 
 
+def _ensure_wal_mode(db_path: str) -> None:
+    """Switches the shared SQLite database to WAL (write-ahead log) journal mode, once,
+    at every startup (2026-08-19, live incident) -- see _SQLITE_TIMEOUT_SECS's own
+    comment above for the real crash this pairs with: _run_pre_open_batch died with
+    sqlite3.OperationalError: database is locked ~19 minutes into a live run, silently
+    killing that morning's On Deck refresh. Rollback-journal mode (SQLite's default)
+    lets one writer's transaction block every other reader AND writer for its duration;
+    WAL mode lets readers and a single writer proceed concurrently without blocking
+    each other, which is the dominant source of contention in an app this size --
+    position_update_loop, ai_log persistence, trade history writes, and the watchlist
+    cursor write that actually crashed all touch this same file from independent async
+    loops with no coordination between them. WAL mode is a property of the database
+    FILE itself (stored in its header), not the connection -- setting it once here
+    covers every connection this app opens afterward (sync sqlite3 in
+    watchlist_manager.py/benchmark_store.py/this file, and aiosqlite in portfolio.py),
+    regardless of which module's connection happens to open the file first. Idempotent
+    and cheap to call unconditionally on every startup -- querying an already-WAL
+    database for its journal_mode is a no-op, not a real migration each time."""
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(db_path, timeout=_SQLITE_TIMEOUT_SECS)
+    try:
+        row = conn.execute("PRAGMA journal_mode=WAL;").fetchone()
+        logger.info("Database journal mode: %s (%s)", row[0] if row else "?", db_path)
+    finally:
+        conn.close()
+
+
 @app.on_event("startup")
 async def startup():
     Path("data").mkdir(exist_ok=True)
+    _ensure_wal_mode(state.config.get("database", {}).get("path", "data/aitrading.db"))
     state.deep_dive_reports = _load_dd_cache()
     if state.deep_dive_reports:
         logger.info("Restored %d deep dive report(s) from cache", len(state.deep_dive_reports))
