@@ -96,12 +96,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Real Hetzner go-live date (see CLAUDE.md "Hetzner Cloud Deployment"). Both
-# /api/portfolio-summary and /api/portfolio-health filter trade data to this cutoff —
-# everything before it is leftover local-machine dev/test data that got rsync'd over
-# during the initial deploy (both data/trade_history/*.jsonl and data/aitrading.db itself),
-# never cleaned up, and would otherwise wildly distort both endpoints' numbers.
-_LIVE_ACCOUNT_START = "2026-07-12"
+# Real go-live date for THIS install, self-initializing rather than hardcoded
+# (2026-08-20, closed at the source after a real incident on the AIShortTrading
+# fork — see that project's CLAUDE_HISTORY.md 2026-08-20 entry). This constant used
+# to be a literal date string; when AIShortTrading forked this file, that literal
+# copied over verbatim and silently named AITrading's own 2026-07-12 inception
+# instead of AIShortTrading's real one, distorting its annualized-P&L display AND
+# its trade-history/win-rate filtering for a full day before anyone noticed. This
+# file's own value (2026-07-12) is still correct for THIS install — the fix below
+# doesn't change today's behavior here at all — but it closes the landmine at its
+# source: the *next* fork of this file (whichever sibling it becomes) now inherits
+# a self-initializing mechanism instead of a copy-pasted literal to forget to
+# update. `_ACCOUNT_GENESIS_PATH` is a marker file (same presence-only-marker idea
+# as `_FIRST_SCAN_MARKER` below): on a fresh clone's very first startup, no such
+# file exists yet, so `_get_or_init_account_genesis()` writes TODAY's date and that
+# becomes that install's own permanent genesis from then on. Both
+# /api/portfolio-summary and /api/portfolio-health filter trade data to this
+# cutoff — everything before it is leftover local-machine dev/test data that got
+# rsync'd over during the initial deploy (both data/trade_history/*.jsonl and
+# data/aitrading.db itself), never cleaned up, and would otherwise wildly distort
+# both endpoints' numbers.
+_ACCOUNT_GENESIS_PATH = Path("data/.account_genesis")
+
+
+def _get_or_init_account_genesis(today_str: str) -> str:
+    """Pure apart from the one file read/write: returns the persisted genesis date if
+    `_ACCOUNT_GENESIS_PATH` already holds one, else writes `today_str` there and
+    returns it -- so a fresh clone's very first startup permanently stamps its own
+    real go-live date with zero manual configuration. `today_str` is passed in
+    (rather than computed here) so this stays testable without mocking the clock."""
+    try:
+        existing = _ACCOUNT_GENESIS_PATH.read_text().strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+    _ACCOUNT_GENESIS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _ACCOUNT_GENESIS_PATH.write_text(today_str)
+    return today_str
 
 # The Watchlist-removal redesign (2026-07-17, see CLAUDE.md) completely replaced the
 # buy/sell decision mechanism — On Deck's continuous near-miss monitoring became the sole
@@ -1430,6 +1462,11 @@ class DashboardState:
         h, m = research_cfg.get("market_close", "16:00").split(":")
         self.market_close = dtime(int(h), int(m))
         self.market_tz = ZoneInfo(research_cfg.get("market_timezone", "America/New_York"))
+        # This install's own real go-live date -- see _get_or_init_account_genesis's
+        # docstring. Computed here (not module-level, unlike the constant it replaces)
+        # since it needs a real ET "today," which needs market_tz just set above.
+        self.live_account_start = _get_or_init_account_genesis(
+            datetime.now(self.market_tz).strftime("%Y-%m-%d"))
 
         self.explicit_scan_times: list[dtime] = []
         for t_str in research_cfg.get("scan_times", []):
@@ -1726,14 +1763,14 @@ class DashboardState:
             "total_pnl": round(p.total_pnl, 2),
             "total_pnl_pct": round(p.total_pnl_pct, 2),
             "total_annualized_pct": _annualized_pct(
-                p.total_pnl_pct, self._days_since(_LIVE_ACCOUNT_START)),
-            "total_annualized_days": self._days_since(_LIVE_ACCOUNT_START),
+                p.total_pnl_pct, self._days_since(self.live_account_start)),
+            "total_annualized_days": self._days_since(self.live_account_start),
             "ytd_pnl": ytd_pnl,
             "ytd_pnl_pct": ytd_pnl_pct,
             "ytd_annualized_pct": _annualized_pct(ytd_pnl_pct, self._days_since(
-                max(_LIVE_ACCOUNT_START, f"{self._now_et().year}-01-01"))),
+                max(self.live_account_start, f"{self._now_et().year}-01-01"))),
             "ytd_annualized_days": self._days_since(
-                max(_LIVE_ACCOUNT_START, f"{self._now_et().year}-01-01")),
+                max(self.live_account_start, f"{self._now_et().year}-01-01")),
             # No annualized figure for week_pnl (2026-07-27) -- a 7-day window extrapolated
             # to a full year is even noisier than the existing "low confidence" Total/YTD
             # annualized figures, so this follows Day P/L's precedent (also no annualized)
@@ -1807,7 +1844,7 @@ class DashboardState:
         final tranches must count as ONE trade, not three).
 
         Floors the effective cutoff to _TRADE_ID_RELIABLE_SINCE (2026-07-30 fix) --
-        callers may legitimately ask for an earlier date (_LIVE_ACCOUNT_START,
+        callers may legitimately ask for an earlier date (self.live_account_start,
         _CURRENT_ARCHITECTURE_START), but trade_id itself didn't exist before
         2026-07-27, so honoring an earlier request as-is would include known
         NULL-trade_id rows that _group_closed_trades can only count individually,
@@ -1833,7 +1870,7 @@ class DashboardState:
         isn't a fair read on how the current logic performs. All-time is kept alongside
         it for the tile's popup detail view."""
         current_arch_trades = await self._closed_trades_since(_CURRENT_ARCHITECTURE_START)
-        all_time_trades = await self._closed_trades_since(_LIVE_ACCOUNT_START)
+        all_time_trades = await self._closed_trades_since(self.live_account_start)
         closed_current_arch = len(current_arch_trades)
         wins_current_arch = sum(1 for t in current_arch_trades if t["is_win"])
         closed_all_time = len(all_time_trades)
@@ -1868,7 +1905,7 @@ class DashboardState:
         first calendar-year boundary, since at that point initial_capital is no longer a
         correct YTD anchor (it would include prior years' gains too)."""
         year_start = f"{self._now_et().year}-01-01"
-        if _LIVE_ACCOUNT_START >= year_start:
+        if self.live_account_start >= year_start:
             base = self.portfolio.initial_capital
         else:
             candidates = [p for p in self.performance_history if p["date"] >= year_start]
@@ -1950,7 +1987,9 @@ class DashboardState:
         window truncation -- checked live (2026-08-14) whether Alpaca's own portfolio-
         history API could backfill further back than this file's own first entry
         (2026-07-13): it can, down to 2026-07-07, but everything before
-        _LIVE_ACCOUNT_START (2026-07-12, the Sunday before that first Monday) is the
+        self.live_account_start (2026-07-12, the Sunday before that first Monday --
+        now sourced from the self-initializing _get_or_init_account_genesis rather
+        than a hardcoded literal, see that function's docstring) is the
         already-documented pre-migration dev/test window this codebase filters out
         everywhere else -- so this file's own first entry already IS genuine day one,
         nothing to backfill.
@@ -8553,16 +8592,17 @@ async def get_trade_history():
     ESTIMATED rows (see _reconstruct_missing_tp_fills) fill the one gap that's still
     reconstructable: TP fills on currently-held positions that predate today's fix."""
     jsonl_trades = state.trade_logger.get_trade_history(days=None)
-    # _LIVE_ACCOUNT_START filter (2026-07-21 fix) -- the JSONL log still contains ~69
-    # leftover pre-migration dev/test buys (2026-06-25 through 2026-07-10, from the local
-    # machine before the 2026-07-12 Hetzner go-live) that were already identified and
-    # filtered out of /api/portfolio-summary on 2026-07-20 ("$209k Buy-Value" fix) -- missed
-    # applying that same filter here when this endpoint was rewritten today, so the unified
-    # list silently included them again (confirmed live: buy_count of 86 vs the real 17 the
-    # already-fixed portfolio-summary endpoint reports; user caught the mismatch directly).
+    # state.live_account_start filter (2026-07-21 fix) -- the JSONL log still contains
+    # ~69 leftover pre-migration dev/test buys (2026-06-25 through 2026-07-10, from the
+    # local machine before the 2026-07-12 Hetzner go-live) that were already identified
+    # and filtered out of /api/portfolio-summary on 2026-07-20 ("$209k Buy-Value" fix) --
+    # missed applying that same filter here when this endpoint was rewritten today, so
+    # the unified list silently included them again (confirmed live: buy_count of 86 vs
+    # the real 17 the already-fixed portfolio-summary endpoint reports; user caught the
+    # mismatch directly).
     buys = [t for t in jsonl_trades
             if t.get("signal") in ("BUY", "STRONG BUY")
-            and t.get("timestamp", "") >= _LIVE_ACCOUNT_START]
+            and t.get("timestamp", "") >= state.live_account_start]
     for b in buys:
         b["action"] = "BUY"
         b["is_estimated"] = False
@@ -8594,7 +8634,7 @@ async def get_trade_history():
         async with state.portfolio._db.execute(
             "SELECT ticker, action, shares, price, pnl, timestamp, reason, trade_id FROM trade_history "
             "WHERE action = 'SELL' AND timestamp >= ? ORDER BY timestamp",
-            (_LIVE_ACCOUNT_START,),
+            (state.live_account_start,),
         ) as cur:
             rows = await cur.fetchall()
         for ticker, action, shares, price, pnl, timestamp, reason, trade_id in rows:
@@ -8940,12 +8980,13 @@ async def get_portfolio_summary():
     # (e.g. a single $10,000 BUY) that inflated buy_value to ~$209k against a real ~$10k
     # account. Filtered by each trade's own timestamp rather than by filename, since ISO
     # timestamps string-sort correctly and this doesn't depend on any file ever being
-    # cleaned up on disk. _LIVE_ACCOUNT_START (module-level, shared with
-    # /api/portfolio-health's win-rate query below -- same pollution, same fix) is the
-    # real Hetzner go-live date (see CLAUDE.md).
+    # cleaned up on disk. state.live_account_start (shared with /api/portfolio-health's
+    # win-rate query below -- same pollution, same fix) is this install's own real
+    # go-live date, self-initializing since 2026-08-20 -- see
+    # _get_or_init_account_genesis's docstring.
     trades = [
         t for t in state.trade_logger.get_trade_history(days=None)
-        if t.get("timestamp", "") >= _LIVE_ACCOUNT_START
+        if t.get("timestamp", "") >= state.live_account_start
     ]
     buy_count = 0
     buy_value = 0.0
@@ -9032,7 +9073,7 @@ async def get_portfolio_health(force: bool = False):
         wins = sum(1 for t in trades if t["is_win"])
         return (wins / closed * 100) if closed else 0.0, closed
 
-    win_rate_all_time_pct, closed_all_time = await _win_rate_since(_LIVE_ACCOUNT_START)
+    win_rate_all_time_pct, closed_all_time = await _win_rate_since(state.live_account_start)
     win_rate_current_arch_pct, closed_current_arch = await _win_rate_since(_CURRENT_ARCHITECTURE_START)
 
     sector_counts: dict[str, int] = {}
