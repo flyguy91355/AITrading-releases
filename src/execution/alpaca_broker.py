@@ -366,8 +366,24 @@ class AlpacaBroker(Broker):
         scoped window. _infer_real_entry_time passes a larger limit explicitly when it
         needs to look further back than routine close-verification ever does."""
         orders = await self._call_with_rate_limit_retry(
+            # status="all" (fixed 2026-08-20, ALLY incident), was "closed" -- Alpaca's own
+            # docs list exactly 4 terminal states (filled, canceled, expired, replaced);
+            # partially_filled is explicitly documented as an active, interim state, not
+            # one of them. Live-caught: a real ALLY market-sell order took 3+ minutes to
+            # fully fill (15.05 shares in three increments), and every poll that landed
+            # while it was still partially_filled queried status="closed" and got back
+            # NOTHING for that order -- not even as a partially_filled entry -- so the
+            # FillStillSettlingError guard just below (which depends on seeing a
+            # partially_filled order in this list) could never fire. Each of those polls
+            # fell through to the "no real order found" unreconciled fallback instead of
+            # correctly deferring, producing two fabricated-looking $0-P&L rows for a
+            # single order that was simply still executing. status="all" includes
+            # partially_filled orders too; the existing status-in-("filled",
+            # "partially_filled") filter below already discards every other still-open
+            # status (new, accepted, pending_new, ...), so this can't leak an order that
+            # hasn't started filling at all into anything downstream.
             lambda: self.api.list_orders(
-                status="closed", limit=limit, direction="desc",
+                status="all", limit=limit, direction="desc",
                 symbols=symbols if symbols else None,
             )
         )
