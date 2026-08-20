@@ -3245,8 +3245,8 @@ function renderNearMissGrid(data) {
   if (items.length === 0) {
     document.getElementById('stockGrid').innerHTML =
       '<div style="color:var(--text-muted);padding:20px;text-align:center;font-size:12px;">' +
-      'No on-deck candidates right now — good stocks (conviction 7+) rejected only on R/R ' +
-      'appear here, watched for a price recovery + confirmed uptick.</div>';
+      `No on-deck candidates right now — good stocks (conviction ${_MIN_CONVICTION_GATE.toFixed(1)}+) ` +
+      'rejected only on R/R appear here, watched for a price recovery + confirmed uptick.</div>';
     return;
   }
   // Signal badge label/class — same mapping updateTickerSignal() uses for the live-push path,
