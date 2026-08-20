@@ -500,9 +500,15 @@ class OrderManager:
             return None
         price = None
         try:
-            quote = await self.broker.get_quote(ticker)
-            if quote:
-                price = quote.get("price") or quote.get("last") or quote.get("ask")
+            # AlpacaBroker.get_quote() returns a plain float (or None), not a dict --
+            # fixed 2026-08-20, BEN incident. The old quote.get("price") call always
+            # raised (a real float has no .get()), meaning this fallback's own live
+            # quote attempt has never actually worked since it was written -- it
+            # silently fell through to entry_price every single time, making the
+            # logged "at current quote $X" line always just the entry price
+            # relabeled, and guaranteeing pnl computed as exactly $0 no matter what
+            # the position actually did.
+            price = await self.broker.get_quote(ticker)
         except Exception as e:
             logger.warning("%s: live quote lookup for unreconciled fill failed (%s)", ticker, e)
         if not price or price <= 0:

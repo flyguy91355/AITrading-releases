@@ -653,13 +653,23 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">R/R Floor Margin <button type="button" class="info-btn" onclick="showInfo(event,'A lower margin below EACH CANDIDATE\'S OWN real, conviction-scaled R/R gate (not a flat number) -- separate from Min Risk/Reward Ratio above (the real buy requirement itself). Floor = gate + this margin -- use a NEGATIVE number for a floor below gate (e.g. -0.4 excludes anything more than 0.4 below its own gate). A stock whose R/R is deeply below its own gate is unlikely to realistically close that gap and get bought, so it is just as pointless to track. There is no separate ceiling setting (removed 2026-08-05) -- a candidate above its own gate is judged individually by a real AI call (still a good buy, or has the ratio become inflated by continued decline?) instead of a flat margin. Leaving this blank disables the floor entirely (any R/R, however low, still gets tracked as long as conviction qualifies) -- not recommended now that floor-to-gate is the core admission range; a real negative number like the -0.4 default is what actually establishes that range\'s lower edge.')">i</button></div>
+          <div class="setting-label">R/R Floor Margin <button type="button" class="info-btn" onclick="showInfo(event,'A lower margin below EACH CANDIDATE\'S OWN real, conviction-scaled R/R gate (not a flat number) -- separate from Min Risk/Reward Ratio above (the real buy requirement itself). Floor = gate + this margin -- use a NEGATIVE number for a floor below gate (e.g. -0.4 excludes anything more than 0.4 below its own gate). A stock whose R/R is deeply below its own gate is unlikely to realistically close that gap and get bought, so it is just as pointless to track. See R/R Ceiling Margin below for the symmetric tolerance just above the gate. A candidate substantially further above its own gate than that is still judged individually by a real AI call (still a good buy, or has the ratio become inflated by continued decline?), not a flat margin. Leaving this blank disables the floor entirely (any R/R, however low, still gets tracked as long as conviction qualifies) -- not recommended now that floor-to-gate is the core admission range; a real negative number like the -0.4 default is what actually establishes that range\'s lower edge.')">i</button></div>
           <div class="setting-desc">Exclude candidates whose R/R is below their own gate + this margin -- use a negative number for a floor below gate. Above the gate is judged per-candidate by AI, not a margin.</div>
         </div>
         <input type="number" class="setting-input" name="research.on_deck_rr_floor_margin"
                value="{{ cfg.research.on_deck_rr_floor_margin if cfg.research.on_deck_rr_floor_margin is not none else '' }}"
                min="-10" max="10" step="0.1" placeholder="-0.4">
         <div class="default-label">default<br><span class="default-val">-0.4</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">R/R Ceiling Margin <button type="button" class="info-btn" onclick="showInfo(event,'A small tolerance ABOVE each candidate\'s own real, conviction-scaled R/R gate (2026-08-20) -- a first-look candidate found just above its own gate (within this margin) is still mechanically admitted to On Deck/On Shore, instead of hard-rejected outright, so a genuinely good setup is not thrown out purely for landing a few cents over the line. Ceiling = gate + this margin. Deliberately small (default 0.15) -- a candidate substantially further above its own gate is still excluded here (confirmed against real data: only a small fraction of real above-gate rejections were within 0.10 of their own gate; most were 15-120% over, the genuine \'price already fell toward the stop\' pattern this must keep excluding). Only applies to a brand-new candidate\'s first look (the fresh scan, a cache restore, an on-demand refill) -- an already-tracked candidate that rises further above its own gate is still judged individually by a real AI call, not this margin.')">i</button></div>
+          <div class="setting-desc">Still admit a first-look candidate whose R/R is just above its own gate, within this margin, instead of hard-rejecting it</div>
+        </div>
+        <input type="number" class="setting-input" name="research.on_deck_rr_ceiling_margin"
+               value="{{ cfg.research.on_deck_rr_ceiling_margin }}"
+               min="0" max="5" step="0.05" placeholder="0.15">
+        <div class="default-label">default<br><span class="default-val">0.15</span></div>
       </div>
       <div class="setting-row">
         <div>
@@ -1345,6 +1355,7 @@ const DEFAULTS = {
   'research.on_deck_removal_conviction': 3,
   'research.min_risk_reward_ratio': 2.1,
   'research.on_deck_rr_floor_margin': -0.4,
+  'research.on_deck_rr_ceiling_margin': 0.15,
   'research.on_deck_rr_conviction_step': 0.1,
   'research.on_deck_rr_floor': 1.5,
   'research.long_term_trend_years': 5,

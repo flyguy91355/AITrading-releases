@@ -576,6 +576,34 @@ def _on_deck_rr_above_gate(rr: float, required_rr: float) -> bool:
     return rr > required_rr
 
 
+def _on_deck_rr_ceiling_exceeded(rr: float, required_rr: float, ceiling_margin: float) -> bool:
+    """True if rr exceeds required_rr by more than ceiling_margin -- a small tolerance
+    band a first-look candidate (no track record) is mechanically admitted within,
+    just above its own real gate, before the harder mechanical exclude kicks in
+    (2026-08-20, owner request/design). Reintroduces the SHAPE of the flat
+    ceiling-margin design removed 2026-08-05 (that one was found broken -- KEY evicted
+    for landing exactly on its own gate, EQR/ALLY/SBRA evicted despite their real gates
+    being far higher, since it compared against one ABSOLUTE flat number rather than
+    each candidate's own conviction-scaled gate) but brought back as a per-candidate
+    RELATIVE margin (matching how the floor margin below already works) and
+    deliberately much smaller in magnitude (owner-set default 0.15, was 0.3) --
+    scoped narrowly to catch genuine "basically at the gate" noise, confirmed against a
+    real day's rejections before this was built: only 2 of 20 above-gate first-look
+    rejections that day were within 0.10 of their own gate; the rest were 15-120% over
+    -- the genuine "price already fell toward the stop, mechanically inflating the
+    ratio" pattern this design must keep excluding regardless of the new tolerance.
+
+    Used ONLY at the 3 mechanical-exclude admission sites _on_deck_rr_above_gate's own
+    docstring names (the fresh universe-scan result, the startup cache restore, the
+    on-demand Settings-triggered refill) -- replaces a bare _on_deck_rr_above_gate
+    check as the reject condition at exactly those 3 sites. The AI-judgment sites
+    (persist-check retention, On-Shore backfill, the buy trigger, the continuous
+    above-gate recheck) are deliberately untouched -- those already ask a real,
+    per-candidate judgment call instead of applying a blunt numeric line, so a small
+    tolerance band adds nothing there."""
+    return rr > required_rr + ceiling_margin
+
+
 def _on_deck_composite_score(
     conviction: float, margin_of_safety_pct: float, rr: float, required_rr: float,
 ) -> float:
@@ -1224,7 +1252,25 @@ class DashboardState:
         self.cycle_count: int = 0
         self.scan_index: int = 0       # which stock in the 50 we're on
         self.next_cycle_at: str = ""
-        self.paused: bool = False
+        # Pause/Stop (2026-08-20, owner request) -- two independent severity levels,
+        # both persisted to disk together (an in-memory-only pause silently un-pauses
+        # on every restart/Apply Update with no warning -- a real gap this fix closes):
+        #   paused=True  -- stops every AI-spend loop (position_monitor_loop,
+        #                    position_deep_dive_loop, auto_scan_loop, watchlist_rr_loop,
+        #                    near_miss_monitor_loop, the pre-open/midday batch paths).
+        #                    Zero Claude calls. position_update_loop keeps running --
+        #                    held positions stay fully protected (stop-loss/
+        #                    trailing-stop/protection-gap checks/exit-order sync).
+        #   stopped=True -- everything above PLUS position_update_loop itself stops.
+        #                    No broker-side management of any kind. Deliberately does
+        #                    NOT kill the process -- keeps the dashboard reachable so a
+        #                    Start System click brings everything back with no
+        #                    SSH/support needed (same reasoning as AICryptoTrading's
+        #                    identical feature, built the same day).
+        self._run_state_path = "data/run_state.json"
+        self.paused: bool
+        self.stopped: bool
+        self.paused, self.stopped = self._load_run_state()
         # Concurrent On Deck promotion cash-reserve guard (fixed 2026-08-02, GitHub #44)
         # -- near_miss_monitor_loop can fire multiple _attempt_near_miss_promotion tasks
         # in the same tick with no shared lock, so each independently checked
@@ -1523,6 +1569,31 @@ class DashboardState:
         self._log_db_path = db_path
         self._init_log_db()
         self.ai_log = self._load_log_from_db()
+
+    def _load_run_state(self) -> tuple[bool, bool]:
+        try:
+            data = json.loads(Path(self._run_state_path).read_text(encoding="utf-8"))
+            return bool(data.get("paused", False)), bool(data.get("stopped", False))
+        except Exception:
+            return False, False
+
+    def _save_run_state(self):
+        try:
+            Path(self._run_state_path).write_text(
+                json.dumps({"paused": self.paused, "stopped": self.stopped}), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.warning("Could not save run state: %s", e)
+
+    def run_status(self) -> str:
+        """Single source of truth for the 3-way UI state -- 'stopped' takes priority
+        over 'paused' since it's the stronger condition (see the paused/stopped
+        __init__ comment for exactly what each level gates)."""
+        if self.stopped:
+            return "stopped"
+        if self.paused:
+            return "paused"
+        return "running"
 
     def _init_log_db(self):
         import sqlite3 as _sqlite3
@@ -1931,7 +2002,7 @@ class DashboardState:
             "index": self.scan_index,
             "total": self.watchlist_manager.size(),
             "next_cycle": self.next_cycle_at,
-            "paused": self.paused,
+            "run_status": self.run_status(),
         }
 
     def _rank_position(self, ticker: str) -> float:
@@ -2634,7 +2705,7 @@ class DashboardState:
         while True:
             interval = self.position_monitor_interval * 60
             await asyncio.sleep(interval)
-            if self.paused or not self._is_market_open():
+            if self.paused or self.stopped or not self._is_market_open():
                 continue
             if not self.portfolio.positions:
                 continue
@@ -2694,7 +2765,7 @@ class DashboardState:
         while True:
             interval_hours = self.config["research"].get("position_deep_dive_interval_hours", 3)
             await asyncio.sleep(max(1, interval_hours) * 3600)
-            if self.paused or not self._is_market_open():
+            if self.paused or self.stopped or not self._is_market_open():
                 continue
             if not self.config["research"].get("position_deep_dive_enabled", True):
                 continue
@@ -3203,7 +3274,7 @@ class DashboardState:
         while True:
             await self._update_holiday_flag()
 
-            if self.paused:
+            if self.paused or self.stopped:
                 await asyncio.sleep(5)
                 continue
 
@@ -4323,6 +4394,7 @@ class DashboardState:
         min_conviction = self.config["research"]["min_conviction_score"]
         base_rr = self.config["research"]["min_risk_reward_ratio"]
         floor_margin = self.config["research"].get("on_deck_rr_floor_margin")
+        ceiling_margin = self.config["research"].get("on_deck_rr_ceiling_margin", 0.15)
         rr_step = self.config["research"].get("on_deck_rr_conviction_step", 0.1)
         rr_floor = self.config["research"].get("on_deck_rr_floor", 1.5)
         # Same population floor as the live Phase 2 fill (_run_pre_open_batch) — a candidate
@@ -4357,12 +4429,15 @@ class DashboardState:
             required_rr = _required_rr(conviction, min_conviction, base_rr, rr_step, rr_floor)
             if _on_deck_rr_floor_not_met(rr, required_rr, floor_margin):
                 continue
-            if _on_deck_rr_above_gate(rr, required_rr):
-                # Above its own gate on a first look -- mechanical exclude, no AI call
-                # (2026-08-05, owner design). The AI-judgment exception is reserved for
-                # a candidate that was actually watched rising past its own gate while
-                # tracked (the On-Shore backfill path specifically) -- this restore path
-                # has no such track record for any given ticker, so it gets no exception.
+            if _on_deck_rr_ceiling_exceeded(rr, required_rr, ceiling_margin):
+                # Above its own gate by more than the small tolerance margin -- mechanical
+                # exclude, no AI call (2026-08-05, owner design; ceiling margin added
+                # 2026-08-20). The AI-judgment exception is reserved for a candidate that
+                # was actually watched rising past its own gate while tracked (the
+                # On-Shore backfill path specifically) -- this restore path has no such
+                # track record for any given ticker, so it gets no exception. A candidate
+                # only just above its own gate (within ceiling_margin) is still admitted
+                # here -- see _on_deck_rr_ceiling_exceeded's docstring for why.
                 continue
             entry = {
                 "ticker": ticker,
@@ -4423,7 +4498,7 @@ class DashboardState:
         while True:
             await asyncio.sleep(60)
             try:
-                if self.paused or not self._is_market_open():
+                if self.paused or self.stopped or not self._is_market_open():
                     continue
                 tickers = [s["ticker"] for s in self.watchlist_manager.get_active()]
                 if not tickers:
@@ -4543,7 +4618,7 @@ class DashboardState:
                 # in this loop runs outside market hours.
                 await self._refresh_win_rate_cache()
 
-                if self.paused or not self._is_market_open():
+                if self.paused or self.stopped or not self._is_market_open():
                     continue
 
                 # Free price-based On Deck re-eligibility check (2026-07-29) -- runs before
@@ -5795,13 +5870,14 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         Submits the first chunk via research_engine.submit_analysis_batch(). While a
         chunk is in flight, if it has been running longer than
         max(3 minutes, 2x the fastest chunk completed so far this run) and neither
-        self.paused nor the caller's `should_stop()` says to stop, pulls and submits the
-        next chunk from `chunk_source` concurrently (capped at 2 chunks in flight at
-        once) rather than waiting further — a slow batch doesn't stall the whole scan,
-        but a normal-speed run stays sequential with no wasted concurrent spend. Calls
-        `on_result(ticker, report)` (async) for every ticker as soon as its batch's
-        results are ready, in whatever order batches complete. New chunks stop being
-        pulled once `should_stop()` returns True or self.paused is set, but any already
+        self.paused, self.stopped, nor the caller's `should_stop()` says to stop, pulls
+        and submits the next chunk from `chunk_source` concurrently (capped at 2 chunks
+        in flight at once) rather than waiting further — a slow batch doesn't stall the
+        whole scan, but a normal-speed run stays sequential with no wasted concurrent
+        spend. Calls `on_result(ticker, report)` (async) for every ticker as soon as its
+        batch's results are ready, in whatever order batches complete. New chunks stop
+        being pulled once `should_stop()` returns True or self.paused/self.stopped is
+        set (2026-08-20), but any already
         in-flight batch is always allowed to finish and its results are always
         processed — already-submitted batch work is already paid for and is never
         discarded outright (the caller's own on_result can still choose not to act on a
@@ -5947,7 +6023,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             return elapsed
 
         async def _try_submit_next() -> bool:
-            if self.paused or should_stop():
+            if self.paused or self.stopped or should_stop():
                 return False
             chunk = await _next_chunk()
             if not chunk:
@@ -6475,6 +6551,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         rr_step = self.config["research"].get("on_deck_rr_conviction_step", 0.1)
         rr_floor = self.config["research"].get("on_deck_rr_floor", 1.5)
         floor_margin = self.config["research"].get("on_deck_rr_floor_margin")
+        ceiling_margin = self.config["research"].get("on_deck_rr_ceiling_margin", 0.15)
 
         def _required_rr_for(r: dict) -> float:
             return _required_rr(r.get("conviction_score", 0), min_conviction, base_rr, rr_step, rr_floor)
@@ -6492,13 +6569,14 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             stop_pct = _derive_stop_pct(raw.get("entry_price", 0.0), stop_loss, default_stop_pct)
             required_rr = _required_rr_for(r)
             rr_val = r.get("rr", 0.0)
-            if _on_deck_rr_above_gate(rr_val, required_rr):
-                # Above its own gate -- mechanical exclude, no AI call (2026-08-05,
-                # owner design). This rare, on-demand refill deliberately reuses
-                # today's frozen cached data without a fresh Claude call (see this
-                # function's own docstring) -- the AI-judgment exception is reserved
-                # for the continuous On-Shore backfill path specifically, which is
-                # the one actually watching a candidate's R/R move over time.
+            if _on_deck_rr_ceiling_exceeded(rr_val, required_rr, ceiling_margin):
+                # Above its own gate by more than the small tolerance margin -- mechanical
+                # exclude, no AI call (2026-08-05, owner design; ceiling margin added
+                # 2026-08-20). This rare, on-demand refill deliberately reuses today's
+                # frozen cached data without a fresh Claude call (see this function's own
+                # docstring) -- the AI-judgment exception is reserved for the continuous
+                # On-Shore backfill path specifically, which is the one actually watching
+                # a candidate's R/R move over time.
                 continue
             entry = {
                 "ticker": ticker,
@@ -6753,11 +6831,11 @@ Respond with ONLY the summary text, no preamble, no markdown."""
 
         async def _persist_chunks():
             for i in range(0, len(to_persist_check), 100):
-                if self.paused:
+                if self.paused or self.stopped:
                     return
                 yield to_persist_check[i:i + 100]
 
-        if to_persist_check and not self.paused:
+        if to_persist_check and not (self.paused or self.stopped):
             await _log("SYSTEM",
                 f"Persist-check — re-analyzing {len(to_persist_check)} existing On Deck "
                 "candidate(s)")
@@ -6847,15 +6925,20 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             await self.broadcast({"type": "ai_log", "entry": entry})
             return False
 
-        if _on_deck_rr_above_gate(rr_val, required_rr):
-            # Above its own gate on a first look -- mechanical exclude, no AI call
-            # (2026-08-05, owner design). Shared by both the pre-open batch and the
-            # mid-day rescan; a candidate found here has zero track record of being
-            # watched rise past its own gate, unlike the On-Shore backfill path,
-            # which is where the AI-judgment exception is reserved for instead.
+        ceiling_margin = self.config["research"].get("on_deck_rr_ceiling_margin", 0.15)
+        if _on_deck_rr_ceiling_exceeded(rr_val, required_rr, ceiling_margin):
+            # Above its own gate by more than the small tolerance margin -- mechanical
+            # exclude, no AI call (2026-08-05, owner design; ceiling margin added
+            # 2026-08-20). Shared by both the pre-open batch and the mid-day rescan; a
+            # candidate found here has zero track record of being watched rise past its
+            # own gate, unlike the On-Shore backfill path, which is where the
+            # AI-judgment exception is reserved for instead. A candidate only just above
+            # its own gate (within ceiling_margin) is still admitted here -- see
+            # _on_deck_rr_ceiling_exceeded's docstring for why.
             entry = self.add_ai_log(ticker, phase_tag,
-                f"Not added — R/R {rr_val:.2f} above its own gate ({required_rr:.2f}) "
-                "on first look", "neutral")
+                f"Not added — R/R {rr_val:.2f} above ceiling ({required_rr + ceiling_margin:.2f}, "
+                f"its own gate {required_rr:.2f} + {ceiling_margin:.2f} margin) on first look",
+                "neutral")
             await self.broadcast({"type": "ai_log", "entry": entry})
             return False
 
@@ -7312,6 +7395,7 @@ async def save_settings(payload: dict):
         "research.on_deck_removal_conviction": float,
         "research.min_risk_reward_ratio": float,
         "research.on_deck_rr_floor_margin": lambda v: (float(v) if v not in ("", None) else None),
+        "research.on_deck_rr_ceiling_margin": float,
         "research.on_deck_rr_conviction_step": float,
         "research.on_deck_rr_floor": float,
         "research.watchlist_size": int,
