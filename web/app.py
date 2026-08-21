@@ -86,7 +86,7 @@ from src.utils.watchlist_manager import WatchlistManager
 from src.data.stock_universe import get_universe
 from src.analytics.composition_benchmark import weighted_daily_return
 from src.update.version import read_local_version, write_local_version, is_newer
-from src.update.release_client import fetch_latest_release
+from src.update.release_client import fetch_latest_release, fetch_recent_releases
 from src.update.apply import extract_release_archive, copy_updatable_files, requirements_changed
 
 logging.basicConfig(
@@ -7856,6 +7856,47 @@ async def get_update_status():
         "notes": release["notes"],
         "severity": release["severity"],
         "market_open": market_open,
+    }
+
+
+_ABOUT_NAME = "Hilton's AITrading"
+_ABOUT_DESCRIPTION = (
+    "AI-powered research and autonomous trading for long-only U.S. equities. "
+    "Claude continuously screens the S&P 500/400/600 universe, tracks qualifying "
+    "setups on an On Deck watchlist, and buys automatically once conviction, "
+    "risk/reward, and a confirmed technical trigger all align — with a graduated "
+    "trailing stop protecting every position from entry to exit."
+)
+
+
+@app.get("/api/about")
+async def get_about():
+    """Backs the About panel (2026-08-20, owner request — "i see no update
+    buttons" led to "maybe i need an about button... so i know what version
+    we are running"). Deliberately reuses fetch_recent_releases against the
+    same releases_repo Apply Update already reads from, rather than
+    authoring/maintaining a separate changelog — the real release notes
+    already exist the moment a release is cut. No caching (unlike
+    /api/update-status above): this is a manual, user-initiated, low-
+    frequency action, not something polled every 60s from an open tab, so
+    the request-volume concern that caching exists for there doesn't apply
+    here. Degrades to an empty release list (never raises) if the releases
+    repo is unreachable, same fail-open philosophy as the update-status
+    endpoint — a GitHub hiccup should never break this panel from at least
+    showing the current version."""
+    current = read_local_version(_VERSION_FILE_PATH) or "v0.0.0"
+    repo = state.config.get("update", {}).get("releases_repo", "")
+    releases: list[dict] = []
+    if repo:
+        try:
+            releases = fetch_recent_releases(repo, limit=15)
+        except Exception:
+            pass
+    return {
+        "name": _ABOUT_NAME,
+        "description": _ABOUT_DESCRIPTION,
+        "current_version": current,
+        "releases": releases,
     }
 
 

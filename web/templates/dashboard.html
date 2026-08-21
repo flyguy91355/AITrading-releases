@@ -727,6 +727,10 @@ tbody tr:hover { background: var(--bg-card-hover); }
     <span class="mode-badge broker-badge" id="brokerBadge">NO BROKER</span>
   </div>
   <div class="header-right">
+    <div id="aboutButton"
+         style="display:flex;align-items:center;justify-content:center;width:22px;height:22px;border:1px solid var(--border);border-radius:50%;font-size:13px;font-weight:600;cursor:pointer;color:var(--text-muted);"
+         onclick="openAboutPanel()"
+         title="About this program">i</div>
     <div id="updateAvailableBadge"
          style="display:none;align-items:center;gap:6px;padding:4px 10px;border:1px solid;border-radius:12px;font-size:12px;cursor:pointer;"
          onclick="openUpdatePanel()"
@@ -3117,6 +3121,60 @@ function renderUpdateBadge() {
   badge.style.borderColor = severityColor;
   badge.innerHTML =
     `<span style="color:${severityColor};">&#9679;</span> Update available: ${_updateStatus.latest}`;
+}
+
+// About panel (2026-08-20, owner request — "i see no update buttons" led to
+// "maybe i need an about button... so i know what version we are running").
+// Fetched fresh on every open (no fetch-once-on-load caching, unlike
+// fetchUpdateStatus above) -- this is a manual, low-frequency click, not
+// something that needs to stay live on an already-open tab, so there's no
+// reason to risk showing a stale version if the page has been open a while.
+async function openAboutPanel() {
+  document.getElementById('ddModalTicker').textContent = 'About';
+  document.getElementById('ddModalBizSummary').textContent = '';
+  document.querySelector('#deepDiveModal .trade-modal').style.width = '640px';
+  document.getElementById('ddModalBody').innerHTML =
+    '<div style="padding:12px;color:var(--text-muted);">Loading…</div>';
+  document.getElementById('deepDiveModal').classList.add('active');
+
+  let data;
+  try {
+    const resp = await fetch('/api/about');
+    data = await resp.json();
+  } catch (e) {
+    document.getElementById('ddModalBody').innerHTML =
+      '<div style="padding:12px;color:var(--text-muted);">Could not load — check your connection and try again.</div>';
+    return;
+  }
+
+  const releaseRows = (data.releases || []).map(r => {
+    const color = r.severity === 'critical' ? 'var(--red)' : 'var(--cyan)';
+    const date = r.published_at ? new Date(r.published_at).toLocaleDateString() : '';
+    return `
+      <div style="padding:10px 0;border-bottom:1px solid var(--border);">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+          <b style="font-size:13px;">${r.tag_name}</b>
+          <span style="color:${color};font-size:11px;text-transform:uppercase;letter-spacing:.03em;">&#9679; ${r.severity}</span>
+          <span style="color:var(--text-muted);font-size:11px;margin-left:auto;">${date}</span>
+        </div>
+        <div style="color:var(--text-muted);font-size:12.5px;white-space:pre-wrap;">${r.notes}</div>
+      </div>`;
+  }).join('');
+
+  const historyHtml = releaseRows
+    ? `<div style="margin-top:18px;">
+         <div style="font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);margin-bottom:6px;">Version History</div>
+         ${releaseRows}
+       </div>`
+    : '';
+
+  document.getElementById('ddModalBody').innerHTML = `
+    <div style="padding:12px;">
+      <p style="margin:0 0 10px 0;font-size:14px;color:var(--text-muted);">${data.description}</p>
+      <p style="margin:0;">Running: <b>${data.current_version}</b></p>
+      ${historyHtml}
+    </div>
+  `;
 }
 
 function openUpdatePanel() {
