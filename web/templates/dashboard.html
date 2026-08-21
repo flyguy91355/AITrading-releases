@@ -2413,21 +2413,29 @@ function renderPositions(positions) {
     // ID + Targets columns (2026-07-27, user request) -- ID is Position.trade_id shown
     // shortened (full uuid in the hover title) since the table has no room for the whole
     // thing; "—" for a position that predates the field. Targets shows all three T1/T2/T3
-    // prices regardless of fire status (T1/T2 from the fixed t1_target_price/
-    // t2_target_price fields, T3 as the last element of whatever's still in
-    // take_profit_targets -- see the T2+/T3 badge comment above for why "last element" is
-    // the reliable way to find T3 as the array shrinks), struck through once fired so the
-    // column reads as a history, not just "what's left".
+    // prices, struck through once fired so the column reads as a history, not just
+    // "what's left".
+    // A NOT-yet-fired target now reads from the live take_profit_targets array, not the
+    // frozen t1_target_price/t2_target_price fields (fixed 2026-08-21, DVN/OXY incident
+    // -- see CLAUDE_HISTORY.md) -- those two fields are captured once at buy time and
+    // deliberately never updated afterward (they anchor the graduated trailing-stop
+    // curve), but ai_chosen_stop_tp_enabled can revise the REAL live target well past
+    // them on a later re-analysis, which made an already-passed frozen price look like a
+    // still-pending target that should have fired but somehow hadn't. An ALREADY-fired
+    // target has no live record left (it's gone from take_profit_targets the moment it
+    // fires), so it still falls back to the frozen field as the best available history.
     const idStr = p.trade_id
       ? `<span style="font-family:monospace;font-size:10px;color:var(--text-muted);" title="${p.trade_id}">${p.trade_id.slice(0, 8)}</span>`
       : '<span style="color:var(--text-muted);">—</span>';
     const remainingTargets = p.take_profit_targets || [];
     const t3Price = remainingTargets.length ? remainingTargets[remainingTargets.length - 1] : null;
+    const liveT1 = targetsFilled === 0 ? remainingTargets[0] : null;
+    const liveT2 = targetsFilled === 0 ? remainingTargets[1] : targetsFilled === 1 ? remainingTargets[0] : null;
     const targetSpan = (label, val, fired) => val == null ? '' :
       `<span style="${fired ? 'text-decoration:line-through;color:var(--text-muted);' : ''}">${label} $${val.toFixed(2)}</span>`;
     const targetsCell = [
-      targetSpan('T1', p.t1_target_price, targetsFilled >= 1),
-      targetSpan('T2', p.t2_target_price, targetsFilled >= 2),
+      targetSpan('T1', targetsFilled >= 1 ? p.t1_target_price : liveT1, targetsFilled >= 1),
+      targetSpan('T2', targetsFilled >= 2 ? p.t2_target_price : liveT2, targetsFilled >= 2),
       targetSpan('T3', t3Price, false),
     ].filter(Boolean).join(' ') || '—';
     return `<tr onclick="showPositionDetail('${p.ticker}')">
