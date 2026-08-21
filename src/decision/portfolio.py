@@ -115,6 +115,34 @@ def _format_sell_analysis_summary(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_analysis_history_summary(ticker: str, rows: list[tuple]) -> str:
+    """Formats every past real analysis for this ticker into a compact, chronological
+    summary for _build_analysis_history_section (2026-08-21, "Analysis History"
+    feed-forward feature -- owner request, see that function's own docstring in
+    src/research/engine.py). Each row is (generated_at, conviction_score, signal,
+    entry_price, fair_value_estimate, watch_condition), the exact column order of
+    "SELECT generated_at, conviction_score, signal, entry_price, fair_value_estimate,
+    watch_condition FROM analysis_history WHERE ticker = ? ORDER BY generated_at".
+    Deliberately includes ALL history the caller passes in (per owner direction: "make
+    sure to prompt ai to use those previous (I think all) analysys"), not a capped
+    recent window -- each line is kept compact specifically so a long history still
+    stays a reasonable prompt size. Returns an empty string for a ticker with no
+    history at all -- callers must treat that as "omit this section entirely"."""
+    if not rows:
+        return ""
+    lines = [f"Prior analysis history on {ticker} (chronological):"]
+    for generated_at, conviction_score, signal, entry_price, fair_value_estimate, watch_condition in rows:
+        date = generated_at.split("T")[0] if generated_at else "unknown date"
+        line = f"- {date}: {signal}, conviction {conviction_score:.1f}/10"
+        if entry_price:
+            line += f", entry ${entry_price:.2f}"
+        if fair_value_estimate:
+            line += f", fair value ${fair_value_estimate:.2f}"
+        line += f" — watch: {watch_condition}" if watch_condition else " — no watch condition stated"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 @dataclass
 class Position:
     ticker: str
@@ -485,6 +513,30 @@ class Portfolio:
                 followup_due_date TEXT,
                 followup_reasoning TEXT,
                 followup_generated_at TEXT
+            )
+        """)
+        await self._db.commit()
+
+        # "Analysis History" feed-forward (2026-08-21, owner request: "I see the same
+        # stocks analyzed all the time.. same ones come up.. surely the most current
+        # analysis should take all of the other analysis into account for a broder
+        # picture") -- one row per real (non-fallback) analysis of a ticker, appended
+        # (never overwritten, unlike the research_reports/reports_cache.json "latest
+        # only" cache) so a recurring candidate's whole arc -- including any
+        # previously-stated watch_condition -- survives being scanned again and again,
+        # instead of the AI starting cold each time. See ResearchEngine.
+        # explain_buy_decision's sibling docstring / docs/CLAUDE_HISTORY.md's
+        # 2026-08-21 "Analysis History" entry for the full design.
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS analysis_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT,
+                generated_at TEXT,
+                conviction_score REAL,
+                signal TEXT,
+                entry_price REAL,
+                fair_value_estimate REAL,
+                watch_condition TEXT
             )
         """)
         await self._db.commit()
@@ -899,3 +951,48 @@ class Portfolio:
         ) as cur:
             rows = await cur.fetchall()
         return [dict(zip(self._SELL_ANALYSIS_COLUMNS, row)) for row in rows]
+
+    async def save_analysis_history(
+        self, ticker: str, generated_at: str, conviction_score: float, signal: str,
+        entry_price: float | None, fair_value_estimate: float | None, watch_condition: str,
+    ) -> None:
+        """Appends one row per real analysis (2026-08-21, "Analysis History"
+        feed-forward feature) -- called by DashboardState._persist_report (web/app.py)
+        for every non-fallback report, fire-and-forget via asyncio.create_task since
+        this must never delay or block the real analysis flow it's recording. Never
+        overwrites (unlike research_reports/reports_cache.json, which only ever keeps
+        the LATEST report per ticker) -- the whole point is preserving the arc across
+        repeated analyses of the same recurring candidate."""
+        if not self._db:
+            return
+        await self._db.execute(
+            "INSERT INTO analysis_history "
+            "(ticker, generated_at, conviction_score, signal, entry_price, "
+            "fair_value_estimate, watch_condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ticker, generated_at, conviction_score, signal, entry_price,
+             fair_value_estimate, watch_condition),
+        )
+        await self._db.commit()
+
+    async def get_analysis_history_summary(self, ticker: str) -> str:
+        """Every past real analysis for this ticker, formatted as prompt context for
+        the NEXT analysis of the same ticker (2026-08-21) -- see
+        _format_analysis_history_summary's own docstring for the full design and why
+        this deliberately includes ALL history, not a capped window. Fails open
+        (returns "") on any DB error or if the DB hasn't been initialized yet, same as
+        every other nice-to-have query in this file -- this must never delay or break a
+        real buy decision."""
+        if not self._db:
+            return ""
+        try:
+            async with self._db.execute(
+                "SELECT generated_at, conviction_score, signal, entry_price, "
+                "fair_value_estimate, watch_condition FROM analysis_history "
+                "WHERE ticker = ? ORDER BY generated_at",
+                (ticker,),
+            ) as cur:
+                rows = await cur.fetchall()
+        except Exception as e:
+            logger.warning("get_analysis_history_summary failed for %s: %s", ticker, e)
+            return ""
+        return _format_analysis_history_summary(ticker, rows)

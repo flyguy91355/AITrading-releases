@@ -5496,8 +5496,10 @@ class DashboardState:
 
             try:
                 trade_history_summary = await self.portfolio.get_trade_history_summary(ticker)
+                analysis_history_summary = await self.portfolio.get_analysis_history_summary(ticker)
                 report = await self.research_engine.analyze_stock(
-                    ticker, trade_history_summary, self.on_deck_notes.get(ticker, ""))
+                    ticker, trade_history_summary, self.on_deck_notes.get(ticker, ""),
+                    analysis_history_summary=analysis_history_summary)
             except Exception as e:
                 entry = self.add_ai_log(ticker, "ON_DECK", f"Re-analysis failed: {e}", "error")
                 await self.broadcast({"type": "ai_log", "entry": entry})
@@ -6028,7 +6030,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         except Exception as e:
             logger.error("Daily report generation failed: %s", e)
 
-    async def _run_batched_chunk_loop(self, chunk_source, on_result, should_stop=None):
+    async def _run_batched_chunk_loop(
+        self, chunk_source, on_result, should_stop=None,
+        analysis_history_summaries: dict[str, str] | None = None,
+    ):
         """Adaptive Batch-API chunk orchestrator shared by pre-open Phase 1 (watchlist
         re-vet — a static pre-sliced chunk source) and Phase 2 (universe fill — a chunk
         source that lazily runs quick_screen to build each ~100-ticker chunk on demand).
@@ -6055,7 +6060,14 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         live on 2026-07-15 — see CLAUDE.md) can never leave the pre-open scan hung with
         zero results. Confirmed via direct account history that a real batch has never
         taken longer than ~7 minutes even at 977 requests, so this timeout has generous
-        margin above normal variance while still recovering well before market open."""
+        margin above normal variance while still recovering well before market open.
+
+        analysis_history_summaries (2026-08-21, optional, keyed by ticker) is passed
+        straight through to submit_analysis_batch/analyze_stock -- only the persist-check
+        re-vet (a small chunk of RECURRING On Deck candidates) pre-fetches and passes
+        one; the full universe scan doesn't, same cost/relevance-scoped exclusion as
+        trade_history_summary. See _build_analysis_history_section's own docstring in
+        src/research/engine.py for the full design."""
         should_stop = should_stop or (lambda: False)
         chunk_iter = chunk_source.__aiter__()
         exhausted = False
@@ -6078,16 +6090,19 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         in_flight: dict[asyncio.Task, float] = {}
 
         async def _sequential_fallback(chunk: list[str]) -> None:
+            _history = analysis_history_summaries or {}
             for ticker in chunk:
                 try:
-                    report = await self.research_engine.analyze_stock(ticker)
+                    report = await self.research_engine.analyze_stock(
+                        ticker, analysis_history_summary=_history.get(ticker, ""))
                     await on_result(ticker, report)
                 except Exception as e:
                     logger.error("Sequential fallback failed for %s: %s", ticker, e)
                 await asyncio.sleep(1)
 
         async def _run_one_batch(chunk: list[str]) -> float | None:
-            batch_id, inputs_by_ticker = await self.research_engine.submit_analysis_batch(chunk)
+            batch_id, inputs_by_ticker = await self.research_engine.submit_analysis_batch(
+                chunk, analysis_history_summaries=analysis_history_summaries)
             if not batch_id:
                 logger.warning(
                     "Batch submission produced no batch_id for a %d-ticker chunk — "
@@ -6488,8 +6503,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             snapshot that picked it as a candidate in the first place."""
             try:
                 trade_history_summary = await self.portfolio.get_trade_history_summary(ticker)
+                analysis_history_summary = await self.portfolio.get_analysis_history_summary(ticker)
                 report = await self.research_engine.analyze_stock(
-                    ticker, trade_history_summary, self.on_deck_notes.get(ticker, ""))
+                    ticker, trade_history_summary, self.on_deck_notes.get(ticker, ""),
+                    analysis_history_summary=analysis_history_summary)
             except Exception as e:
                 logger.debug("%s: On Deck backfill re-analysis failed: %s", ticker, e)
                 return False
@@ -6823,6 +6840,20 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         self.research_reports[report.ticker] = report_data
         asyncio.create_task(self.broadcast({"type": "report", "report": report_data}))
 
+        # "Analysis History" feed-forward (2026-08-21) -- appends a permanent row
+        # (never overwritten, unlike research_reports above) so the NEXT analysis of
+        # this same ticker can see the whole arc, including any watch_condition this
+        # call stated. Skipped for a fallback report (no real Claude data -- nothing
+        # worth remembering) -- same AI Data Integrity principle as every other real
+        # trading figure in this codebase. Fire-and-forget: this must never delay or
+        # block the report-persistence flow it's recording.
+        if not getattr(report, "is_fallback", False):
+            asyncio.create_task(self.portfolio.save_analysis_history(
+                report.ticker, report.generated_at.isoformat(), report.conviction_score,
+                report.signal.value, report.entry_price, report.fair_value_estimate,
+                getattr(report, "watch_condition", ""),
+            ))
+
     async def _run_on_deck_persist_check(self, phase_tag: str = "PRE-OPEN") -> tuple[int, int]:
         """Re-analyze every current On Deck candidate with a fresh, real Claude call —
         extracted (2026-07-19) from _run_pre_open_batch so the exact same logic can also
@@ -7005,7 +7036,19 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             await _log("SYSTEM",
                 f"Persist-check — re-analyzing {len(to_persist_check)} existing On Deck "
                 "candidate(s)")
-            await self._run_batched_chunk_loop(_persist_chunks(), _persist_on_result)
+            # "Analysis History" feed-forward (2026-08-21) -- pre-fetched here since
+            # to_persist_check is always small (bounded by on_deck_max_size, typically
+            # ~5), unlike the full universe scan this same _run_batched_chunk_loop
+            # orchestrator also drives elsewhere (which never pre-fetches this). These
+            # are exactly the RECURRING candidates the owner's request was about ("I
+            # see the same stocks analyzed all the time").
+            analysis_history_summaries = {
+                t: await self.portfolio.get_analysis_history_summary(t)
+                for t in to_persist_check
+            }
+            await self._run_batched_chunk_loop(
+                _persist_chunks(), _persist_on_result,
+                analysis_history_summaries=analysis_history_summaries)
             _already_gone_str = (f", {already_gone} already gone (bought/evicted "
                                   "concurrently)" if already_gone else "")
             await _log("SYSTEM",
