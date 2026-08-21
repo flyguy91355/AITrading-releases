@@ -20,6 +20,7 @@ from src.research.fundamental import FundamentalAnalyzer
 from src.research.sentiment import SentimentAnalyzer
 from src.research.insider_analysis import InsiderAnalyzer
 from src.research.competitor import CompetitorAnalyzer
+from src.decision.risk_tier import build_risk_tier_prompt_section
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +341,7 @@ IMPORTANT RULES:
 - Every numeric field you output (entry_price, stop_loss, take_profit_targets) must be used consistently everywhere else in your response, including inside reasoning — if you cite risk/reward math or a specific target price in reasoning, it must match the actual entry_price/stop_loss/take_profit_targets values you output, and "first target" must mean take_profit_targets[0], not a later one.
 - If a LONG-TERM TREND section is present below, weigh it explicitly: judge whether the current setup looks like a genuine fundamental turnaround versus a bounce back toward a level the stock has already failed at before.
 - If a PRIOR ANALYSIS HISTORY section is present below, use it: judge whether any previously-stated watch condition has since been met or invalidated, and let the arc across those past calls inform how you read the current setup — not just today's numbers in isolation.
+- A RISK TIER section states this portfolio's real, current risk posture — weigh it directly when judging conviction and position-sizing guidance, not as a hypothetical.
 
 STOCK: {ticker} — {company_name}
 CURRENT PRICE: ${current_price:.2f}
@@ -358,7 +360,7 @@ CURRENT PRICE: ${current_price:.2f}
 
 ── TECHNICAL CONTEXT ──
 {technical_summary}
-{market_context_section}{long_term_trend_section}{analysis_history_section}{trade_history_section}{user_note_section}
+{market_context_section}{risk_tier_section}{long_term_trend_section}{analysis_history_section}{trade_history_section}{user_note_section}
 Based on all of the above, provide your analysis as JSON with these exact fields:
 {{
     "conviction_score": <1-10, one decimal place, e.g. 7.3>,
@@ -730,6 +732,8 @@ class ResearchEngine:
             return None
         market_change_pct = await self.market_data.get_market_change_pct()
         market_context_section = _build_market_context_section(market_change_pct)
+        risk_tier_section = build_risk_tier_prompt_section(
+            self.config.get("risk_tier", {}).get("value", 50.0))
         cap_tier = _market_cap_tier_label(market_cap) if market_cap else ""
         cap_line = f"\nCompany size: {cap_tier} (~${market_cap/1e9:.1f}B market cap)" if cap_tier else ""
         peak_age_line = (f"Recent peak (before the dip): ${peak:.2f}, {peak_days_ago:.1f} day(s) ago"
@@ -748,7 +752,7 @@ Fair value estimate: ${fair_value_estimate:.2f}
 {peak_age_line}
 {low_age_line}
 Current price (recovering off the low): ${current_price:.2f}
-{market_context_section}
+{market_context_section}{risk_tier_section}
 Use the elapsed time above as real information, not decoration: a low from many days or
 weeks ago that the stock simply hasn't revisited since (because it's been trending steadily
 in one direction the whole time) is NOT a current dip-and-recovery worth acting on, even
@@ -1279,6 +1283,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         a bare engine with no "research" key at all)."""
         tp_cfg = self.config.get("take_profit", {})
         research_cfg = self.config.get("research", {})
+        risk_tier_value = self.config.get("risk_tier", {}).get("value", 50.0)
         # Follows the live min_conviction_score setting (2026-08-03, owner request) rather
         # than a hardcoded "7/10" -- previously this prompt instruction never moved even
         # when the owner lowered the real gate, so Claude kept reserving BUY/STRONG BUY for
@@ -1337,6 +1342,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             long_term_trend_section=_build_long_term_trend_section(long_term_trend_summary),
             user_note_section=_build_user_note_section(user_note_summary),
             market_context_section=_build_market_context_section(market_change_pct),
+            risk_tier_section=build_risk_tier_prompt_section(risk_tier_value),
             analysis_history_section=_build_analysis_history_section(analysis_history_summary),
             stop_tp_instructions=stop_tp_instructions,
         )

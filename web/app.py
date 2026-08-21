@@ -79,6 +79,12 @@ async def _quick_screen_with_timeout(ticker: str) -> tuple[bool, str] | None:
 from src.decision.signal_generator import SignalGenerator
 from src.decision.risk_manager import RiskManager
 from src.decision.portfolio import Portfolio
+from src.decision.risk_tier import (
+    apply_risk_tier_to_settings,
+    compute_risk_tier_settings,
+    risk_tier_label,
+    RISK_TIER_DOTKEYS,
+)
 from src.execution.order_manager import OrderManager
 from src.execution.broker import OrderStatus
 from src.reporting.trade_logger import TradeLogger
@@ -7586,6 +7592,7 @@ async def save_settings(payload: dict):
         "take_profit.dollar_target_trail_pct": float,
         "portfolio.max_positions": int,
         "portfolio.initial_capital": float,
+        "risk_tier.value": float,
         "risk_management.max_position_pct": float,
         "risk_management.starting_position_pct": float,
         "risk_management.min_cash_reserve_pct": float,
@@ -7677,6 +7684,19 @@ async def save_settings(payload: dict):
     except ValueError as e:
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail=str(e))
+
+    if "risk_tier.value" in coerced_values:
+        _risk_tier_anchors = state.config.get("risk_tier", {}).get("anchors", {})
+        coerced_values = apply_risk_tier_to_settings(coerced_values, _risk_tier_anchors)
+        # The _rm_map resync block below reads directly from `payload`, not
+        # `coerced_values` -- write the freshly tier-computed values back into
+        # `payload` too so that block picks up the real numbers instead of whatever
+        # stale value the browser's own (un-updated) form fields held at submit time.
+        # See CLAUDE.md's "Risk-Tier Slider" section for the full incident this
+        # avoids (found during implementation planning, not a live bug).
+        for _dotkey in RISK_TIER_DOTKEYS.values():
+            if _dotkey in coerced_values:
+                payload[_dotkey] = str(coerced_values[_dotkey])
 
     for dotkey, value in coerced_values.items():
         section, key = dotkey.split(".", 1)
@@ -7959,6 +7979,18 @@ async def get_conviction_gate_config():
             "on_deck_rr_floor_margin"
         ),
     }
+
+
+@app.get("/api/risk-tier-preview")
+async def risk_tier_preview(value: float):
+    """Read-only -- computes what the 11 real risk-tier factors WOULD become at the
+    given tier value, without saving anything. Backs the Settings page's live preview
+    table (owner: "i would know more about the risk" -- see
+    docs/superpowers/specs/2026-08-21-risk-tier-design.md), so there's no surprise
+    between moving the slider and clicking Save."""
+    anchors = state.config.get("risk_tier", {}).get("anchors", {})
+    computed = compute_risk_tier_settings(value, anchors)
+    return {"label": risk_tier_label(value), **computed}
 
 
 _VERSION_FILE_PATH = str(Path(__file__).resolve().parent.parent / "VERSION")
