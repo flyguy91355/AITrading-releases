@@ -856,6 +856,149 @@ Respond with ONLY a JSON object:
             logger.warning("%s: explain_buy_decision failed: %s", ticker, e)
             return None
 
+    async def analyze_sell_decision(
+        self, ticker: str, company_name: str, buy_thesis: str, buy_reasoning: str,
+        buy_conviction: int | None, buy_rr: float | None, buy_required_rr: float | None,
+        entry_price: float, opened_at_days_ago: float | None,
+        tranches: list[dict], price_history: list[dict],
+    ) -> dict | None:
+        """"Recent Sell" post-mortem, immediate half (2026-08-21, owner request: "an
+        analisys of what the program could have done for a better sell if warented...
+        saved for future analysis"). Fired once per fully-closed trade by a periodic job
+        draining Portfolio.get_pending_sell_analyses() (this file has no DB access of its
+        own). Judges the hold itself -- entry to final exit -- using the real original
+        buy thesis, every real sell tranche (date/price/reason/pnl), and real price
+        history across the window, so the verdict is grounded in what the system could
+        actually have seen and done, not hindsight-only second-guessing. `tranches` is
+        chronological, one dict per SELL row for this trade_id
+        (date/price/reason/pnl keys); `price_history` is chronological daily closes
+        (date/close keys) spanning the hold. Returns None on any failure -- the caller
+        leaves the row pending and retries on a later pass, same AI Data Integrity
+        principle as every other real trading figure in this codebase never guessing."""
+        if not self.client:
+            return None
+        conv_line = f"\nConviction at purchase: {buy_conviction}/10" if buy_conviction is not None else ""
+        rr_line = ""
+        if buy_rr is not None and buy_required_rr is not None:
+            rr_line = f"\nR/R at purchase: {buy_rr:.2f} against a required {buy_required_rr:.2f}."
+        age_line = (f"\nHeld for approximately {opened_at_days_ago:.0f} day(s)."
+                    if opened_at_days_ago is not None else "")
+        tranches_str = "\n".join(
+            f"- {t['date']}: sold at ${t['price']:.2f} ({t['reason']})"
+            + (f", P&L {'+' if t['pnl'] >= 0 else ''}${t['pnl']:.2f}" if t.get("pnl") is not None else "")
+            for t in tranches
+        ) or "none recorded"
+        history_str = "\n".join(
+            f"- {p['date']}: ${p['close']:.2f}" for p in price_history
+        ) or "not available"
+
+        prompt = f"""\
+You are writing a post-mortem for a real, already-completed trade this system made, to help
+improve future sell decisions on this same stock. Judge whether a genuinely better exit was
+realistically available given what was known and visible at the time -- not simple hindsight
+("it went up later" alone isn't evidence of a mistake if nothing signaled that at the time).
+
+STOCK: {ticker} — {company_name}
+Original buy thesis: {buy_thesis}
+Original buy reasoning: {buy_reasoning}
+Entry price: ${entry_price:.2f}{conv_line}{rr_line}{age_line}
+
+Sell tranches (chronological):
+{tranches_str}
+
+Price history across the hold (chronological daily closes):
+{history_str}
+
+Write a genuine, specific assessment: did the exit(s) capture a reasonable outcome given the
+setup, or does the price history show a clearly better exit was available (e.g. price
+recovered sharply right after a stop fired, or kept climbing well past where a take-profit
+closed the position)? Be concrete and grounded in the real numbers above -- don't write
+generic boilerplate. This is for future reference on this same stock, not a performance
+score.
+
+Respond with ONLY a JSON object:
+{{"thesis": "<1-2 sentence verdict>",
+  "reasoning": "<3-5 sentences of specific supporting detail from the real price history and tranches above>"}}
+"""
+        model = self.config.get("research", {}).get("model_dip_entry", "claude-haiku-4-5")
+        try:
+            response_text = await self._call_claude_with_retry(
+                model=model, max_tokens=500, messages=[{"role": "user", "content": prompt}],
+                max_retries=2,
+            )
+            text = response_text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]
+            text = text.rstrip()
+            if text.endswith("```"):
+                text = text[:-3].rstrip()
+            data = json.loads(text)
+            thesis = str(data.get("thesis", "")).strip()
+            reasoning = str(data.get("reasoning", "")).strip()
+            if not thesis and not reasoning:
+                return None
+            return {"thesis": thesis, "reasoning": reasoning}
+        except Exception as e:
+            logger.warning("%s: analyze_sell_decision failed: %s", ticker, e)
+            return None
+
+    async def analyze_sell_followup(
+        self, ticker: str, company_name: str, post_mortem_thesis: str,
+        post_mortem_reasoning: str, exit_price: float, closed_at_days_ago: float | None,
+        price_history_since: list[dict],
+    ) -> str | None:
+        """"Recent Sell" post-mortem, delayed half (2026-08-21, owner's explicit choice
+        to add this rather than judge on entry-to-exit data alone). Fired once, some
+        days after the immediate post-mortem, by a periodic job draining Portfolio.
+        get_due_sell_analysis_followups() -- revisits the original verdict using real
+        price action that has happened SINCE the sale, which wasn't knowable at
+        post-mortem time. Returns a single reasoning string (no separate thesis field --
+        this is a revision/confirmation of the existing verdict, not a fresh one) or None
+        on any failure, same fail-open-to-nothing principle as analyze_sell_decision."""
+        if not self.client:
+            return None
+        age_line = (f"\nThat was approximately {closed_at_days_ago:.0f} day(s) ago."
+                    if closed_at_days_ago is not None else "")
+        history_str = "\n".join(
+            f"- {p['date']}: ${p['close']:.2f}" for p in price_history_since
+        ) or "not available"
+
+        prompt = f"""\
+You previously wrote this post-mortem for a real, completed trade on {ticker} — {company_name}:
+
+Verdict: {post_mortem_thesis}
+Reasoning: {post_mortem_reasoning}
+
+The position was closed at ${exit_price:.2f}.{age_line} Real price history has accumulated
+since then:
+{history_str}
+
+With this additional real price action now visible, does your original verdict still hold, or
+does it change? Be concrete about what the price did after the sale and what that confirms or
+revises about the original exit's timing.
+
+Respond with ONLY a JSON object:
+{{"reasoning": "<3-5 sentences, referencing the real post-sale price action above>"}}
+"""
+        model = self.config.get("research", {}).get("model_dip_entry", "claude-haiku-4-5")
+        try:
+            response_text = await self._call_claude_with_retry(
+                model=model, max_tokens=400, messages=[{"role": "user", "content": prompt}],
+                max_retries=2,
+            )
+            text = response_text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]
+            text = text.rstrip()
+            if text.endswith("```"):
+                text = text[:-3].rstrip()
+            data = json.loads(text)
+            reasoning = str(data.get("reasoning", "")).strip()
+            return reasoning or None
+        except Exception as e:
+            logger.warning("%s: analyze_sell_followup failed: %s", ticker, e)
+            return None
+
     async def recommend_on_deck_retention(
         self, ticker: str, company_name: str, thesis: str, price: float,
         fair_value_estimate: float, stop_loss: float, rr: float, required_rr: float,

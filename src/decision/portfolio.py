@@ -95,6 +95,26 @@ def _format_trade_history_summary(ticker: str, rows: list[tuple]) -> str:
     return "\n".join(lines)
 
 
+def _format_sell_analysis_summary(rows: list[dict]) -> str:
+    """Formats completed "Recent Sell" post-mortems (2026-08-21) for inclusion in a Claude
+    prompt as minor supplementary context -- same "for reference only" framing as
+    _format_trade_history_summary, appended alongside it rather than replacing it. Each
+    dict is one row from Portfolio.get_recent_sell_analyses (already filtered to
+    post_mortem_thesis IS NOT NULL, newest close first). Includes the delayed follow-up
+    verdict when one has been generated, since it reflects real price action the
+    immediate post-mortem couldn't have known about yet. Returns an empty string for no
+    rows -- callers must treat that as "omit this section entirely"."""
+    if not rows:
+        return ""
+    lines = ["Past sell post-mortem(s) for this ticker (for reference only):"]
+    for r in rows:
+        date = (r.get("closed_at") or "").split("T")[0] or "unknown date"
+        lines.append(f"- {date}: {r.get('post_mortem_thesis', '')}")
+        if r.get("followup_reasoning"):
+            lines.append(f"  Follow-up: {r['followup_reasoning']}")
+    return "\n".join(lines)
+
+
 @dataclass
 class Position:
     ticker: str
@@ -437,6 +457,38 @@ class Portfolio:
             await self._db.commit()
             logger.info("Migrated trade_history: added trade_id column")
 
+        # "Recent Sell" post-mortem (2026-08-21, owner request) -- a position's buy-side
+        # thesis/reasoning/etc. is about to be lost the moment close_position_async
+        # deletes the Position row, so it's snapshotted here (see close_position_async
+        # below) alongside the raw close facts, one row per trade_id. post_mortem_*
+        # fields start NULL and are filled in by a separate periodic job in web/app.py
+        # (this file has no Claude client) once per closed trade; followup_* fields are
+        # filled in by a second, delayed pass using price action after the sale.
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS sell_analysis (
+                trade_id TEXT PRIMARY KEY,
+                ticker TEXT,
+                buy_thesis TEXT,
+                buy_reasoning TEXT,
+                buy_conviction INTEGER,
+                buy_signal TEXT,
+                buy_rr REAL,
+                buy_required_rr REAL,
+                buy_fair_value REAL,
+                entry_price REAL,
+                exit_price REAL,
+                opened_at TEXT,
+                closed_at TEXT,
+                post_mortem_thesis TEXT,
+                post_mortem_reasoning TEXT,
+                generated_at TEXT,
+                followup_due_date TEXT,
+                followup_reasoning TEXT,
+                followup_generated_at TEXT
+            )
+        """)
+        await self._db.commit()
+
         # Migrate existing INTEGER shares columns to REAL so fractional shares are preserved
         for table in ("positions", "trade_history"):
             # Recovery: if a previous migration was interrupted (e.g. power loss between
@@ -641,7 +693,23 @@ class Portfolio:
         except Exception as e:
             logger.warning("get_trade_history_summary failed for %s: %s", ticker, e)
             return ""
-        return _format_trade_history_summary(ticker, rows)
+        summary = _format_trade_history_summary(ticker, rows)
+
+        # "Recent Sell" post-mortem feed-forward (2026-08-21, owner request: "saved for
+        # future analysis of that paticular stock... for future buying and selling
+        # analysys") -- same minor, supplementary framing as the trade-history summary
+        # above, appended rather than replacing it. Fails open exactly like the query
+        # above -- a post-mortem lookup failure must never delay or break a real buy
+        # decision either.
+        try:
+            sell_analyses = await self.get_recent_sell_analyses(ticker)
+        except Exception as e:
+            logger.warning("get_recent_sell_analyses failed for %s: %s", ticker, e)
+            sell_analyses = []
+        post_mortem_summary = _format_sell_analysis_summary(sell_analyses)
+        if post_mortem_summary:
+            summary = f"{summary}\n\n{post_mortem_summary}" if summary else post_mortem_summary
+        return summary
 
     def update_peak(self):
         # Guarded here (not just at the order_manager.py call site) because
@@ -718,4 +786,116 @@ class Portfolio:
                 (ticker, "SELL", _exit_shares, _exit_price, pnl, datetime.now().isoformat(), reason, _trade_id),
             )
             await self._db.commit()
+            # "Recent Sell" post-mortem snapshot (2026-08-21) -- close_position_async is
+            # always a FULL close (the position is gone from self.positions either way by
+            # this point), so this is exactly the one moment pos's buy_thesis/etc is still
+            # available before it's lost for good. Skipped for a ticker with no real
+            # buy-time rationale (pre-feature position, or a non-AI-driven signal source
+            # like the admin rebuy utility) -- nothing worth a post-mortem without it.
+            if pos and pos.trade_id and pos.buy_thesis:
+                await self._db.execute(
+                    "INSERT OR IGNORE INTO sell_analysis "
+                    "(trade_id, ticker, buy_thesis, buy_reasoning, buy_conviction, buy_signal, "
+                    "buy_rr, buy_required_rr, buy_fair_value, entry_price, opened_at, closed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        pos.trade_id, ticker, pos.buy_thesis, pos.buy_reasoning,
+                        pos.buy_conviction, pos.buy_signal, pos.buy_rr, pos.buy_required_rr,
+                        pos.buy_fair_value, pos.entry_price,
+                        pos.opened_at.isoformat() if pos.opened_at else None,
+                        datetime.now().isoformat(),
+                    ),
+                )
+                await self._db.commit()
         return pnl
+
+    _SELL_ANALYSIS_COLUMNS = (
+        "trade_id", "ticker", "buy_thesis", "buy_reasoning", "buy_conviction", "buy_signal",
+        "buy_rr", "buy_required_rr", "buy_fair_value", "entry_price", "exit_price",
+        "opened_at", "closed_at",
+        "post_mortem_thesis", "post_mortem_reasoning", "generated_at",
+        "followup_due_date", "followup_reasoning", "followup_generated_at",
+    )
+
+    async def get_pending_sell_analyses(self, limit: int = 5) -> list[dict]:
+        """Closed trades whose immediate post-mortem hasn't been generated yet -- the
+        queue a periodic job (web/app.py, which owns the real Claude client) drains one
+        real API call at a time. Oldest first, same "process a bounded batch per pass"
+        pattern as this project's other periodic queues."""
+        if not self._db:
+            return []
+        cols = ", ".join(self._SELL_ANALYSIS_COLUMNS)
+        async with self._db.execute(
+            f"SELECT {cols} FROM sell_analysis WHERE post_mortem_thesis IS NULL "
+            "ORDER BY closed_at ASC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(zip(self._SELL_ANALYSIS_COLUMNS, row)) for row in rows]
+
+    async def get_sell_analysis(self, trade_id: str) -> dict | None:
+        if not self._db:
+            return None
+        cols = ", ".join(self._SELL_ANALYSIS_COLUMNS)
+        async with self._db.execute(
+            f"SELECT {cols} FROM sell_analysis WHERE trade_id = ?", (trade_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(zip(self._SELL_ANALYSIS_COLUMNS, row)) if row else None
+
+    async def save_sell_analysis_post_mortem(
+        self, trade_id: str, thesis: str, reasoning: str, followup_due_date: str,
+        exit_price: float | None = None,
+    ):
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE sell_analysis SET post_mortem_thesis = ?, post_mortem_reasoning = ?, "
+            "generated_at = ?, followup_due_date = ?, exit_price = ? WHERE trade_id = ?",
+            (thesis, reasoning, datetime.now().isoformat(), followup_due_date,
+             exit_price, trade_id),
+        )
+        await self._db.commit()
+
+    async def get_due_sell_analysis_followups(self, today_str: str, limit: int = 5) -> list[dict]:
+        """Trades whose delayed follow-up check (price action after the sale) is due --
+        has a real post-mortem already, no follow-up yet, and its due date has arrived.
+        Same bounded-queue pattern as get_pending_sell_analyses."""
+        if not self._db:
+            return []
+        cols = ", ".join(self._SELL_ANALYSIS_COLUMNS)
+        async with self._db.execute(
+            f"SELECT {cols} FROM sell_analysis WHERE post_mortem_thesis IS NOT NULL "
+            "AND followup_generated_at IS NULL AND followup_due_date IS NOT NULL "
+            "AND followup_due_date <= ? ORDER BY followup_due_date ASC LIMIT ?",
+            (today_str, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(zip(self._SELL_ANALYSIS_COLUMNS, row)) for row in rows]
+
+    async def save_sell_analysis_followup(self, trade_id: str, followup_reasoning: str):
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE sell_analysis SET followup_reasoning = ?, followup_generated_at = ? "
+            "WHERE trade_id = ?",
+            (followup_reasoning, datetime.now().isoformat(), trade_id),
+        )
+        await self._db.commit()
+
+    async def get_recent_sell_analyses(self, ticker: str, limit: int = 2) -> list[dict]:
+        """Completed post-mortems for this ticker, newest close first -- feeds
+        get_trade_history_summary's minor supplementary prompt context (2026-08-21) so a
+        past sell's own AI post-mortem genuinely informs the next time this ticker is
+        reconsidered as a buy candidate, not just a passive record. Excludes a still-
+        pending row (no post_mortem_thesis yet) -- nothing useful to say yet."""
+        if not self._db:
+            return []
+        cols = ", ".join(self._SELL_ANALYSIS_COLUMNS)
+        async with self._db.execute(
+            f"SELECT {cols} FROM sell_analysis WHERE ticker = ? AND post_mortem_thesis IS NOT NULL "
+            "ORDER BY closed_at DESC LIMIT ?",
+            (ticker, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(zip(self._SELL_ANALYSIS_COLUMNS, row)) for row in rows]

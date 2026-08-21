@@ -1897,6 +1897,109 @@ class DashboardState:
             "trades": current_arch_trades,
         }
 
+    async def _process_sell_analysis_queue(self) -> None:
+        """"Recent Sell" post-mortem (2026-08-21, owner request: "an analisys of what
+        the program could have done for a better sell if warented... saved for future
+        analysis"). Drains at most one pending immediate post-mortem and one due delayed
+        follow-up per call (bounded real Claude spend per tick, same "small bounded batch
+        per pass" pattern as this project's other periodic queues, e.g. On Deck
+        backfill). The raw facts were already captured synchronously by
+        Portfolio.close_position_async at the moment of close (see that method) --
+        this only ever generates the AI judgment on top of already-safe, already-
+        persisted data, so a failure here just leaves a row pending for the next tick,
+        never loses anything."""
+        pending = await self.portfolio.get_pending_sell_analyses(limit=1)
+        for row in pending:
+            ticker = row["ticker"]
+            company_name = self.research_reports.get(ticker, {}).get("company_name", ticker)
+            async with self.portfolio._db.execute(
+                "SELECT price, reason, pnl, timestamp FROM trade_history "
+                "WHERE trade_id = ? AND action = 'SELL' ORDER BY timestamp ASC",
+                (row["trade_id"],),
+            ) as cur:
+                tranche_rows = await cur.fetchall()
+            tranches = [
+                {"date": ts.split("T")[0] if ts else "unknown", "price": price,
+                 "reason": reason or "Not recorded", "pnl": pnl}
+                for price, reason, pnl, ts in tranche_rows
+            ]
+            opened_date = (row["opened_at"] or "").split("T")[0]
+            closed_date = (row["closed_at"] or "").split("T")[0]
+            price_history = []
+            if opened_date:
+                try:
+                    hist = await self.market_data.get_historical(ticker, period="1y")
+                    price_history = [
+                        {"date": p["date"], "close": p["close"]}
+                        for p in hist if opened_date <= p["date"] <= closed_date
+                    ]
+                except Exception as e:
+                    logger.warning("sell-analysis price history fetch failed for %s: %s", ticker, e)
+            days_ago = None
+            if row["opened_at"]:
+                try:
+                    opened_dt = datetime.fromisoformat(row["opened_at"])
+                    days_ago = (datetime.now() - opened_dt).total_seconds() / 86400
+                except ValueError:
+                    pass
+            result = await self.research_engine.analyze_sell_decision(
+                ticker=ticker, company_name=company_name,
+                buy_thesis=row["buy_thesis"], buy_reasoning=row["buy_reasoning"],
+                buy_conviction=row["buy_conviction"], buy_rr=row["buy_rr"],
+                buy_required_rr=row["buy_required_rr"], entry_price=row["entry_price"],
+                opened_at_days_ago=days_ago, tranches=tranches, price_history=price_history,
+            )
+            if result is None:
+                continue  # leaves the row pending -- retried on a later tick
+            followup_due = (self._now_et() + timedelta(
+                days=self.config.get("research", {}).get("sell_analysis_followup_days", 5)
+            )).strftime("%Y-%m-%d")
+            exit_price = tranches[-1]["price"] if tranches else None
+            await self.portfolio.save_sell_analysis_post_mortem(
+                row["trade_id"], result["thesis"], result["reasoning"], followup_due,
+                exit_price=exit_price)
+            entry = self.add_ai_log(
+                ticker, "SELL_ANALYSIS", f"Post-mortem: {result['thesis']}", "info")
+            await self.broadcast({"type": "ai_log", "entry": entry})
+
+        today_str = self._now_et().strftime("%Y-%m-%d")
+        due = await self.portfolio.get_due_sell_analysis_followups(today_str, limit=1)
+        for row in due:
+            ticker = row["ticker"]
+            company_name = self.research_reports.get(ticker, {}).get("company_name", ticker)
+            closed_date = (row["closed_at"] or "").split("T")[0]
+            price_history_since = []
+            if closed_date:
+                try:
+                    hist = await self.market_data.get_historical(ticker, period="3mo")
+                    price_history_since = [
+                        {"date": p["date"], "close": p["close"]}
+                        for p in hist if p["date"] > closed_date
+                    ]
+                except Exception as e:
+                    logger.warning("sell-analysis followup price fetch failed for %s: %s", ticker, e)
+            closed_days_ago = None
+            if row["closed_at"]:
+                try:
+                    closed_dt = datetime.fromisoformat(row["closed_at"])
+                    closed_days_ago = (datetime.now() - closed_dt).total_seconds() / 86400
+                except ValueError:
+                    pass
+            followup = await self.research_engine.analyze_sell_followup(
+                ticker=ticker, company_name=company_name,
+                post_mortem_thesis=row["post_mortem_thesis"],
+                post_mortem_reasoning=row["post_mortem_reasoning"],
+                exit_price=row["exit_price"] if row["exit_price"] is not None else row["entry_price"],
+                closed_at_days_ago=closed_days_ago,
+                price_history_since=price_history_since,
+            )
+            if followup is None:
+                continue  # retried on a later due check -- followup_due_date stays in the past
+            await self.portfolio.save_sell_analysis_followup(row["trade_id"], followup)
+            entry = self.add_ai_log(
+                ticker, "SELL_ANALYSIS", f"Post-mortem follow-up: {followup}", "info")
+            await self.broadcast({"type": "ai_log", "entry": entry})
+
     def _ytd_pnl(self) -> tuple[float | None, float | None]:
         """Year-to-date P&L. When the account's entire real history began within the current
         year (true here since go-live 2026-07-12), YTD is definitionally identical to Total
@@ -4664,6 +4767,14 @@ class DashboardState:
                 # over a weekend shouldn't see a stale win rate just because nothing else
                 # in this loop runs outside market hours.
                 await self._refresh_win_rate_cache()
+
+                # "Recent Sell" post-mortem queue (2026-08-21) -- also deliberately
+                # before the market-hours gate, same reasoning as the win-rate refresh
+                # above: a position can close (and need its post-mortem generated)
+                # outside market hours (e.g. a stop firing right at the close), and the
+                # delayed follow-up check has nothing to do with whether the market is
+                # open right now either.
+                await self._process_sell_analysis_queue()
 
                 if self.paused or self.stopped or not self._is_market_open():
                     continue
@@ -8880,6 +8991,22 @@ async def get_win_loss_trades():
         "win_rate_all_time_pct": state._win_rate_cache.get("win_rate_all_time_pct", 0.0),
         "closed_all_time": state._win_rate_cache.get("closed_all_time", 0),
     }
+
+
+@app.get("/api/sell-analysis/{trade_id}")
+async def get_sell_analysis(trade_id: str):
+    """Backs the Recent Sells trade-detail popup's post-mortem section (2026-08-21) --
+    the buy-side snapshot plus the AI's immediate and (once due) delayed follow-up
+    judgment for one closed trade. Lazy-fetched by the frontend only when a Recent
+    Sells row is actually opened, same pattern as every other on-demand popup in this
+    app -- not embedded in the base /api/trade-history payload. 404 for a trade_id with
+    no row (predates this feature, or never had a real buy_thesis to snapshot -- see
+    close_position_async) or one still pending its first AI pass."""
+    from fastapi import HTTPException
+    record = await state.portfolio.get_sell_analysis(trade_id)
+    if not record or not record.get("post_mortem_thesis"):
+        raise HTTPException(status_code=404, detail="No sell analysis available for this trade")
+    return record
 
 
 @app.get("/api/weekly-pnl-history")

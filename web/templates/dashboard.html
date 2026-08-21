@@ -2754,6 +2754,14 @@ function openTradeDetail(index) {
   if (isBuy && t.reasoning) {
     rows += `<div style="margin-top:14px;font-size:12px;color:var(--text-secondary);line-height:1.5;"><b>Reasoning:</b> ${t.reasoning}</div>`;
   }
+  // "Recent Sell" post-mortem slot (2026-08-21) -- a SELL row with a real trade_id gets
+  // an empty placeholder here, filled in asynchronously below (same
+  // open-modal-then-fetch pattern as appendOnDeckChart/appendDeepDiveChart) since the
+  // post-mortem is lazy-fetched, not part of the base trade-history payload.
+  const sellAnalysisSlotId = `sellAnalysisSlot-${t.trade_id || 'none'}`;
+  if (!isBuy && t.trade_id) {
+    rows += `<div id="${sellAnalysisSlotId}"></div>`;
+  }
   // Reuses the shared deepDiveModal shell (ticker header + one content div), same pattern
   // already used for On Deck charts and position detail -- not reportModal (a different,
   // simpler modal with no matching content-div ID). Hides the Run/Re-run/Deeper-Dive
@@ -2765,6 +2773,52 @@ function openTradeDetail(index) {
   document.getElementById('ddDiveAgainBtn').style.display = 'none';
   document.getElementById('ddModalBody').innerHTML = estNote + rows;
   document.getElementById('deepDiveModal').classList.add('active');
+
+  if (!isBuy && t.trade_id) {
+    appendSellAnalysis(sellAnalysisSlotId, t.trade_id);
+  }
+}
+
+// Fetches and renders the "Recent Sell" post-mortem for one closed trade (2026-08-21) --
+// combines the original buy thesis (frozen at the moment the trade closed, since the live
+// Position row is gone by then) with the AI's judgment on whether a better exit was
+// realistically available, plus a delayed follow-up once one exists. Silently leaves the
+// slot empty on a 404 (no post-mortem generated yet -- the periodic queue in web/app.py
+// hasn't reached this trade, or it never had a real buy_thesis to snapshot) rather than
+// showing an error, since "nothing here yet" is the common, expected case for a very
+// recently closed trade.
+async function appendSellAnalysis(slotId, tradeId) {
+  const slot = document.getElementById(slotId);
+  if (!slot) return;
+  try {
+    const resp = await fetch(`/api/sell-analysis/${encodeURIComponent(tradeId)}`);
+    if (!resp.ok) return;
+    const d = await resp.json();
+    const rrLine = (d.buy_rr != null && d.buy_required_rr != null)
+      ? `<div style="margin-top:6px;font-size:11.5px;color:var(--text-muted);">R/R at purchase: <strong style="color:var(--text-primary)">${d.buy_rr.toFixed(2)}</strong> against a required <strong style="color:var(--text-primary)">${d.buy_required_rr.toFixed(2)}</strong></div>`
+      : '';
+    const followupHtml = d.followup_reasoning
+      ? `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+           <div style="font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Follow-Up (Later Price Action)</div>
+           <div style="font-size:12.5px;color:var(--text-secondary);line-height:1.6;">${d.followup_reasoning}</div>
+         </div>`
+      : '';
+    slot.innerHTML = `<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-top:14px;">
+      <div style="font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Why It Was Bought</div>
+      ${d.buy_thesis ? `<div style="font-size:12.5px;color:var(--text-primary);line-height:1.6;margin-bottom:4px;">${d.buy_thesis}</div>` : ''}
+      ${d.buy_reasoning ? `<div style="font-size:12px;color:var(--text-secondary);line-height:1.6;">${d.buy_reasoning}</div>` : ''}
+      ${rrLine}
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+        <div style="font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">AI Post-Mortem</div>
+        <div style="font-size:12.5px;color:var(--text-primary);line-height:1.6;margin-bottom:4px;">${d.post_mortem_thesis}</div>
+        <div style="font-size:12px;color:var(--text-secondary);line-height:1.6;">${d.post_mortem_reasoning}</div>
+      </div>
+      ${followupHtml}
+    </div>`;
+  } catch (e) {
+    // Leave the slot empty -- same "unavailable is not an error" precedent as every
+    // other lazy-fetched popup section in this app.
+  }
 }
 
 // Fresh-install banner actions (2026-07-21). "Not Now" is deliberately per-session only
