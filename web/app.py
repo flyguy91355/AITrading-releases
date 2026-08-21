@@ -7513,7 +7513,7 @@ async def settings_page():
     class _NS:
         pass
     ns = _NS()
-    for section in ("portfolio", "take_profit", "risk_management", "research", "trading", "dashboard"):
+    for section in ("portfolio", "take_profit", "risk_management", "research", "trading", "dashboard", "risk_tier"):
         sub = _NS()
         for k, v in cfg.get(section, {}).items():
             setattr(sub, k, v)
