@@ -770,6 +770,92 @@ Respond with ONLY a JSON object:
             logger.warning("%s: dip-entry recommendation failed: %s", ticker, e)
             return None
 
+    async def explain_buy_decision(
+        self, ticker: str, company_name: str, entry_price: float, stop_loss: float,
+        take_profit_targets: list[float], fair_value_estimate: float | None,
+        conviction: int | None, rr: float | None, required_rr: float | None,
+        opened_at_days_ago: float | None,
+    ) -> dict | None:
+        """Retroactive backfill for "Why AI Bought This" (2026-08-21, owner request:
+        "make sure its retroactive so i can see it on all the bought stocks and
+        crypto.. make sure it talks about r/r and what it did to allow the purchase").
+        Only used for a position bought BEFORE Position.buy_thesis/buy_reasoning
+        existed to capture the real decision automatically -- see
+        scripts/backfill_buy_rationale.py, the sole caller. A genuinely new buy never
+        calls this; it gets the real, original thesis/reasoning/R/R for free from the
+        exact analysis that triggered it (OrderManager._execute_buy).
+
+        This is necessarily a RECONSTRUCTION, not the original reasoning verbatim (that
+        moment is gone) -- the prompt is explicit about this and grounds Claude in the
+        real, immutable trade parameters (entry, stop, targets, fair value, conviction,
+        the exact R/R math) rather than asking it to invent a narrative from nothing.
+        Returns None on any failure (no API key, malformed response, API error) -- the
+        backfill script simply skips that position and leaves it blank rather than
+        fabricating something, same AI Data Integrity principle as every other real
+        trading figure in this codebase. Uses model_dip_entry (a one-time, non-live-
+        buy-decision utility call, same class of usage that setting already covers)."""
+        if not self.client:
+            return None
+        risk = stop_loss - entry_price if stop_loss < entry_price else entry_price - stop_loss
+        rr_line = ""
+        if rr is not None and required_rr is not None:
+            rr_line = (f"\nRisk/reward at purchase: {rr:.2f} against a required {required_rr:.2f} "
+                       f"for this conviction level (this is what actually allowed the purchase -- "
+                       f"reward is the distance from entry ${entry_price:.2f} to the fair value "
+                       f"estimate below; risk is the distance from entry to the stop ${stop_loss:.2f}, "
+                       f"${risk:.2f} away).")
+        fv_line = f"\nFair value estimate at purchase: ${fair_value_estimate:.2f}" if fair_value_estimate else ""
+        conv_line = f"\nConviction score: {conviction}/10" if conviction is not None else ""
+        age_line = (f"\nThis position was opened approximately {opened_at_days_ago:.0f} day(s) ago."
+                    if opened_at_days_ago is not None else "")
+        targets_str = ", ".join(f"${t:.2f}" for t in take_profit_targets) if take_profit_targets else "none recorded"
+
+        prompt = f"""\
+You are reconstructing the investment case for a real trade this system already made, for a
+"Why AI Bought This" explanation shown to the account owner. The original real-time reasoning
+text from the moment of purchase was not captured for this specific position (it predates
+that tracking), so you're rebuilding a faithful, well-reasoned explanation from the real,
+immutable trade parameters below -- not inventing a story disconnected from them.
+
+STOCK: {ticker} — {company_name}
+Entry price: ${entry_price:.2f}
+Stop loss: ${stop_loss:.2f}
+Take-profit targets: {targets_str}{fv_line}{conv_line}{rr_line}{age_line}
+
+Write a genuine, comprehensive walk-through of the likely investment thesis: what about this
+company's fundamentals and technical setup would make it a buy candidate, how the risk/reward
+math above specifically cleared this system's gate, and what the conviction level implies
+about how strong the case was. Be specific and grounded in the real numbers given -- don't
+write generic boilerplate that could apply to any stock. This should read like a real analyst's
+reasoning, several sentences of substance, not a one-line summary.
+
+Respond with ONLY a JSON object:
+{{"thesis": "<2-3 sentence core investment thesis>",
+  "reasoning": "<4-6 sentences of detailed reasoning covering fundamentals/technicals, why the
+  R/R math worked, and what the conviction level reflects>"}}
+"""
+        model = self.config.get("research", {}).get("model_dip_entry", "claude-haiku-4-5")
+        try:
+            response_text = await self._call_claude_with_retry(
+                model=model, max_tokens=500, messages=[{"role": "user", "content": prompt}],
+                max_retries=2,
+            )
+            text = response_text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]
+            text = text.rstrip()
+            if text.endswith("```"):
+                text = text[:-3].rstrip()
+            data = json.loads(text)
+            thesis = str(data.get("thesis", "")).strip()
+            reasoning = str(data.get("reasoning", "")).strip()
+            if not thesis and not reasoning:
+                return None
+            return {"thesis": thesis, "reasoning": reasoning}
+        except Exception as e:
+            logger.warning("%s: explain_buy_decision failed: %s", ticker, e)
+            return None
+
     async def recommend_on_deck_retention(
         self, ticker: str, company_name: str, thesis: str, price: float,
         fair_value_estimate: float, stop_loss: float, rr: float, required_rr: float,

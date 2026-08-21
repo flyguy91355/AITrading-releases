@@ -49,6 +49,13 @@ class TradeSignal:
     # JSONL buy record. None until the buy actually executes; never set at all for a
     # signal that never becomes a real trade (e.g. a sell signal, or a rejected buy).
     trade_id: str | None = None
+    # The exact R/R and its required gate at the moment THIS signal cleared to buy
+    # (2026-08-21) -- not recomputed later, so Position.buy_rr/buy_required_rr (see
+    # that field's own docstring) reflect the real numbers that allowed the purchase,
+    # not a reconstruction from possibly-since-changed data. None for a sell signal or
+    # any construction site that predates this field.
+    rr: float | None = None
+    required_rr: float | None = None
 
 
 class SignalGenerator:
@@ -137,5 +144,7 @@ class SignalGenerator:
             generated_at=datetime.now(),
             sector=getattr(report, 'sector', ''),
             should_execute=report.signal in (Signal.STRONG_BUY, Signal.BUY),
+            rr=rr,
+            required_rr=required_rr,
         )
 

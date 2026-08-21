@@ -1018,6 +1018,12 @@ class OrderManager:
             _trade_id = str(uuid.uuid4())
             if hasattr(signal, "trade_id"):
                 signal.trade_id = _trade_id
+            # "Why AI Bought This" snapshot (2026-08-21) -- captured once, here, from
+            # whatever real report/numbers this signal actually carries. research_report
+            # is None for a handful of non-AI-driven signal sources (e.g. a legacy
+            # rebuy) -- falls back to empty/None fields rather than guessing, same
+            # precedent as every other nullable Position field.
+            _report = getattr(signal, "research_report", None)
             await self.portfolio.add_position_async(Position(
                 ticker=signal.ticker,
                 shares=actual_shares,
@@ -1030,6 +1036,13 @@ class OrderManager:
                 t1_target_price=signal.take_profit_targets[0] if len(signal.take_profit_targets) > 0 else None,
                 t2_target_price=signal.take_profit_targets[1] if len(signal.take_profit_targets) > 1 else None,
                 trade_id=_trade_id,
+                buy_thesis=_report.thesis if _report else "",
+                buy_reasoning=_report.reasoning if _report else "",
+                buy_conviction=signal.conviction,
+                buy_signal=signal.signal.value if hasattr(signal.signal, "value") else str(signal.signal),
+                buy_rr=getattr(signal, "rr", None),
+                buy_required_rr=getattr(signal, "required_rr", None),
+                buy_fair_value=_report.fair_value_estimate if _report else None,
             ))
             # Locked so sync_exit_orders can't independently discover this brand-new
             # position mid-placement and race to "cover" it a second time — a gap that

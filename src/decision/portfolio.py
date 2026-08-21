@@ -162,6 +162,24 @@ class Position:
     # docs/superpowers -- the win-loss-dashboard-stat and tax-tracking-database design
     # notes). None for a position that predates this field.
     trade_id: str | None = None
+    # "Why AI Bought This" (2026-08-21, owner request) -- a snapshot of the AI's real
+    # buy-time decision, captured once at the moment of purchase and never regenerated
+    # or overwritten by a later re-analysis while the position is held. Deliberately a
+    # SNAPSHOT, not a live reference to whatever's currently cached for this ticker --
+    # the whole point is answering "why was THIS bought," which should stay fixed even
+    # if the ticker's own thesis later drifts. buy_rr/buy_required_rr are the exact
+    # numbers that cleared the gate at that moment (not recomputed later), so the
+    # displayed R/R breakdown is always accurate to the real decision, not a
+    # reconstruction from possibly-stale current data. None/"" for any position bought
+    # before this field existed -- backfilled once via scripts/backfill_buy_rationale.py
+    # rather than left silently blank forever (see that script's own docstring).
+    buy_thesis: str = ""
+    buy_reasoning: str = ""
+    buy_conviction: int | None = None
+    buy_signal: str = ""
+    buy_rr: float | None = None
+    buy_required_rr: float | None = None
+    buy_fair_value: float | None = None
 
     @property
     def market_value(self) -> float:
@@ -399,6 +417,19 @@ class Portfolio:
             await self._db.execute("ALTER TABLE positions ADD COLUMN trade_id TEXT")
             await self._db.commit()
             logger.info("Migrated positions: added trade_id column")
+        # "Why AI Bought This" snapshot (2026-08-21) -- see Position's own field
+        # docstring. Existing rows get NULL/empty on every one of these 7 columns; a
+        # position that predates this feature is exactly what
+        # scripts/backfill_buy_rationale.py exists to fill in, once, retroactively.
+        for _col, _type in (
+            ("buy_thesis", "TEXT"), ("buy_reasoning", "TEXT"),
+            ("buy_conviction", "INTEGER"), ("buy_signal", "TEXT"),
+            ("buy_rr", "REAL"), ("buy_required_rr", "REAL"), ("buy_fair_value", "REAL"),
+        ):
+            if _col not in _pos_cols:
+                await self._db.execute(f"ALTER TABLE positions ADD COLUMN {_col} {_type}")
+                await self._db.commit()
+                logger.info("Migrated positions: added %s column", _col)
         async with self._db.execute("PRAGMA table_info(trade_history)") as cur:
             _th_cols2 = {row[1] for row in await cur.fetchall()}
         if "trade_id" not in _th_cols2:
@@ -546,6 +577,13 @@ class Portfolio:
                     t2_target_price=row[14] if len(row) > 14 else None,
                     profit_target_hit=bool(row[15]) if len(row) > 15 and row[15] is not None else False,
                     trade_id=row[16] if len(row) > 16 else None,
+                    buy_thesis=row[17] if len(row) > 17 and row[17] is not None else "",
+                    buy_reasoning=row[18] if len(row) > 18 and row[18] is not None else "",
+                    buy_conviction=row[19] if len(row) > 19 else None,
+                    buy_signal=row[20] if len(row) > 20 and row[20] is not None else "",
+                    buy_rr=row[21] if len(row) > 21 else None,
+                    buy_required_rr=row[22] if len(row) > 22 else None,
+                    buy_fair_value=row[23] if len(row) > 23 else None,
                 )
 
     async def _save_state(self):
@@ -561,7 +599,7 @@ class Portfolio:
         if not self._db:
             return
         await self._db.execute(
-            "INSERT OR REPLACE INTO positions (ticker, shares, entry_price, current_price, stop_loss, take_profit_targets, sector, opened_at, trailing_stop, day_open_price, final_tranche_start_price, realized_pnl, shares_sold, t1_target_price, t2_target_price, profit_target_hit, trade_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO positions (ticker, shares, entry_price, current_price, stop_loss, take_profit_targets, sector, opened_at, trailing_stop, day_open_price, final_tranche_start_price, realized_pnl, shares_sold, t1_target_price, t2_target_price, profit_target_hit, trade_id, buy_thesis, buy_reasoning, buy_conviction, buy_signal, buy_rr, buy_required_rr, buy_fair_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 position.ticker, position.shares, position.entry_price,
                 position.current_price, position.stop_loss,
@@ -571,6 +609,9 @@ class Portfolio:
                 position.realized_pnl, position.shares_sold,
                 position.t1_target_price, position.t2_target_price,
                 int(position.profit_target_hit), position.trade_id,
+                position.buy_thesis, position.buy_reasoning, position.buy_conviction,
+                position.buy_signal, position.buy_rr, position.buy_required_rr,
+                position.buy_fair_value,
             ),
         )
         await self._db.commit()

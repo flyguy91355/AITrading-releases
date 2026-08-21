@@ -3764,12 +3764,45 @@ async function showPositionDetail(ticker) {
         ${r.monitoring_checklist.map(c => `<li>${c}</li>`).join('')}
       </ul>`
     : '';
+  // "Why AI Bought This" (2026-08-21, owner request) -- a snapshot of the AI's real
+  // buy-time decision (Position.buy_thesis/buy_reasoning/buy_conviction/buy_signal/
+  // buy_rr/buy_required_rr/buy_fair_value), already present synchronously in `p` --
+  // no extra fetch needed, unlike the AI-entry-price note below. Blank for a position
+  // bought before this feature existed, until scripts/backfill_buy_rationale.py fills
+  // it in retroactively -- shows nothing rather than a misleading empty box.
+  let whyBoughtHtml = '';
+  if (p.buy_thesis || p.buy_reasoning) {
+    const rrLine = (p.buy_rr != null && p.buy_required_rr != null)
+      ? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:12px;">
+           <span style="color:var(--text-muted);">R/R at purchase:</span>
+           <strong style="color:${p.buy_rr >= p.buy_required_rr ? 'var(--green)' : 'var(--text-primary)'}">${p.buy_rr.toFixed(2)}</strong>
+           <span style="color:var(--text-muted);">against a required</span>
+           <strong>${p.buy_required_rr.toFixed(2)}</strong>
+           ${p.buy_fair_value != null ? `&nbsp;·&nbsp; <span style="color:var(--text-muted);">fair value</span> <strong>$${p.buy_fair_value.toFixed(2)}</strong> <span style="color:var(--text-muted);">vs. entry</span> <strong>$${p.entry_price.toFixed(2)}</strong>` : ''}
+         </div>`
+      : '';
+    const convSigLine = (p.buy_conviction != null || p.buy_signal)
+      ? `<div style="margin-bottom:6px;font-size:11px;">
+           ${p.buy_signal ? `<span style="color:var(--accent);font-weight:700;text-transform:uppercase;letter-spacing:.3px;">${p.buy_signal}</span>` : ''}
+           ${p.buy_conviction != null ? `<span style="color:var(--text-muted);"> · Conviction ${p.buy_conviction}/10</span>` : ''}
+         </div>`
+      : '';
+    whyBoughtHtml = `<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:14px 0;">
+      <div style="font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">Why AI Bought This</div>
+      ${convSigLine}
+      ${p.buy_thesis ? `<div style="font-size:13px;color:var(--text-primary);line-height:1.6;margin-bottom:6px;">${p.buy_thesis}</div>` : ''}
+      ${p.buy_reasoning ? `<div style="font-size:12.5px;color:var(--text-secondary);line-height:1.6;">${p.buy_reasoning}</div>` : ''}
+      ${rrLine}
+    </div>`;
+  }
   // The AI-entry recommendation that actually triggered this buy (2026-07-20), if this
-  // position came from a near-miss promotion -- otherwise absent entirely (a manual buy, or
-  // any position bought before this tracking existed). Fetched together with the chart data
-  // below (the same /api/position/{ticker}/history response already carries it) rather than
-  // needing a second round trip or a separate always-loaded client-side cache.
-  const buyReasoningHtml = '<div id="posBuyReasoning"></div>';
+  // position came from a near-miss promotion's dip-entry price flow specifically --
+  // otherwise absent entirely. Fetched together with the chart data below (the same
+  // /api/position/{ticker}/history response already carries it) -- narrower and
+  // supplementary to whyBoughtHtml above (that's the full decision; this is just the
+  // specific entry-price timing rationale, when it exists), so it renders into its own
+  // slot right after whyBoughtHtml rather than replacing it.
+  const buyReasoningHtml = whyBoughtHtml + '<div id="posBuyReasoning"></div>';
 
   document.getElementById('reportContent').innerHTML = `
     <h2 style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
@@ -3930,7 +3963,7 @@ async function showPositionDetail(ticker) {
     const brDiv = document.getElementById('posBuyReasoning');
     if (brDiv && data.ai_entry_reasoning) {
       brDiv.innerHTML = `<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin:14px 0;">
-        <div style="font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Why This Was Bought</div>
+        <div style="font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">AI-Recommended Entry Timing</div>
         <div style="font-size:12.5px;color:var(--text-secondary);line-height:1.6;">
           ${data.ai_entry_price != null ? `AI-recommended entry <strong style="color:var(--text-primary)">$${Number(data.ai_entry_price).toFixed(2)}</strong> — ` : ''}${data.ai_entry_reasoning}
         </div>
