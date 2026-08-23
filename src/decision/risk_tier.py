@@ -151,18 +151,53 @@ RISK_TIER_DOTKEYS = {
 }
 
 
-def apply_risk_tier_to_settings(coerced_values: dict, anchors: dict) -> dict:
-    """If a /api/settings payload's already-coerced values include "risk_tier.value",
-    computes the 11 real factor values at that tier and merges them into a NEW dict
-    (the input is never mutated), overwriting any of the same dotkeys the payload
-    already had -- the slider move is the explicit action being applied, so it wins
-    over whatever the browser's individual fields happened to hold at submit time.
+def apply_risk_tier_to_settings(
+    coerced_values: dict, anchors: dict, current_tier_value: float | None = None,
+) -> dict:
+    """If a /api/settings payload's already-coerced values include "risk_tier.value"
+    AND that value genuinely differs from current_tier_value (the tier value
+    already stored, before this save), computes the 11 real factor values at that
+    tier and merges them into a NEW dict (the input is never mutated), overwriting
+    any of the same dotkeys the payload already had -- the slider move is the
+    explicit action being applied, so it wins over whatever the browser's
+    individual fields happened to hold at submit time.
+
+    Real live incident, 2026-08-23 -- the risk-tier slider is one of every
+    settings page's <input class="setting-input"> elements, so its current value
+    is included in literally EVERY settings save, whether or not the caller
+    touched it. Before this current_tier_value comparison existed,
+    "risk_tier.value" being present in coerced_values (which it always was) was
+    treated as "the slider was moved," so any unrelated save silently recomputed
+    and overwrote 8 real trading fields back to the tier's own values every
+    time -- confirmed live: this program's own real conviction gate drifted from
+    the owner's actual 6.2 to the tier-40-computed 6.5 this way after an
+    unrelated settings save. current_tier_value defaults to None (never equal to
+    a real submitted float) so every existing caller that doesn't pass it keeps
+    the original always-apply behavior.
+
     Returns the input dict unchanged (same contents) when "risk_tier.value" isn't
-    present, so a plain settings save that never touches the slider is a no-op here."""
+    present, or hasn't genuinely changed, so a plain settings save that never
+    touches the slider is a true no-op here."""
     if "risk_tier.value" not in coerced_values:
+        return coerced_values
+    if coerced_values["risk_tier.value"] == current_tier_value:
         return coerced_values
     computed = compute_risk_tier_settings(coerced_values["risk_tier.value"], anchors)
     result = dict(coerced_values)
     for factor_key, dotkey in RISK_TIER_DOTKEYS.items():
         result[dotkey] = computed[factor_key]
+    return result
+
+
+def restore_anchors_to_settings(coerced_values: dict, anchors: dict) -> dict:
+    """Restores the 11 real factor dotkeys to their anchor values, merged into a NEW
+    dict (the input is never mutated) -- used when risk_tier.mode switches from
+    "auto" to "manual". Per explicit owner direction, leaving auto mode must restore
+    the program's real original settings, never a hardcoded factory default; the
+    anchors ARE that original baseline (captured once, at the moment this program's
+    risk-tier feature was first seeded -- see compute_risk_tier_settings's own
+    docstring), so restoring to them is restoring the owner's own prior values."""
+    result = dict(coerced_values)
+    for factor_key, dotkey in RISK_TIER_DOTKEYS.items():
+        result[dotkey] = anchors[factor_key]
     return result

@@ -299,6 +299,21 @@ input[type=time].setting-input { font-family: monospace; }
   color: var(--text-muted);
   margin-top: -4px;
 }
+.risk-tier-number {
+  width: 72px;
+  margin: 6px auto 0;
+  display: block;
+  padding: 4px 6px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.risk-tier-number:focus { outline: none; border-color: var(--accent); }
 .risk-tier-preview {
   width: 100%;
   margin-top: 10px;
@@ -400,13 +415,29 @@ input[type=time].setting-input { font-family: monospace; }
     <div class="settings-grid">
       <div class="setting-row">
         <div>
-          <div class="setting-label">Risk Tier <button type="button" class="info-btn" onclick="showInfo(event,'A single dial that scales the conviction gate, R/R gate, position sizing, stop-loss/take-profit widths, and portfolio circuit breakers together. Moving it and clicking Save overwrites the individual fields below to match — they stay independently editable afterward if you want to hand-tune one specific dial without moving everything else.')">i</button></div>
+          <div class="setting-label">Risk Tier Mode <button type="button" class="info-btn" onclick="showInfo(event,'Auto: moving the dial and clicking Save computes and applies the 8 factor settings below. Manual: those fields are entirely under your own control — saving never recomputes them from the dial, no matter where it is set. Switching Auto → Manual restores this program\'s real original pre-tier settings (never a hardcoded default). Switching Manual → Auto applies whatever the dial is currently set to.')">i</button></div>
+          <div class="setting-desc">Auto computes the fields below from the dial; Manual leaves them entirely up to you.</div>
+        </div>
+        <div>
+          <select class="setting-input" name="risk_tier.mode" id="risk_tier_mode" onchange="onRiskTierModeChange(this.value)">
+            <option value="auto" {% if cfg.risk_tier.mode != 'manual' %}selected{% endif %}>Auto</option>
+            <option value="manual" {% if cfg.risk_tier.mode == 'manual' %}selected{% endif %}>Manual</option>
+          </select>
+        </div>
+        <div class="default-label">default<br><span class="default-val">auto</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Risk Tier <button type="button" class="info-btn" onclick="showInfo(event,'A single dial that scales the conviction gate, R/R gate, position sizing, stop-loss/take-profit widths, and portfolio circuit breakers together. Only applied on Save while Risk Tier Mode is Auto — in Manual mode this still previews what the dial would produce, but Save leaves the individual fields below untouched.')">i</button></div>
           <div class="setting-desc"><span id="riskTierLabel">Medium (40)</span></div>
         </div>
         <div>
           <input type="range" class="setting-input" name="risk_tier.value"
                  id="risk_tier_value" value="{{ cfg.risk_tier.value }}"
                  min="0" max="100" step="1" oninput="onRiskTierSlide(this.value)">
+          <input type="number" id="risk_tier_value_number" value="{{ cfg.risk_tier.value }}"
+                 min="0" max="100" step="0.1" class="risk-tier-number"
+                 oninput="onRiskTierNumberInput(this.value)">
           <div class="risk-tier-ticks"><span>Low</span><span>Med</span><span>High</span></div>
         </div>
         <div class="default-label">default<br><span class="default-val">40</span></div>
@@ -1512,16 +1543,34 @@ function showToast(msg, type) {
 let riskTierPreviewTimer = null;
 
 function onRiskTierSlide(value) {
+  const numEl = document.getElementById('risk_tier_value_number');
+  if (numEl) numEl.value = value;
   clearTimeout(riskTierPreviewTimer);
   riskTierPreviewTimer = setTimeout(() => fetchRiskTierPreview(value), 150);
 }
 
-async function fetchRiskTierPreview(value) {
+function onRiskTierNumberInput(value) {
+  const v = Math.max(0, Math.min(100, parseFloat(value) || 0));
+  const sliderEl = document.getElementById('risk_tier_value');
+  if (sliderEl) sliderEl.value = v;
+  clearTimeout(riskTierPreviewTimer);
+  riskTierPreviewTimer = setTimeout(() => fetchRiskTierPreview(v), 150);
+}
+
+function onRiskTierModeChange(mode) {
+  const el = document.getElementById('risk_tier_value');
+  fetchRiskTierPreview(el ? el.value : 50, mode);
+}
+
+async function fetchRiskTierPreview(value, modeOverride) {
   try {
     const resp = await fetch(`/api/risk-tier-preview?value=${value}`);
     if (!resp.ok) return;
     const p = await resp.json();
-    document.getElementById('riskTierLabel').textContent = `${p.label} (${value})`;
+    const modeEl = document.getElementById('risk_tier_mode');
+    const mode = modeOverride || (modeEl ? modeEl.value : 'auto');
+    const suffix = mode === 'manual' ? ' — preview only, mode is Manual' : '';
+    document.getElementById('riskTierLabel').textContent = `${p.label} (${value})${suffix}`;
     document.getElementById('rtpConviction').textContent = p.min_conviction_score.toFixed(1);
     document.getElementById('rtpRr').textContent = p.min_risk_reward_ratio.toFixed(2) + ':1';
     document.getElementById('rtpPosition').textContent = p.starting_position_pct.toFixed(1) + '%';

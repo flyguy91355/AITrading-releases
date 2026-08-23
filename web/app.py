@@ -82,6 +82,7 @@ from src.decision.portfolio import Portfolio
 from src.decision.risk_tier import (
     apply_risk_tier_to_settings,
     compute_risk_tier_settings,
+    restore_anchors_to_settings,
     risk_tier_label,
     RISK_TIER_DOTKEYS,
 )
@@ -7548,6 +7549,12 @@ async def settings_page():
     )
 
 
+def _coerce_risk_tier_mode(v: str) -> str:
+    if v not in ("auto", "manual"):
+        raise ValueError(f"must be 'auto' or 'manual', got {v!r}")
+    return v
+
+
 def _coerce_settings_payload(payload: dict, coercions: dict) -> dict:
     """Validates/coerces every COERCIONS-covered key in a /api/settings payload and
     returns the coerced values as a plain dict -- WITHOUT mutating anything itself
@@ -7593,6 +7600,7 @@ async def save_settings(payload: dict):
         "portfolio.max_positions": int,
         "portfolio.initial_capital": float,
         "risk_tier.value": float,
+        "risk_tier.mode": _coerce_risk_tier_mode,
         "risk_management.max_position_pct": float,
         "risk_management.starting_position_pct": float,
         "risk_management.min_cash_reserve_pct": float,
@@ -7685,18 +7693,42 @@ async def save_settings(payload: dict):
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail=str(e))
 
-    if "risk_tier.value" in coerced_values:
-        _risk_tier_anchors = state.config.get("risk_tier", {}).get("anchors", {})
-        coerced_values = apply_risk_tier_to_settings(coerced_values, _risk_tier_anchors)
-        # The _rm_map resync block below reads directly from `payload`, not
-        # `coerced_values` -- write the freshly tier-computed values back into
-        # `payload` too so that block picks up the real numbers instead of whatever
-        # stale value the browser's own (un-updated) form fields held at submit time.
-        # See CLAUDE.md's "Risk-Tier Slider" section for the full incident this
-        # avoids (found during implementation planning, not a live bug).
-        for _dotkey in RISK_TIER_DOTKEYS.values():
-            if _dotkey in coerced_values:
-                payload[_dotkey] = str(coerced_values[_dotkey])
+    _risk_tier_anchors = state.config.get("risk_tier", {}).get("anchors", {})
+    _current_tier_value = state.config.get("risk_tier", {}).get("value")
+    _current_tier_mode = state.config.get("risk_tier", {}).get("mode", "auto")
+    _new_tier_mode = coerced_values.get("risk_tier.mode", _current_tier_mode)
+
+    if _new_tier_mode != _current_tier_mode:
+        # The mode itself just changed -- this is the explicit action, so it always
+        # applies regardless of whether risk_tier.value also happened to change.
+        if _new_tier_mode == "manual":
+            # Leaving auto mode must restore the program's real pre-tier settings,
+            # never a hardcoded default (explicit owner direction) -- the anchors
+            # ARE that real baseline.
+            coerced_values = restore_anchors_to_settings(coerced_values, _risk_tier_anchors)
+        else:
+            # Entering auto mode applies whatever the dial is currently set to,
+            # even if that value itself didn't change on this save.
+            coerced_values = apply_risk_tier_to_settings(
+                coerced_values, _risk_tier_anchors, current_tier_value=None,
+            )
+    elif _new_tier_mode == "auto" and "risk_tier.value" in coerced_values:
+        coerced_values = apply_risk_tier_to_settings(
+            coerced_values, _risk_tier_anchors, current_tier_value=_current_tier_value,
+        )
+    # else: mode is "manual" and unchanged -- the 8 factor fields are entirely
+    # owner-controlled; never recomputed here regardless of risk_tier.value.
+
+    # The _rm_map resync block below reads directly from `payload`, not
+    # `coerced_values` -- write any freshly tier-computed/restored values back into
+    # `payload` too so that block picks up the real numbers instead of whatever
+    # stale value the browser's own (un-updated) form fields held at submit time.
+    # See CLAUDE.md's "Risk-Tier Slider" section for the full incident this
+    # avoids (found during implementation planning, not a live bug), and the
+    # 2026-08-23 Auto/Manual mode addition for the overwrite-on-every-save fix.
+    for _dotkey in RISK_TIER_DOTKEYS.values():
+        if _dotkey in coerced_values:
+            payload[_dotkey] = str(coerced_values[_dotkey])
 
     for dotkey, value in coerced_values.items():
         section, key = dotkey.split(".", 1)
