@@ -167,6 +167,19 @@ h1 {
 .setting-input.changed { border-color: var(--yellow); }
 select.setting-input { text-align: left; cursor: pointer; }
 input[type=time].setting-input { font-family: monospace; }
+.setting-input.tier-locked {
+  background: var(--border);
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.tier-lock-note {
+  display: block;
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 600;
+  margin-top: 2px;
+}
 .default-label {
   font-size: 11px;
   color: var(--text-muted);
@@ -1518,7 +1531,15 @@ document.querySelectorAll('.setting-input').forEach(el => {
 const DEFAULT_UNIVERSE = ['S&P 500', 'S&P 400', 'S&P 600', 'Nasdaq 100', 'Dow Jones 30'];
 function resetChanges() {
   if (!confirm('Reset all settings to factory defaults? This will overwrite your custom values — you will still need to click Save to make it permanent.')) return;
+  // 2026-08-23: while a field is tier-locked (Auto mode), leave its value alone here --
+  // writing a factory default straight into it, then saving with the dial's own value
+  // unchanged, would silently override the dial's real computed number with a stale
+  // default the moment Save is clicked (mode/value both unchanged means
+  // apply_risk_tier_to_settings never re-fires to correct it). Switch to Manual first
+  // if you want Reset to actually touch these.
+  const isAutoNow = document.getElementById('risk_tier_mode')?.value !== 'manual';
   document.querySelectorAll('.setting-input').forEach(el => {
+    if (isAutoNow && RISK_TIER_LOCKED_FIELDS.includes(el.name)) return;
     if (el.type === 'checkbox') {
       el.checked = el.name in DEFAULTS ? DEFAULTS[el.name] : originals[el.name];
     } else if (el.name in DEFAULTS) {
@@ -1560,6 +1581,53 @@ function onRiskTierNumberInput(value) {
 function onRiskTierModeChange(mode) {
   const el = document.getElementById('risk_tier_value');
   fetchRiskTierPreview(el ? el.value : 50, mode);
+  applyRiskTierLockState();
+}
+
+// The 8 real fields the Risk Tier dial computes and applies in Auto mode (11 dotkeys
+// -- t1/t2/t3 count as 3 since they scale together) -- mirrors RISK_TIER_DOTKEYS'
+// values in src/decision/risk_tier.py exactly. 2026-08-23, owner request: these need
+// to visibly (and actually) lock in Auto mode so it's never ambiguous which value is
+// really in effect -- previously they looked identically editable in both modes even
+// though an edit here only sticks in Auto mode until the next time the dial itself
+// moves. Built and verified on AIShortTrading first.
+const RISK_TIER_LOCKED_FIELDS = [
+  'research.min_conviction_score',
+  'research.min_risk_reward_ratio',
+  'risk_management.starting_position_pct',
+  'risk_management.max_loss_per_trade_pct',
+  'take_profit.stop_loss_pct',
+  'take_profit.t1_pct',
+  'take_profit.t2_pct',
+  'take_profit.t3_pct',
+  'risk_management.min_cash_reserve_pct',
+  'risk_management.drawdown_halt_pct',
+  'risk_management.daily_loss_limit_pct',
+];
+
+function applyRiskTierLockState() {
+  const modeEl = document.getElementById('risk_tier_mode');
+  const isAuto = !modeEl || modeEl.value !== 'manual';
+  RISK_TIER_LOCKED_FIELDS.forEach(name => {
+    const input = document.querySelector(`.setting-input[name="${name}"]`);
+    if (!input) return;
+    input.disabled = isAuto;
+    input.classList.toggle('tier-locked', isAuto);
+    const row = input.closest('.setting-row');
+    const descEl = row ? row.querySelector('.setting-desc') : null;
+    if (!descEl) return;
+    let note = descEl.querySelector('.tier-lock-note');
+    if (isAuto) {
+      if (!note) {
+        note = document.createElement('span');
+        note.className = 'tier-lock-note';
+        note.textContent = '🔒 Auto-controlled by Risk Tier — switch to Manual to edit';
+        descEl.appendChild(note);
+      }
+    } else if (note) {
+      note.remove();
+    }
+  });
 }
 
 async function fetchRiskTierPreview(value, modeOverride) {
@@ -1590,6 +1658,7 @@ async function fetchRiskTierPreview(value, modeOverride) {
 document.addEventListener('DOMContentLoaded', () => {
   const el = document.getElementById('risk_tier_value');
   if (el) fetchRiskTierPreview(el.value);
+  applyRiskTierLockState();
 });
 
 async function saveSettings() {
