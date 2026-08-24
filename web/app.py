@@ -9844,6 +9844,20 @@ async def manual_buy(payload: dict):
         take_profit_targets=targets,
     )
 
+    # Sector populated here (fixed 2026-08-24, GitHub #79) -- without a real sector,
+    # check_sector_concentration()'s own `if not sector: return True` early-out always
+    # passes, silently letting a manual buy bypass the sector cap the automated On Deck
+    # path already enforces (GitHub #42). Same real, cheap (no Claude call) lookup
+    # analyze_stock() itself uses, same fail-open-on-fetch-error pattern already
+    # established at _run_sma_trend_scan's own get_financials call site -- a data-fetch
+    # hiccup must not hard-block a manual buy, it just falls back to today's unchecked
+    # behavior for that one request.
+    try:
+        financials = await state.market_data.get_financials(ticker)
+        report.sector = getattr(financials, "sector", "") or ""
+    except Exception:
+        pass
+
     if not state.risk_manager.check_all_rules(report, state.portfolio):
         raise HTTPException(status_code=400, detail="Trade rejected by risk management (cash reserve, sector limits, or drawdown rules)")
 
