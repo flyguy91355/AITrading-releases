@@ -107,7 +107,7 @@ from src.execution.broker import OrderStatus
 from src.reporting.trade_logger import TradeLogger
 from src.utils.watchlist_manager import WatchlistManager
 from src.data.stock_universe import get_universe
-from src.analytics.composition_benchmark import weighted_daily_return
+from src.analytics.composition_benchmark import weighted_daily_return, is_usable_price
 from src.update.version import read_local_version, write_local_version, is_newer
 from src.update.release_client import fetch_latest_release, fetch_recent_releases
 from src.update.apply import extract_release_archive, copy_updatable_files, requirements_changed
@@ -8791,14 +8791,16 @@ async def get_stock_chart(ticker: str):
     manual Deep Dive modal.  Works for any ticker the owner types, not just held
     positions.  ref_lines come from the most-recent cached research report when one
     exists, so entry/stop/TP/fair-value price lines show up automatically."""
-    import math as _math
-
     import yfinance as yf
 
     def _fin(v):
         """Return None for NaN/Inf (yfinance occasionally returns these); otherwise v.
-        JSON cannot serialize NaN — a single bad bar crashes the whole endpoint with 500."""
-        return None if (v is None or (isinstance(v, float) and not _math.isfinite(v))) else v
+        JSON cannot serialize NaN — a single bad bar crashes the whole endpoint with 500.
+        Uses the shared is_usable_price guard (2026-08-24, GitHub #85) -- this function
+        already used the correct, stricter isfinite condition (unlike the other 2
+        drifted NaN-only guards this codebase had), so this is a consolidation onto the
+        shared helper, not a behavior fix, for this one call site specifically."""
+        return v if is_usable_price(v) else None
 
     ticker = ticker.upper()
     try:
@@ -9226,13 +9228,15 @@ def _live_holdings_value() -> dict:
     hardening added 2026-07-29 after a live NoneType*float TypeError was
     caught here in production (non-fatal, already wrapped in the caller's
     own try/except, but this stops one bad position from blocking every
-    other position's legitimate contribution)."""
+    other position's legitimate contribution). Uses the shared
+    is_usable_price guard (2026-08-24, GitHub #85) -- this used to be its own
+    isnan-only check with no Infinity guard, independently drifted from the 2
+    other NaN/Infinity guards this codebase had (composition_benchmark.py's
+    own trio, and get_stock_chart's _fin())."""
     holdings_value = {}
     for t, pos in state.portfolio.positions.items():
         shares, price = pos.shares, pos.current_price
-        if (shares is None or price is None
-                or (isinstance(shares, float) and math.isnan(shares))
-                or (isinstance(price, float) and math.isnan(price))):
+        if not is_usable_price(shares) or not is_usable_price(price):
             logger.warning(
                 "_live_holdings_value: skipping %s -- shares=%r current_price=%r", t, shares, price)
             continue

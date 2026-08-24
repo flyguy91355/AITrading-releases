@@ -209,6 +209,27 @@ def weighted_intraday_series(
     return series
 
 
+def is_usable_price(value) -> bool:
+    """True only for a real, finite number -- rejects None, NaN, +/-Infinity, and
+    any non-numeric value alike (extracted 2026-08-24, GitHub #85 -- single shared
+    guard replacing 3 independently-drifted "is this price/share value usable"
+    checks: this module's own carry_forward_price/seed_last_known_prices/
+    has_real_close, all isnan-only; web/app.py's _live_holdings_value, also
+    isnan-only with no Infinity guard; and web/app.py's _fin(), which already used
+    isfinite -- the stricter, correct condition this shared helper standardizes
+    on). math.isnan alone lets a float('inf')/float('-inf') straight through,
+    which this codebase has no defense against without this guard -- confirmed
+    live (2026-07-29) that a NaN price from yfinance can silently poison an
+    entire day's composition-benchmark computation; an Infinity value would be
+    just as capable of corrupting a downstream sum, undetected by 2 of the 3
+    old guards."""
+    if isinstance(value, bool):
+        return False  # bool is a subclass of int -- never a real price/share value
+    if not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
 def carry_forward_price(
     ticker: str, date: str, closes_by_ticker: dict[str, dict[str, float]],
     last_known: dict[str, float],
@@ -224,7 +245,7 @@ def carry_forward_price(
     (a single NaN ticker corrupts that whole day's total portfolio value and
     therefore every position's composition weight, not just its own)."""
     price = closes_by_ticker.get(ticker, {}).get(date)
-    if price is not None and not math.isnan(price):
+    if is_usable_price(price):
         last_known[ticker] = price
         return price
     return last_known.get(ticker)
@@ -247,7 +268,7 @@ def seed_last_known_prices(
         candidates = sorted(d for d in by_date if d < before_date)
         for d in reversed(candidates):
             price = by_date[d]
-            if price is not None and not math.isnan(price):
+            if is_usable_price(price):
                 seeded[symbol] = price
                 break
     return seeded
@@ -261,5 +282,4 @@ def has_real_close(symbol: str, date: str, closes_by_symbol: dict[str, dict[str,
     (2026-07-29 finding) -- it must be marked provisional so a later backfill
     run knows to recompute it once the real data is published, rather than
     permanently freezing in a placeholder value."""
-    price = closes_by_symbol.get(symbol, {}).get(date)
-    return price is not None and not math.isnan(price)
+    return is_usable_price(closes_by_symbol.get(symbol, {}).get(date))
