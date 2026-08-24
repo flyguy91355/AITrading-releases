@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import yfinance as yf
 
+from src.research.market_cap import market_cap_tier_label
+
 
 SECTOR_PEERS = {
     "AAPL": ["MSFT", "GOOGL", "SAMSUNG"],
@@ -71,18 +73,24 @@ class CompetitorAnalyzer:
             summary=" ".join(summary_parts),
         )
 
+    # Position phrases keyed off market_cap_tier_label's own shared tiers (fixed
+    # 2026-08-24, GitHub #82) -- this used to have its own independent 6-tier
+    # boundary set that drifted from engine.py's _market_cap_tier_label despite a
+    # docstring there claiming they matched: the same $15B company was "large-cap"
+    # in one and "mid-cap contender" in the other. Now both are always driven by
+    # the same underlying tier, so they can't disagree on which bucket a company
+    # falls into again -- only the descriptive wording differs by design.
+    _POSITION_PHRASES = {
+        "mega-cap": "dominant mega-cap leader",
+        "large-cap": "major large-cap player",
+        "mid-cap": "mid-cap contender",
+        "small-cap": "small/micro-cap niche player",
+        "": "unclassified-cap",
+    }
+
     def _assess_position(self, market_cap: float, info: dict) -> str:
-        if market_cap >= 1_000_000_000_000:
-            return "dominant mega-cap leader"
-        if market_cap >= 200_000_000_000:
-            return "major large-cap player"
-        if market_cap >= 50_000_000_000:
-            return "established large-cap"
-        if market_cap >= 10_000_000_000:
-            return "mid-cap contender"
-        if market_cap >= 2_000_000_000:
-            return "small-cap competitor"
-        return "micro/small-cap niche player"
+        tier = market_cap_tier_label(market_cap)
+        return self._POSITION_PHRASES[tier]
 
     def _assess_moat(self, info: dict) -> tuple[str, float]:
         score = 5.0

@@ -20,6 +20,7 @@ from src.research.fundamental import FundamentalAnalyzer
 from src.research.sentiment import SentimentAnalyzer
 from src.research.insider_analysis import InsiderAnalyzer
 from src.research.competitor import CompetitorAnalyzer
+from src.research.market_cap import market_cap_tier_label as _market_cap_tier_label
 from src.decision.risk_tier import build_risk_tier_prompt_section
 
 logger = logging.getLogger(__name__)
@@ -450,28 +451,6 @@ def _build_market_context_section(market_change_pct: float | None) -> str:
         f"buy. On a broadly down market, be more selective and cautious, since risk is "
         f"elevated market-wide.\n"
     )
-
-
-def _market_cap_tier_label(market_cap: float) -> str:
-    """Human-readable size tier for a market cap in dollars (2026-08-04, "billion dollar
-    stock" discussion) -- feeds recommend_dip_entry's staleness judgment, which previously
-    had zero information about company size and applied the same generic "is this many
-    days stale" instinct to a small volatile stock and a stable mega-cap alike. A large,
-    steady company's support/resistance levels reasonably persist longer than a small
-    volatile one's -- this gives Claude the context to calibrate for that instead of
-    guessing. Same bucket boundaries CompetitorAnalyzer._assess_position already uses
-    (src/research/competitor.py) for consistency across the codebase. Returns "" for a
-    non-positive/unknown market cap so the caller can omit the context line entirely
-    rather than asserting a tier it has no real data for."""
-    if market_cap <= 0:
-        return ""
-    if market_cap >= 200_000_000_000:
-        return "mega-cap"
-    if market_cap >= 10_000_000_000:
-        return "large-cap"
-    if market_cap >= 2_000_000_000:
-        return "mid-cap"
-    return "small-cap"
 
 
 def _build_sma_trend_section(
