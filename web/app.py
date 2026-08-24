@@ -6923,6 +6923,13 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             "margin_of_safety_pct": report.margin_of_safety_pct,
             "generated_at": report.generated_at.isoformat(),
             "source": source,
+            # Fixed 2026-08-24, GitHub #81 -- without this key, every d.get("is_fallback",
+            # False) read against this cached dict elsewhere (e.g.
+            # _backfill_on_deck_from_on_shore's admission filter) always fell through to
+            # the default False regardless of the real report, making that guard a
+            # permanent no-op. Currently masked there by two other, unrelated filters in
+            # the same admission check, but a real dead-guard gap otherwise.
+            "is_fallback": getattr(report, "is_fallback", False),
         }
         self.research_reports[report.ticker] = report_data
         asyncio.create_task(self.broadcast({"type": "report", "report": report_data}))
