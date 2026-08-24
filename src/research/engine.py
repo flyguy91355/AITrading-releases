@@ -768,10 +768,8 @@ class ResearchEngine:
         market_change_pct = await self.market_data.get_market_change_pct()
         market_context_section = _build_market_context_section(market_change_pct)
         _risk_tier_cfg = self.config.get("risk_tier", {})
-        risk_tier_section = (
-            build_risk_tier_prompt_section(_risk_tier_cfg.get("value", 50.0))
-            if _risk_tier_cfg.get("mode", "auto") != "manual" else ""
-        )
+        risk_tier_section = build_risk_tier_prompt_section(
+            _risk_tier_cfg.get("value", 50.0), mode=_risk_tier_cfg.get("mode", "auto"))
         cap_tier = _market_cap_tier_label(market_cap) if market_cap else ""
         cap_line = f"\nCompany size: {cap_tier} (~${market_cap/1e9:.1f}B market cap)" if cap_tier else ""
         peak_age_line = (f"Recent peak (before the dip): ${peak:.2f}, {peak_days_ago:.1f} day(s) ago"
@@ -1329,7 +1327,13 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         its posture as the portfolio's "current risk tier" would hand Claude a framing
         that can actively contradict whatever the owner has actually hand-set the real
         gates to -- omitting it avoids that, same graceful-omission pattern every
-        other optional section here already uses."""
+        other optional section here already uses. The gate itself now lives inside
+        build_risk_tier_prompt_section (fixed 2026-08-24, GitHub #86) -- it used to
+        be a separate inline ternary here, independently duplicated from an
+        identical one in recommend_dip_entry, the exact shape that let the
+        2026-08-23 fix above miss a call site until it was audited; passing `mode=`
+        through gets this guard for free rather than relying on every caller
+        remembering to write it."""
         tp_cfg = self.config.get("take_profit", {})
         research_cfg = self.config.get("research", {})
         _risk_tier_cfg = self.config.get("risk_tier", {})
@@ -1401,10 +1405,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             long_term_trend_section=_build_long_term_trend_section(long_term_trend_summary),
             user_note_section=_build_user_note_section(user_note_summary),
             market_context_section=_build_market_context_section(market_change_pct),
-            risk_tier_section=(
-                build_risk_tier_prompt_section(risk_tier_value)
-                if risk_tier_mode != "manual" else ""
-            ),
+            risk_tier_section=build_risk_tier_prompt_section(risk_tier_value, mode=risk_tier_mode),
             analysis_history_section=_build_analysis_history_section(analysis_history_summary),
             sma_trend_section=sma_trend_section,
             stop_tp_instructions=stop_tp_instructions,

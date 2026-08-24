@@ -120,13 +120,32 @@ _RISK_TIER_POSTURES = {
 }
 
 
-def build_risk_tier_prompt_section(tier_value: float) -> str:
+def build_risk_tier_prompt_section(tier_value: float, mode: str = "auto") -> str:
     """The AI-facing framing half of the risk-tier feature -- tells Claude directly
     what risk posture this portfolio is operating under, alongside the mechanical
     gate/sizing numbers compute_risk_tier_settings already changes. See
     _RISK_TIER_POSTURES for the owner-directed interpretive lean at each bucket
     (mirrors _build_market_context_section's own "give real data + explicit framing,
-    trust Claude's judgment" pattern in src/research/engine.py)."""
+    trust Claude's judgment" pattern in src/research/engine.py).
+
+    The Manual-mode gate lives here now, not at each caller (fixed 2026-08-24,
+    GitHub #86) -- it used to be an independent inline ternary
+    (`... if risk_tier_cfg.get("mode", "auto") != "manual" else ""`) written
+    separately at each of the 2 real call sites in engine.py, the exact
+    duplicated-check shape that already caused a real incident (2026-08-23:
+    "AI framing ignored Manual mode entirely until fixed," patched as 2
+    independent inline fixes rather than folded into one shared gate). In
+    Manual mode the dial is deliberately disconnected from the real settings
+    (see apply_risk_tier_to_settings/restore_anchors_to_settings below), so
+    presenting its posture as the portfolio's "current risk tier" would hand
+    Claude a framing that can actively contradict whatever the owner has
+    actually hand-set the real gates to -- an empty string omits the section
+    entirely, the same graceful-omission pattern every other optional prompt
+    section in this codebase already uses, rather than describing it as
+    inactive. Every caller now gets this guard for free instead of having to
+    remember to add it -- including any future one."""
+    if mode == "manual":
+        return ""
     label = risk_tier_label(tier_value)
     t = max(0.0, min(100.0, tier_value))
     return (
