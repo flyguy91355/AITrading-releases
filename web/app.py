@@ -149,13 +149,13 @@ def _get_or_init_account_genesis(today_str: str) -> str:
     real go-live date with zero manual configuration. `today_str` is passed in
     (rather than computed here) so this stays testable without mocking the clock."""
     try:
-        existing = _ACCOUNT_GENESIS_PATH.read_text().strip()
+        existing = _ACCOUNT_GENESIS_PATH.read_text(encoding="utf-8").strip()
         if existing:
             return existing
     except FileNotFoundError:
         pass
     _ACCOUNT_GENESIS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _ACCOUNT_GENESIS_PATH.write_text(today_str)
+    _ACCOUNT_GENESIS_PATH.write_text(today_str, encoding="utf-8")
     return today_str
 
 # The Watchlist-removal redesign (2026-07-17, see CLAUDE.md) completely replaced the
@@ -8379,11 +8379,11 @@ async def apply_update():
 
             old_requirements_path = Path(_INSTALL_ROOT) / "requirements.txt"
             old_requirements = (
-                old_requirements_path.read_text() if old_requirements_path.exists() else ""
+                old_requirements_path.read_text(encoding="utf-8") if old_requirements_path.exists() else ""
             )
             new_requirements_path = Path(extracted_root) / "requirements.txt"
             new_requirements = (
-                new_requirements_path.read_text() if new_requirements_path.exists() else old_requirements
+                new_requirements_path.read_text(encoding="utf-8") if new_requirements_path.exists() else old_requirements
             )
             needs_pip_install = requirements_changed(old_requirements, new_requirements)
 
