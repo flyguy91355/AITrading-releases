@@ -118,26 +118,32 @@ def _format_sell_analysis_summary(rows: list[dict]) -> str:
 def _format_analysis_history_summary(ticker: str, rows: list[tuple]) -> str:
     """Formats every past real analysis for this ticker into a compact, chronological
     summary for _build_analysis_history_section (2026-08-21, "Analysis History"
-    feed-forward feature -- owner request, see that function's own docstring in
-    src/research/engine.py). Each row is (generated_at, conviction_score, signal,
-    entry_price, fair_value_estimate, watch_condition), the exact column order of
-    "SELECT generated_at, conviction_score, signal, entry_price, fair_value_estimate,
-    watch_condition FROM analysis_history WHERE ticker = ? ORDER BY generated_at".
-    Deliberately includes ALL history the caller passes in (per owner direction: "make
-    sure to prompt ai to use those previous (I think all) analysys"), not a capped
-    recent window -- each line is kept compact specifically so a long history still
-    stays a reasonable prompt size. Returns an empty string for a ticker with no
-    history at all -- callers must treat that as "omit this section entirely"."""
+    feed-forward feature; extended 2026-08-24 for the SMA Trend-Confirmation Track
+    design, ported from AIShortTrading). Each row is (generated_at, conviction_score,
+    signal, entry_price, fair_value_estimate, watch_condition, sma_relationship,
+    trend_confirms_entry), the exact column order of get_analysis_history_summary's
+    SELECT. sma_relationship/trend_confirms_entry are None for any Track 1-only row
+    (the vast majority) -- omitted from that row's line entirely, not shown as
+    "None". Deliberately includes ALL history the caller passes in (per owner
+    direction: "make sure to prompt ai to use those previous (I think all)
+    analysys"), not a capped recent window -- each line is kept compact specifically
+    so a long history still stays a reasonable prompt size. Returns an empty string
+    for a ticker with no history at all -- callers must treat that as "omit this
+    section entirely"."""
     if not rows:
         return ""
     lines = [f"Prior analysis history on {ticker} (chronological):"]
-    for generated_at, conviction_score, signal, entry_price, fair_value_estimate, watch_condition in rows:
+    for (generated_at, conviction_score, signal, entry_price, fair_value_estimate,
+         watch_condition, sma_relationship, trend_confirms_entry) in rows:
         date = generated_at.split("T")[0] if generated_at else "unknown date"
         line = f"- {date}: {signal}, conviction {conviction_score:.1f}/10"
         if entry_price:
             line += f", entry ${entry_price:.2f}"
         if fair_value_estimate:
             line += f", fair value ${fair_value_estimate:.2f}"
+        if sma_relationship:
+            confirmed = "confirmed" if trend_confirms_entry else "not confirmed"
+            line += f", SMA {sma_relationship} ({confirmed})"
         line += f" — watch: {watch_condition}" if watch_condition else " — no watch condition stated"
         lines.append(line)
     return "\n".join(lines)
@@ -540,6 +546,23 @@ class Portfolio:
             )
         """)
         await self._db.commit()
+
+        # sma_relationship / trend_confirms_entry (2026-08-24, SMA Trend-Confirmation
+        # Track design, ported from AIShortTrading) -- captures the SMA50/SMA200
+        # relationship and the AI's trend_confirms_entry judgment at the time of a
+        # Track 2 analysis. Existing rows (and every Track 1 row, which never passes
+        # these) get NULL on both -- same "NULL = predates this feature / not
+        # applicable" convention as every other nullable column here.
+        async with self._db.execute("PRAGMA table_info(analysis_history)") as cur:
+            _ah_cols = {row[1] for row in await cur.fetchall()}
+        if "sma_relationship" not in _ah_cols:
+            await self._db.execute("ALTER TABLE analysis_history ADD COLUMN sma_relationship TEXT")
+            await self._db.commit()
+            logger.info("Migrated analysis_history: added sma_relationship column")
+        if "trend_confirms_entry" not in _ah_cols:
+            await self._db.execute("ALTER TABLE analysis_history ADD COLUMN trend_confirms_entry INTEGER")
+            await self._db.commit()
+            logger.info("Migrated analysis_history: added trend_confirms_entry column")
 
         # Migrate existing INTEGER shares columns to REAL so fractional shares are preserved
         for table in ("positions", "trade_history"):
@@ -955,6 +978,7 @@ class Portfolio:
     async def save_analysis_history(
         self, ticker: str, generated_at: str, conviction_score: float, signal: str,
         entry_price: float | None, fair_value_estimate: float | None, watch_condition: str,
+        sma_relationship: str | None = None, trend_confirms_entry: bool | None = None,
     ) -> None:
         """Appends one row per real analysis (2026-08-21, "Analysis History"
         feed-forward feature) -- called by DashboardState._persist_report (web/app.py)
@@ -962,21 +986,29 @@ class Portfolio:
         this must never delay or block the real analysis flow it's recording. Never
         overwrites (unlike research_reports/reports_cache.json, which only ever keeps
         the LATEST report per ticker) -- the whole point is preserving the arc across
-        repeated analyses of the same recurring candidate."""
+        repeated analyses of the same recurring candidate.
+
+        sma_relationship/trend_confirms_entry (2026-08-24, SMA Trend-Confirmation
+        Track design, ported from AIShortTrading) are only ever non-None for a
+        Track 2 candidate -- every existing Track 1 call site omits them, storing
+        NULL, same as any pre-migration row."""
         if not self._db:
             return
         await self._db.execute(
             "INSERT INTO analysis_history "
             "(ticker, generated_at, conviction_score, signal, entry_price, "
-            "fair_value_estimate, watch_condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "fair_value_estimate, watch_condition, sma_relationship, trend_confirms_entry) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ticker, generated_at, conviction_score, signal, entry_price,
-             fair_value_estimate, watch_condition),
+             fair_value_estimate, watch_condition, sma_relationship,
+             None if trend_confirms_entry is None else int(trend_confirms_entry)),
         )
         await self._db.commit()
 
     async def get_analysis_history_summary(self, ticker: str) -> str:
         """Every past real analysis for this ticker, formatted as prompt context for
-        the NEXT analysis of the same ticker (2026-08-21) -- see
+        the NEXT analysis of the same ticker (2026-08-21; extended 2026-08-24 to
+        carry SMA Trend-Confirmation Track columns) -- see
         _format_analysis_history_summary's own docstring for the full design and why
         this deliberately includes ALL history, not a capped window. Fails open
         (returns "") on any DB error or if the DB hasn't been initialized yet, same as
@@ -987,7 +1019,8 @@ class Portfolio:
         try:
             async with self._db.execute(
                 "SELECT generated_at, conviction_score, signal, entry_price, "
-                "fair_value_estimate, watch_condition FROM analysis_history "
+                "fair_value_estimate, watch_condition, sma_relationship, "
+                "trend_confirms_entry FROM analysis_history "
                 "WHERE ticker = ? ORDER BY generated_at",
                 (ticker,),
             ) as cur:

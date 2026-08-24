@@ -119,6 +119,13 @@ class ResearchReport:
     # into the next analysis of the same ticker, so a stated "wait for X" isn't lost the
     # instant this report is overwritten by the next one.
     watch_condition: str = ""
+    # True only when this report came from a Track 2 (SMA Trend-Confirmation Track,
+    # 2026-08-24 design, ported from AIShortTrading) candidate AND Claude judged the
+    # SMA golden-cross signal a genuine, current, tradeable uptrend -- never assumed
+    # True on a missing/failed judgment (see _parse_json_bool's default=False below).
+    # Used by _track2_rr_override_applies (web/app.py) to decide whether this
+    # candidate can buy despite R/R falling short of its usual gate.
+    trend_confirms_entry: bool = False
 
 
 @dataclass
@@ -342,6 +349,7 @@ IMPORTANT RULES:
 - If a LONG-TERM TREND section is present below, weigh it explicitly: judge whether the current setup looks like a genuine fundamental turnaround versus a bounce back toward a level the stock has already failed at before.
 - If a PRIOR ANALYSIS HISTORY section is present below, use it: judge whether any previously-stated watch condition has since been met or invalidated, and let the arc across those past calls inform how you read the current setup — not just today's numbers in isolation.
 - If a RISK TIER section is present below, weigh it directly when judging conviction and position-sizing guidance: it states this portfolio's real, current risk posture, not a hypothetical. Manual mode omits this section entirely -- absence of it is not itself meaningful.
+- If an SMA TREND SIGNAL section is present below, judge whether it represents a genuine, current uptrend worth buying — this can justify a buy even when risk/reward doesn't fully clear the usual gate. Always answer trend_confirms_entry as false if that section is absent.
 
 STOCK: {ticker} — {company_name}
 CURRENT PRICE: ${current_price:.2f}
@@ -360,7 +368,7 @@ CURRENT PRICE: ${current_price:.2f}
 
 ── TECHNICAL CONTEXT ──
 {technical_summary}
-{market_context_section}{risk_tier_section}{long_term_trend_section}{analysis_history_section}{trade_history_section}{user_note_section}
+{market_context_section}{risk_tier_section}{long_term_trend_section}{sma_trend_section}{analysis_history_section}{trade_history_section}{user_note_section}
 Based on all of the above, provide your analysis as JSON with these exact fields:
 {{
     "conviction_score": <1-10, one decimal place, e.g. 7.3>,
@@ -377,7 +385,8 @@ Based on all of the above, provide your analysis as JSON with these exact fields
     "reasoning": "<detailed reasoning connecting all research dimensions>",
     "fair_value_estimate": <quick intrinsic value estimate as a number>,
     "margin_of_safety_pct": <percentage below fair value the current price represents — negative if overvalued>,
-    "watch_condition": "<a specific, concrete condition that would make this a better buying opportunity right now, e.g. a price level to wait for or an event to pass — empty string if the current setup needs no such condition>"
+    "watch_condition": "<a specific, concrete condition that would make this a better buying opportunity right now, e.g. a price level to wait for or an event to pass — empty string if the current setup needs no such condition>",
+    "trend_confirms_entry": <true only if an SMA TREND SIGNAL section is present above AND you judge it a genuine, current, tradeable uptrend — always false if that section is absent>
 }}
 
 Respond with ONLY the JSON object, no other text.
@@ -465,6 +474,51 @@ def _market_cap_tier_label(market_cap: float) -> str:
     return "small-cap"
 
 
+def _build_sma_trend_section(
+    sma_50: float, sma_200: float, crossover_date: str | None,
+    days_since_crossover: int | None, market_cap: float,
+) -> str:
+    """Prompt section for a Track 2 (SMA Trend-Confirmation Track, 2026-08-24 design,
+    ported from AIShortTrading) candidate -- states the real SMA50/SMA200
+    relationship, how long ago it crossed into its current state (or that no
+    crossover was found in the lookback window, meaning the stock has held this
+    relationship the whole time), and the company's market-cap tier, mirroring
+    _market_cap_tier_label's own "how stale is too stale depends on company size"
+    judgment already used by recommend_dip_entry. Returns "" when sma_50/sma_200 are
+    non-positive (no usable data), same graceful-omission pattern as every other
+    optional prompt section in this file."""
+    if sma_50 <= 0 or sma_200 <= 0:
+        return ""
+    relationship = "above" if sma_50 > sma_200 else "below"
+    tier = _market_cap_tier_label(market_cap)
+    tier_text = tier if tier else "unknown size"
+    if crossover_date and days_since_crossover is not None:
+        day_word = "day" if days_since_crossover == 1 else "days"
+        recency = (
+            f"This crossover happened {days_since_crossover} {day_word} ago, "
+            f"on {crossover_date}."
+        )
+    else:
+        recency = (
+            "No crossover was found within the lookback window — the 50-day average "
+            "has held this relationship for the entire window, a sustained, "
+            "longer-standing state rather than a fresh cross."
+        )
+    return (
+        f"\n── SMA TREND SIGNAL ──\n"
+        f"SMA50 (${sma_50:.2f}) is currently {relationship} SMA200 (${sma_200:.2f}) — "
+        f"a golden cross state (50-day average above 200-day average) is a mechanical "
+        f"signal of a confirmed uptrend. {recency} Company size: {tier_text}.\n"
+        f"Judge whether this represents a genuine, CURRENTLY-ACTIONABLE uptrend worth "
+        f"buying even if risk/reward doesn't fully clear the usual gate — weigh how "
+        f"recent the crossover is against this company's size (a larger, more stable "
+        f"company's trend signals reasonably stay meaningful longer than a small, "
+        f"volatile one's). Set trend_confirms_entry to true only if you genuinely "
+        f"believe this is a real, current, tradeable uptrend — not merely because "
+        f"the mechanical SMA relationship is technically satisfied.\n"
+    )
+
+
 def _build_analysis_history_section(analysis_history_summary: str) -> str:
     """Wraps a non-empty analysis-history summary in a clearly-labeled prompt section
     (2026-08-21, owner request: "I see the same stocks analyzed all the time.. same
@@ -550,6 +604,7 @@ class ResearchEngine:
         self, ticker: str, trade_history_summary: str = "",
         user_note_summary: str = "", model: str | None = None,
         analysis_history_summary: str = "",
+        sma_context: dict | None = None,
     ) -> ResearchReport:
         logger.info("Starting research analysis for %s", ticker)
 
@@ -598,6 +653,7 @@ class ResearchEngine:
                 user_note_summary,
                 model,
                 analysis_history_summary,
+                sma_context,
             )
         else:
             logger.warning("No ANTHROPIC_API_KEY — generating rule-based report for %s", ticker)
@@ -1256,6 +1312,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         user_note_summary: str = "",
         market_change_pct: float | None = None,
         analysis_history_summary: str = "",
+        sma_context: dict | None = None,
     ) -> str:
         """Shared by the sequential path (_claude_analysis) and the batch path
         (submit_analysis_batch) — both build the identical prompt from ANALYSIS_PROMPT,
@@ -1340,6 +1397,14 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 f'    "take_profit_targets": [<T1 — ~{t1_pct:.0f}% above entry>, '
                 f'<T2 — ~{t2_pct:.0f}% above entry>, <T3 — ~{t3_pct:.0f}% above entry>],'
             )
+        if sma_context:
+            sma_trend_section = _build_sma_trend_section(
+                sma_context.get("sma_50", 0.0), sma_context.get("sma_200", 0.0),
+                sma_context.get("crossover_date"), sma_context.get("days_since_crossover"),
+                sma_context.get("market_cap", 0.0))
+        else:
+            sma_trend_section = ""
+
         return ANALYSIS_PROMPT.format(
             current_date=self._now_et().strftime("%Y-%m-%d"),
             min_conviction=min_conviction,
@@ -1362,6 +1427,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 if risk_tier_mode != "manual" else ""
             ),
             analysis_history_section=_build_analysis_history_section(analysis_history_summary),
+            sma_trend_section=sma_trend_section,
             stop_tp_instructions=stop_tp_instructions,
         )
 
@@ -1447,6 +1513,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             fair_value_estimate=float(data["fair_value_estimate"]) if data.get("fair_value_estimate") is not None else 0.0,
             margin_of_safety_pct=float(data["margin_of_safety_pct"]) if data.get("margin_of_safety_pct") is not None else 0.0,
             watch_condition=str(data.get("watch_condition", "") or "").strip(),
+            trend_confirms_entry=_parse_json_bool(data.get("trend_confirms_entry"), default=False),
         )
 
     def _fallback_report(self, ticker: str, company_name: str, current_price: float,
@@ -1484,13 +1551,14 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         user_note_summary: str = "",
         model: str | None = None,
         analysis_history_summary: str = "",
+        sma_context: dict | None = None,
     ) -> ResearchReport:
         market_change_pct = await self.market_data.get_market_change_pct()
         prompt = self._build_quick_scan_prompt(
             ticker, company_name, current_price, fundamental_summary,
             insider_summary, news_summary, competitive_summary, technical_summary,
             trade_history_summary, long_term_trend_summary, user_note_summary,
-            market_change_pct, analysis_history_summary,
+            market_change_pct, analysis_history_summary, sma_context,
         )
         try:
             response_text = await self._call_claude_with_retry(

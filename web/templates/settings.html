@@ -802,6 +802,15 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
+          <div class="setting-label">SMA Crossover Lookback Days <button type="button" class="info-btn" onclick="showInfo(event,'How far back (in trading days) the SMA Trend-Confirmation Track (Track 2) searches for a fresh SMA50/SMA200 golden-cross date. A crossover found within this window is treated as fresh; not finding one means the stock has held the relationship for the entire window, treated as a sustained (not fresh) state. Does not affect Track 1 (the existing R/R-gated On Deck mechanism) at all.')">i</button></div>
+          <div class="setting-desc">Search window for a fresh SMA golden-cross date (Track 2 only)</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.sma_crossover_lookback_days"
+               value="{{ cfg.research.sma_crossover_lookback_days }}" min="30" max="756">
+        <div class="default-label">default<br><span class="default-val">252</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
           <div class="setting-label">On Deck Entry Mode <button type="button" class="info-btn" onclick="showInfo(event,'How On Deck decides a dip has recovered enough to buy. AI mode: once a real dip starts recovering (2+ consecutive upticks off the low), asks Claude once for a specific entry price given the actual observed peak/low/current price -- a judgment call informed by real price action, not a prediction made before any dip happened. Retracement % mode: a fixed mechanical rule instead -- price must recover a set percentage of the dip depth (see the setting below). Both modes share the same underlying peak/low/depth detection; only how the final entry price is decided differs. The other mode\'s number is still shown on the chart for comparison even while inactive.')">i</button></div>
           <div class="setting-desc">How the entry price for a recovering dip gets decided</div>
         </div>
@@ -1461,6 +1470,7 @@ const DEFAULTS = {
   'research.on_deck_rr_conviction_step': 0.1,
   'research.on_deck_rr_floor': 1.5,
   'research.long_term_trend_years': 5,
+  'research.sma_crossover_lookback_days': 252,
   'research.on_deck_entry_mode': 'ai',
   'research.on_deck_ai_entry_low_refresh_pct': 1.0,
   'research.on_deck_ai_entry_arm_band_pct': 2.0,

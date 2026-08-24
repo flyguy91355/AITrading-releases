@@ -76,6 +76,22 @@ async def _quick_screen_with_timeout(ticker: str) -> tuple[bool, str] | None:
         # TimeoutError, itself an OSError subclass) -- no separate branch needed.
         logger.debug("Quick screen error/timeout for %s: %s", ticker, _qs_err)
         return None
+
+
+async def _get_technicals_with_timeout(market_data, ticker: str):
+    """Shared hang-protection wrapper for get_technicals(), mirroring
+    _quick_screen_with_timeout's own 15s timeout above (2026-08-24, SMA
+    Trend-Confirmation Track design, ported from AIShortTrading) -- Stage 1 of
+    Track 2 calls this once per universe ticker, so a single unresponsive ticker
+    must not freeze the whole scan. Returns None on any error or timeout (caller
+    should `continue` to the next ticker); returns the real TechnicalIndicators
+    otherwise."""
+    try:
+        return await asyncio.wait_for(
+            market_data.get_technicals(ticker), timeout=_QUICK_SCREEN_TIMEOUT_SECS)
+    except Exception as _gt_err:
+        logger.debug("get_technicals error/timeout for %s: %s", ticker, _gt_err)
+        return None
 from src.decision.signal_generator import SignalGenerator
 from src.decision.risk_manager import RiskManager
 from src.decision.portfolio import Portfolio
@@ -934,6 +950,33 @@ def _required_rr(conviction: int, min_conviction: int, base_rr: float, step: flo
     return max(floor, base_rr - extra_conviction * step)
 
 
+def _sma_golden_cross_qualifies(sma_50: float, sma_200: float) -> bool:
+    """Stage 1 mechanical pre-filter for the SMA Trend-Confirmation Track (Track 2,
+    2026-08-24 design, ported from AIShortTrading) -- True when the current
+    SMA50/SMA200 relationship is a golden cross state (50-day average above 200-day
+    average), this program's long-side mirror of AIShortTrading's own death-cross
+    check (SMA50 < SMA200). Zero/negative values mean no real data was fetched (e.g.
+    a failed get_technicals() call) -- treated as not-qualifying rather than
+    raising, matching this codebase's existing fail-open convention for market
+    data."""
+    return sma_50 > 0 and sma_200 > 0 and sma_50 > sma_200
+
+
+def _track2_rr_override_applies(
+    is_track2: bool, trend_confirms_entry: bool, rr: float, rr_floor: float,
+) -> bool:
+    """True when a Track 2 (SMA Trend-Confirmation Track, 2026-08-24 design)
+    candidate should be allowed to buy even though its raw R/R fell short of its
+    own conviction-scaled gate. Conviction itself is NOT re-checked here --
+    _attempt_near_miss_promotion already rejects below min_conviction_score before
+    ever reaching the R/R gate this override sits inside, so by the time this runs
+    conviction is already guaranteed to clear. The override only ever waives the R/R
+    comparison itself -- an absolute floor still applies regardless of conviction or
+    trend confirmation (rr >= rr_floor), reusing research.on_deck_rr_floor exactly as
+    documented in the design spec rather than adding a new setting."""
+    return is_track2 and trend_confirms_entry and rr >= rr_floor
+
+
 def _yf_interval_and_period_for_days(days: int) -> tuple[str, str]:
     """Picks the finest intraday granularity yfinance actually supports for the requested
     window, falling back to coarser bars once the window exceeds each granularity's own
@@ -1505,6 +1548,13 @@ class DashboardState:
         # _run_pre_open_batch itself unchanged rather than adding a try/finally inside that
         # already-long, already-live function.
         self._full_scan_in_progress: bool = False
+
+        # SMA Trend-Confirmation Track (Track 2, 2026-08-24 design, ported from
+        # AIShortTrading) -- own guard so a slow run can't overlap itself;
+        # deliberately separate from _full_scan_in_progress/_midday_rescan_in_progress
+        # above, since this is a genuinely separate, additive mechanism from Track
+        # 1's own scans.
+        self._sma_trend_scan_in_progress: bool = False
 
         # Update-available apply guard (2026-08-12, owner concern: "someone would push
         # the button again") -- the frontend already disables the clicked button for
@@ -5365,6 +5415,7 @@ class DashboardState:
 
     async def _attempt_near_miss_promotion(
         self, ticker: str, nm_snapshot: dict | None = None, dip_low: float | None = None,
+        sma_context: dict | None = None,
     ):
         """Fired when a candidate clears R/R + a confirmed uptick. Runs one fresh Claude
         re-analysis (pre-open data can be hours old) and, if it still passes every normal buy
@@ -5506,7 +5557,8 @@ class DashboardState:
                 analysis_history_summary = await self.portfolio.get_analysis_history_summary(ticker)
                 report = await self.research_engine.analyze_stock(
                     ticker, trade_history_summary, self.on_deck_notes.get(ticker, ""),
-                    analysis_history_summary=analysis_history_summary)
+                    analysis_history_summary=analysis_history_summary,
+                    sma_context=sma_context)
             except Exception as e:
                 entry = self.add_ai_log(ticker, "ON_DECK", f"Re-analysis failed: {e}", "error")
                 await self.broadcast({"type": "ai_log", "entry": entry})
@@ -5578,7 +5630,19 @@ class DashboardState:
             rr_step = self.config["research"].get("on_deck_rr_conviction_step", 0.1)
             rr_floor = self.config["research"].get("on_deck_rr_floor", 1.5)
             min_rr = _required_rr(report.conviction_score, min_conviction, base_rr, rr_step, rr_floor)
-            if rr < min_rr:
+            # Track 2 override (2026-08-24, SMA Trend-Confirmation Track design,
+            # ported from AIShortTrading) -- a candidate that reached this gate via
+            # the SMA golden-cross path (sma_context is not None) can still buy
+            # despite R/R falling short of its own conviction-scaled gate, IF the
+            # fresh analysis's own trend_confirms_entry judgment says this is a
+            # genuine, current uptrend AND rr still clears the absolute floor.
+            # Conviction was already re-checked above this block (the "No longer
+            # qualifies" branch), so it's not re-checked here. See
+            # _track2_rr_override_applies's own docstring.
+            track2_override = _track2_rr_override_applies(
+                sma_context is not None, getattr(report, "trend_confirms_entry", False),
+                rr, rr_floor)
+            if rr < min_rr and not track2_override:
                 entry = self.add_ai_log(ticker, "ON_DECK",
                     f"R/R fell back below gate on fresh data — {rr:.2f} < {min_rr:.2f}", "warning")
                 await self.broadcast({"type": "ai_log", "entry": entry})
@@ -5587,6 +5651,11 @@ class DashboardState:
                     conviction=report.conviction_score, rr=rr, price=report.entry_price)
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
                 return
+            if track2_override and rr < min_rr:
+                entry = self.add_ai_log(ticker, "ON_DECK",
+                    f"R/R below gate ({rr:.2f} < {min_rr:.2f}) but SMA trend-confirmation "
+                    f"override applied — AI confirmed a genuine, current uptrend", "info")
+                await self.broadcast({"type": "ai_log", "entry": entry})
 
             # Above-gate ambiguity check at the actual buy trigger (2026-08-13, owner
             # design after the OXY incident) -- clearing the gate here can mean a genuine
@@ -6855,10 +6924,19 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         # trading figure in this codebase. Fire-and-forget: this must never delay or
         # block the report-persistence flow it's recording.
         if not getattr(report, "is_fallback", False):
+            # sma_relationship/trend_confirms_entry (2026-08-24, SMA
+            # Trend-Confirmation Track design, ported from AIShortTrading) are only
+            # ever set for a Track 2 report (source == "sma_track2", stamped by
+            # _run_sma_trend_scan) -- every Track 1 report passes None for both.
+            _is_track2 = source == "sma_track2"
             asyncio.create_task(self.portfolio.save_analysis_history(
                 report.ticker, report.generated_at.isoformat(), report.conviction_score,
                 report.signal.value, report.entry_price, report.fair_value_estimate,
                 getattr(report, "watch_condition", ""),
+                sma_relationship="golden_cross" if _is_track2 else None,
+                trend_confirms_entry=(
+                    getattr(report, "trend_confirms_entry", False) if _is_track2 else None
+                ),
             ))
 
     async def _run_on_deck_persist_check(self, phase_tag: str = "PRE-OPEN") -> tuple[int, int]:
@@ -7283,8 +7361,90 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 f"covered today{trimmed_str}.",
                 "success")
             await self.broadcast({"type": "ai_log", "entry": entry})
+            await self._run_sma_trend_scan(tag)
         finally:
             self._midday_rescan_in_progress = False
+
+    async def _run_sma_trend_scan(self, source_label: str = "PRE-OPEN"):
+        """Track 2 of the buy pipeline (2026-08-24 design, ported from
+        AIShortTrading) -- an independent, additive path alongside Track 1 (the
+        existing R/R-gated watch-and-promote mechanism, completely untouched by
+        this function). Looks for stocks already showing a confirmed golden cross
+        (SMA50 > SMA200) and sends only those through a real analyze_stock() call
+        with SMA context, skipping Track 1's extended watch-and-wait holding
+        period entirely -- a qualifying candidate goes straight to
+        _attempt_near_miss_promotion with sma_context set, which can then buy even
+        when R/R doesn't clear its usual gate (see _track2_rr_override_applies).
+
+        Runs as its own guarded pass (self._sma_trend_scan_in_progress) so a slow
+        run can't overlap itself -- deliberately does NOT share
+        _full_scan_in_progress/_midday_rescan_in_progress with the unrelated Track
+        1 scans, since this is a genuinely separate mechanism. Called once at the
+        end of both _run_pre_open_batch and _run_midday_rescan (see their own call
+        sites), matching Track 1's existing scan cadence.
+
+        Skips any ticker already held or already on Track 1's near_miss_candidates
+        list -- avoids a wasteful concurrent double-analysis of the same ticker by
+        both tracks at once."""
+        if self._sma_trend_scan_in_progress:
+            return
+        self._sma_trend_scan_in_progress = True
+        try:
+            held_tickers = set(self.portfolio.positions.keys())
+            lookback_days = self.config["research"].get("sma_crossover_lookback_days", 252)
+            checked = 0
+            stage1_qualified = 0
+            attempted = 0
+
+            entry = self.add_ai_log("SYSTEM", source_label,
+                "SMA trend-confirmation scan (Track 2) starting...", "info")
+            await self.broadcast({"type": "ai_log", "entry": entry})
+
+            for ticker in STOCK_UNIVERSE:
+                if self.paused:
+                    break
+                if ticker in held_tickers or ticker in self.near_miss_candidates:
+                    continue
+
+                checked += 1
+                technicals = await _get_technicals_with_timeout(self.market_data, ticker)
+                if technicals is None:
+                    continue
+                if not _sma_golden_cross_qualifies(technicals.sma_50, technicals.sma_200):
+                    continue
+                stage1_qualified += 1
+
+                crossover_info = await self.market_data.get_sma_crossover_info(
+                    ticker, direction="above", lookback_days=lookback_days)
+
+                try:
+                    financials = await self.market_data.get_financials(ticker)
+                    market_cap = getattr(financials, "market_cap", 0.0)
+                except Exception:
+                    market_cap = 0.0
+
+                sma_context = {
+                    "sma_50": crossover_info.sma_50 or technicals.sma_50,
+                    "sma_200": crossover_info.sma_200 or technicals.sma_200,
+                    "crossover_date": crossover_info.crossover_date,
+                    "days_since_crossover": crossover_info.days_since_crossover,
+                    "market_cap": market_cap,
+                }
+
+                attempted += 1
+                entry = self.add_ai_log(ticker, source_label,
+                    "SMA golden cross confirmed — running Track 2 trend-confirmation analysis...",
+                    "info")
+                await self.broadcast({"type": "ai_log", "entry": entry})
+                await self._attempt_near_miss_promotion(ticker, sma_context=sma_context)
+
+            entry = self.add_ai_log("SYSTEM", source_label,
+                f"SMA trend-confirmation scan complete — {checked:,} tickers checked, "
+                f"{stage1_qualified} in a golden cross, {attempted} sent for analysis.",
+                "success")
+            await self.broadcast({"type": "ai_log", "entry": entry})
+        finally:
+            self._sma_trend_scan_in_progress = False
 
     async def _run_pre_open_batch(self, source_label: str = "PRE-OPEN"):
         """Pre-open universe scan — quick-screens the full universe, runs full analyze_stock()
@@ -7462,6 +7622,8 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 logger.warning("Failed to write first-scan marker: %s", e)
             await self.broadcast({"type": "first_scan_done"})
 
+        await self._run_sma_trend_scan(source_label)
+
     async def _run_full_scan_on_demand(self):
         """Wraps _run_pre_open_batch() for the manual "Full Scan" dashboard button
         (2026-08-03) -- deliberately a thin wrapper rather than editing that already-long,
@@ -7624,6 +7786,7 @@ async def save_settings(payload: dict):
         "research.on_deck_rr_floor": float,
         "research.watchlist_size": int,
         "research.long_term_trend_years": int,
+        "research.sma_crossover_lookback_days": int,
         "research.on_deck_entry_mode": str,
         "research.on_deck_ai_entry_low_refresh_pct": float,
         "research.on_deck_ai_entry_arm_band_pct": float,
