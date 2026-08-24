@@ -2213,7 +2213,30 @@ class DashboardState:
         }
 
     def _rank_position(self, ticker: str) -> float:
-        """Score a held position — lower score = weaker holding, better swap candidate."""
+        """Score a held position — lower score = weaker holding, better swap candidate.
+
+        Confirmed dead code as of 2026-08-24 (GitHub #84 investigation) -- this
+        function's only callers are inside _try_rotation_swap below, and
+        _try_rotation_swap's own only caller is _buy_from_watchlist_by_price, already
+        documented elsewhere in this file as dead (zero callers, superseded by the
+        2026-07-17 Watchlist-removal redesign). The real live promotion path
+        (_attempt_near_miss_promotion) dropped its own rotation-swap-on-full-portfolio
+        behavior entirely on 2026-07-20/21 -- see that function's own docstring and
+        the "max_positions is now purely the sizing guideline" comment inside it --
+        so nothing in the live system reaches this formula today.
+
+        This uses conviction + unrealized_pnl_pct/10, a genuinely different (and
+        independently drifted) formula from the shared _on_deck_composite_score
+        (conviction + margin_of_safety_pct/10 + rr_vs_gate*2, capped 2026-08-12) that
+        ranks On Deck/On Shore candidates -- a real inconsistency were this code ever
+        live, since it doesn't use the same conviction-scaled R/R comparison at all.
+        Left unreconciled and left in place (not deleted) per this project's standing
+        precedent for confirmed-dead code -- see e.g. _replace_one_watchlist_slot's
+        and analyze_stock_with_logging's own docstrings for the same pattern. If this
+        code is ever revived, reconcile it with _on_deck_composite_score at that
+        point, using each held position's own current conviction/margin_of_safety_pct/
+        R/R (computable from its cached report + entry/stop/current price), rather
+        than reviving this drifted formula as-is."""
         pos = self.portfolio.positions.get(ticker)
         if not pos:
             return float("inf")
