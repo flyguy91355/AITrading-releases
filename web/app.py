@@ -3936,22 +3936,25 @@ class DashboardState:
 
     async def _rebuy_legacy_positions(self):
         """Sell round-share (legacy) positions and immediately rebuy notionally to get T1/T2/T3."""
-        import alpaca_trade_api as tradeapi
         from src.decision.signal_generator import TradeSignal
         from src.research.engine import Signal as Sig
+        from src.execution.broker import Order, OrderSide, OrderType
 
-        api = tradeapi.REST(
-            os.getenv("ALPACA_API_KEY"),
-            os.getenv("ALPACA_SECRET_KEY"),
-            os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
-        )
+        # Routed through the shared AlpacaBroker instance (fixed 2026-08-24, GitHub #83)
+        # -- this used to construct its own raw tradeapi.REST client and call every
+        # Alpaca method via bare asyncio.to_thread, none of which went through
+        # AlpacaBroker._call_with_rate_limit_retry -- the wrapper every other Alpaca
+        # call in the codebase uses to retry a 429 with exponential backoff instead of
+        # raising immediately mid-migration (this function sells then immediately
+        # rebuys several legacy positions in one pass -- a real burst of API calls).
+        broker = self.order_manager.broker
 
         # Legacy = round share count (bought by qty, not notional)
-        all_positions = await asyncio.to_thread(api.list_positions)
+        all_positions = await broker.get_positions()
         legacy = [
-            (p.symbol, float(p.qty), float(p.market_value))
+            (p["ticker"], p["shares"], p["market_value"])
             for p in all_positions
-            if float(p.qty) == int(float(p.qty))
+            if p["shares"] == int(p["shares"])
         ]
 
         if not legacy:
@@ -3982,21 +3985,20 @@ class DashboardState:
 
             # Cancel existing orders for this ticker
             try:
-                open_orders = await asyncio.to_thread(api.list_orders, status="open")
+                open_orders = await broker.get_open_orders()
                 for o in open_orders:
-                    if o.symbol == ticker:
-                        await asyncio.to_thread(api.cancel_order, o.id)
+                    if o["ticker"] == ticker:
+                        await broker.cancel_order(o["order_id"])
                         await asyncio.sleep(0.5)
             except Exception as e:
                 logger.warning("Cancel orders failed for %s: %s", ticker, e)
 
             # Sell all shares at market
             try:
-                await asyncio.to_thread(
-                    api.submit_order,
-                    symbol=ticker, qty=int(qty), side="sell",
-                    type="market", time_in_force="day",
-                )
+                await broker.submit_order(Order(
+                    ticker=ticker, side=OrderSide.SELL, order_type=OrderType.MARKET,
+                    quantity=int(qty),
+                ))
                 entry = self.add_ai_log(ticker, "REBUY",
                     f"Sold {int(qty)} share(s) at market — waiting for fill", "sell")
                 await self.broadcast({"type": "ai_log", "entry": entry})
@@ -4019,16 +4021,18 @@ class DashboardState:
 
             # Re-sync cash from Alpaca so the rebuy check uses the actual post-sell balance
             try:
-                account = await asyncio.to_thread(api.get_account)
-                self.portfolio.cash = float(account.cash)
+                account = await broker.get_account()
+                self.portfolio.cash = account.cash
                 await self.portfolio._save_state()
             except Exception as _e:
                 logger.warning("Cash re-sync after rebuy sell of %s failed: %s", ticker, _e)
 
             # Get current price for stop/TP levels
             try:
-                latest = await asyncio.to_thread(api.get_latest_trade, ticker)
-                current_price = float(latest.price)
+                quote_price = await broker.get_quote(ticker)
+                if quote_price is None:
+                    raise ValueError("no quote available")
+                current_price = quote_price
             except Exception:
                 current_price = mkt_value / qty
 
