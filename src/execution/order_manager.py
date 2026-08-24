@@ -1120,6 +1120,30 @@ class OrderManager:
         never got a working order this call."""
         return await self._place_stop_only(ticker, shares, stop_price)
 
+    async def _build_and_submit_sell(
+        self, ticker: str, order_type: OrderType, quantity: float,
+        stop_price: float | None = None,
+    ) -> Order:
+        """Builds a SELL Order and submits it, registering the result in
+        self.active_orders (and self._stop_order_ids too, for a STOP order) on
+        success. Raises whatever self.broker.submit_order raises on failure --
+        callers own their own try/except for logging text and retry decisions;
+        this extracts only the mechanical build+submit+register step, which
+        _place_stop_only repeated 7 times near-identically across its initial
+        attempts and every retry tier (2026-08-24, GitHub #88 -- a fix applied
+        to one copy had no mechanism to reach the other 6, exactly the class of
+        drift this file's own comments elsewhere already warn about)."""
+        order = Order(
+            ticker=ticker, side=OrderSide.SELL, order_type=order_type,
+            quantity=quantity,
+            stop_price=round(stop_price, 2) if stop_price is not None else None,
+        )
+        result = await self.broker.submit_order(order)
+        self.active_orders[result.broker_order_id] = result
+        if order_type == OrderType.STOP:
+            self._stop_order_ids[ticker] = result.broker_order_id
+        return result
+
     async def _place_stop_only(self, ticker: str, shares: float, stop_price: float) -> bool:
         """The stop-placement half of the old _place_exit_orders, extracted verbatim
         (2026-08-11) so both _place_exit_orders (the normal "no exit orders yet" path)
@@ -1144,15 +1168,8 @@ class OrderManager:
         if stop_price is not None and stop_price > 0 and stop_shares > 0:
             stop_ok = False  # about to attempt; only True once a submit actually succeeds
             try:
-                stop_order = Order(
-                    ticker=ticker, side=OrderSide.SELL,
-                    order_type=OrderType.STOP,
-                    quantity=stop_shares,
-                    stop_price=round(stop_price, 2),
-                )
-                stop_result = await self.broker.submit_order(stop_order)
-                self.active_orders[stop_result.broker_order_id] = stop_result
-                self._stop_order_ids[ticker] = stop_result.broker_order_id
+                await self._build_and_submit_sell(
+                    ticker, OrderType.STOP, stop_shares, stop_price=stop_price)
                 logger.info("Stop placed for %s: %.4g shares @ $%.2f", ticker, stop_shares, stop_price)
                 stop_ok = True
             except Exception as e:
@@ -1188,13 +1205,7 @@ class OrderManager:
                         stop_price, ticker, shares,
                     )
                     try:
-                        market_order = Order(
-                            ticker=ticker, side=OrderSide.SELL,
-                            order_type=OrderType.MARKET,
-                            quantity=shares,
-                        )
-                        market_result = await self.broker.submit_order(market_order)
-                        self.active_orders[market_result.broker_order_id] = market_result
+                        await self._build_and_submit_sell(ticker, OrderType.MARKET, shares)
                         logger.info(
                             "Market sell submitted for %s (%.4g shares) — stop was already breached",
                             ticker, shares,
@@ -1223,13 +1234,7 @@ class OrderManager:
                                     ticker, shares, match.group(1),
                                 )
                                 try:
-                                    market_order = Order(
-                                        ticker=ticker, side=OrderSide.SELL,
-                                        order_type=OrderType.MARKET,
-                                        quantity=available,
-                                    )
-                                    market_result = await self.broker.submit_order(market_order)
-                                    self.active_orders[market_result.broker_order_id] = market_result
+                                    await self._build_and_submit_sell(ticker, OrderType.MARKET, available)
                                     logger.info(
                                         "Market sell submitted for %s (%.4g shares, "
                                         "qty-corrected retry) — stop was already breached",
@@ -1257,13 +1262,7 @@ class OrderManager:
                                 )
                                 await asyncio.sleep(2)
                                 try:
-                                    market_order = Order(
-                                        ticker=ticker, side=OrderSide.SELL,
-                                        order_type=OrderType.MARKET,
-                                        quantity=shares,
-                                    )
-                                    market_result = await self.broker.submit_order(market_order)
-                                    self.active_orders[market_result.broker_order_id] = market_result
+                                    await self._build_and_submit_sell(ticker, OrderType.MARKET, shares)
                                     logger.info(
                                         "Market sell submitted for %s (%.4g shares, "
                                         "available:0 retry) — stop was already breached",
@@ -1298,15 +1297,8 @@ class OrderManager:
                     )
                     await asyncio.sleep(3)
                     try:
-                        stop_order = Order(
-                            ticker=ticker, side=OrderSide.SELL,
-                            order_type=OrderType.STOP,
-                            quantity=stop_shares,
-                            stop_price=round(stop_price, 2),
-                        )
-                        stop_result = await self.broker.submit_order(stop_order)
-                        self.active_orders[stop_result.broker_order_id] = stop_result
-                        self._stop_order_ids[ticker] = stop_result.broker_order_id
+                        await self._build_and_submit_sell(
+                            ticker, OrderType.STOP, stop_shares, stop_price=stop_price)
                         logger.info(
                             "Stop placed for %s: %.4g shares @ $%.2f (wash-trade retry)",
                             ticker, stop_shares, stop_price,
@@ -1334,15 +1326,8 @@ class OrderManager:
                             ticker, stop_shares, match.group(1),
                         )
                         try:
-                            stop_order = Order(
-                                ticker=ticker, side=OrderSide.SELL,
-                                order_type=OrderType.STOP,
-                                quantity=available,
-                                stop_price=round(stop_price, 2),
-                            )
-                            stop_result = await self.broker.submit_order(stop_order)
-                            self.active_orders[stop_result.broker_order_id] = stop_result
-                            self._stop_order_ids[ticker] = stop_result.broker_order_id
+                            await self._build_and_submit_sell(
+                                ticker, OrderType.STOP, available, stop_price=stop_price)
                             logger.info(
                                 "Stop placed for %s: %.4g shares @ $%.2f (qty-corrected retry)",
                                 ticker, available, stop_price,
@@ -1364,15 +1349,8 @@ class OrderManager:
                         )
                         await asyncio.sleep(2)
                         try:
-                            stop_order = Order(
-                                ticker=ticker, side=OrderSide.SELL,
-                                order_type=OrderType.STOP,
-                                quantity=stop_shares,
-                                stop_price=round(stop_price, 2),
-                            )
-                            stop_result = await self.broker.submit_order(stop_order)
-                            self.active_orders[stop_result.broker_order_id] = stop_result
-                            self._stop_order_ids[ticker] = stop_result.broker_order_id
+                            await self._build_and_submit_sell(
+                                ticker, OrderType.STOP, stop_shares, stop_price=stop_price)
                             logger.info(
                                 "Stop placed for %s: %.4g shares @ $%.2f (available:0 retry)",
                                 ticker, stop_shares, stop_price,
