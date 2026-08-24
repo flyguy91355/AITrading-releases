@@ -346,6 +346,44 @@ tbody tr:hover { background: var(--bg-card-hover); }
 }
 .pause-btn:hover { border-color: var(--accent); color: var(--accent); }
 .pause-btn.paused { border-color: var(--yellow); color: var(--yellow); background: var(--yellow-bg); }
+.pause-btn.stopped { border-color: var(--red); color: #fff; background: var(--red); }
+
+/* Pause-or-Stop confirmation modal (GitHub #78 fix, 2026-08-24, ported from
+   AICryptoTrading's identical, already-working feature) */
+#pauseModalOverlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 2000;
+  align-items: center;
+  justify-content: center;
+}
+#pauseModalOverlay.active { display: flex; }
+.pause-modal {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  max-width: 420px;
+  width: 90%;
+}
+.pause-modal h3 { margin: 0 0 12px; font-size: 16px; color: var(--text-primary); }
+.pause-modal p { margin: 0 0 10px; font-size: 13px; line-height: 1.5; color: var(--text-secondary); }
+.pause-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.pause-modal-actions button {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 7px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+}
+.pm-cancel:hover { border-color: var(--accent); color: var(--accent); }
+.pm-pause { border-color: var(--yellow); color: var(--yellow); background: var(--yellow-bg); }
+.pm-stop { border-color: var(--red-border); color: var(--red); background: var(--red-bg); }
 
 /* SEARCH */
 .search-wrap {
@@ -1003,7 +1041,7 @@ tbody tr:hover { background: var(--bg-card-hover); }
         </div>
         <span id="cycleLabel" style="font-size:11px;color:var(--text-muted)">—</span>
         <button class="pause-btn" id="forceScanBtn" onclick="forceScan()" title="Runs the same full universe scan as the pre-open batch">▶ Full Scan</button>
-        <button class="pause-btn" id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
+        <button class="pause-btn" id="pauseBtn" onclick="onPauseBtnClick()">⏸ Pause</button>
       </div>
     </div>
 
@@ -1042,6 +1080,21 @@ tbody tr:hover { background: var(--bg-card-hover); }
   <div class="modal">
     <button class="modal-close" onclick="closeModal()">&times;</button>
     <div id="reportContent"></div>
+  </div>
+</div>
+
+<!-- Pause-or-Stop confirmation modal (GitHub #78 fix, 2026-08-24, ported from
+     AICryptoTrading's identical, already-working feature) -->
+<div id="pauseModalOverlay" onclick="if (event.target === this) closePauseModal()">
+  <div class="pause-modal">
+    <h3>Pause or Stop?</h3>
+    <p><strong>Pause</strong> stops all AI (Claude) call costs only. The program will still run to manage positions — only without AI costs.</p>
+    <p>To stop the program from running entirely, press <strong>Stop</strong>. This halts position management too — no management of any positions at the broker will take place until you press Start System.</p>
+    <div class="pause-modal-actions">
+      <button class="pm-cancel" onclick="closePauseModal()">Cancel</button>
+      <button class="pm-pause" onclick="confirmPause()">Pause</button>
+      <button class="pm-stop" onclick="confirmStop()">Stop</button>
+    </div>
   </div>
 </div>
 
@@ -1172,7 +1225,14 @@ let reports = {};
 let researchReports = {};
 let allStocks = [];
 let heldTickers = new Set();
-let isPaused = false;
+// 3-way run state (GitHub #78 fix, 2026-08-24, ported from AICryptoTrading's
+// identical, already-working feature): 'running' -> clicking the button opens the
+// Pause-or-Stop confirmation modal (both are consequential, so neither fires
+// directly on click). 'paused' -> clicking directly resumes (a safe, low-friction
+// action, no confirmation needed). 'stopped' -> clicking directly starts everything
+// back up (also safe/low-friction). currentRunStatus is the single source of truth
+// the click handler dispatches on.
+let currentRunStatus = 'running';
 let tickerSignals = {};  // cache for re-applying badges after grid re-render
 let positionData = {};   // ticker → full position object (includes TPs, opened_at)
 
@@ -1277,7 +1337,7 @@ async function fallbackPollTick() {
       tickerSignals = data.ticker_signals;
       Object.values(tickerSignals).forEach(b => updateTickerSignal(b));
     }
-    if (data.scan_status) updatePausedState(data.scan_status.paused);
+    if (data.scan_status) setRunStatusUI(data.scan_status.run_status || 'running');
     if (data.promotion_attempts) renderPromotionAttempts(data.promotion_attempts);
     if (data.broker_status) updateBrokerBadge(data.broker_status);
     setMarketStatusBadge(!!data.market_open);
@@ -1317,7 +1377,7 @@ function handleMessage(msg) {
         tickerSignals = msg.ticker_signals;
         Object.values(tickerSignals).forEach(b => updateTickerSignal(b));
       }
-      if (msg.scan_status) updatePausedState(msg.scan_status.paused);
+      if (msg.scan_status) setRunStatusUI(msg.scan_status.run_status || 'running');
       if (msg.promotion_attempts) renderPromotionAttempts(msg.promotion_attempts);
       if (msg.broker_status) updateBrokerBadge(msg.broker_status);
       setMarketStatusBadge(!!msg.market_open);
@@ -1451,7 +1511,10 @@ function handleMessage(msg) {
       updateBrokerBadge(msg);
       break;
     case 'paused':
-      updatePausedState(msg.paused);
+      setRunStatusUI(msg.paused ? 'paused' : 'running');
+      break;
+    case 'run_status':
+      setRunStatusUI(msg.run_status);
       break;
 
     case 'market_status':
@@ -1537,24 +1600,52 @@ async function forceScan() {
   }
 }
 
-// ── Pause / Resume ─────────────────────────────────────────────────────────
+// ── Pause / Stop / Start (GitHub #78 fix, 2026-08-24, ported from
+// AICryptoTrading's identical, already-working feature) ────────────────────
 
-function togglePause() {
-  if (!ws || ws.readyState !== 1) return;
-  ws.send(JSON.stringify({ command: isPaused ? 'resume' : 'pause' }));
-}
-
-function updatePausedState(paused) {
-  isPaused = paused;
+function setRunStatusUI(status) {
+  currentRunStatus = status;
   const btn = document.getElementById('pauseBtn');
-  if (paused) {
+  btn.classList.remove('paused', 'stopped');
+  if (status === 'paused') {
     btn.textContent = '▶ Resume';
     btn.classList.add('paused');
     updateAiStatus(false, '');
+  } else if (status === 'stopped') {
+    btn.textContent = '▶ Start System';
+    btn.classList.add('stopped');
+    updateAiStatus(false, '');
   } else {
     btn.textContent = '⏸ Pause';
-    btn.classList.remove('paused');
   }
+}
+
+function onPauseBtnClick() {
+  if (currentRunStatus === 'running') {
+    document.getElementById('pauseModalOverlay').classList.add('active');
+  } else if (currentRunStatus === 'paused') {
+    fetch('/api/resume', { method: 'POST' }).then(r => r.json()).then(d => setRunStatusUI(d.run_status));
+  } else if (currentRunStatus === 'stopped') {
+    fetch('/api/start', { method: 'POST' }).then(r => r.json()).then(d => setRunStatusUI(d.run_status));
+  }
+}
+
+function closePauseModal() {
+  document.getElementById('pauseModalOverlay').classList.remove('active');
+}
+
+async function confirmPause() {
+  closePauseModal();
+  const resp = await fetch('/api/pause', { method: 'POST' });
+  const data = await resp.json();
+  setRunStatusUI(data.run_status);
+}
+
+async function confirmStop() {
+  closePauseModal();
+  const resp = await fetch('/api/stop', { method: 'POST' });
+  const data = await resp.json();
+  setRunStatusUI(data.run_status);
 }
 
 // Market open/closed badge (2026-08-04, owner request) -- init payload carries the

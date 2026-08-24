@@ -2445,6 +2445,17 @@ class DashboardState:
                 await self.broadcast({"type": "portfolio",
                                      "portfolio": self.get_portfolio_snapshot()})
 
+            # Gated on stopped only, NOT paused (GitHub #78 fix, 2026-08-24, ported
+            # from AICryptoTrading's identical, already-working position_loop guard)
+            # -- position management (stop-loss/trailing-stop/protection-gap checks/
+            # exit-order sync) has zero AI cost and must keep running through an
+            # ordinary pause, per this feature's own __init__ design comment ("held
+            # positions stay fully protected" while paused). Only a full Stop halts
+            # it too. Before this fix, self.stopped was never checked here at all --
+            # the one loop the "stopped=True... position_update_loop itself stops"
+            # comment specifically calls out kept running regardless.
+            if self.stopped:
+                continue
             if not self.broker_connected:
                 continue
             try:
@@ -9963,6 +9974,74 @@ async def save_keys(payload: dict):
     return {"status": "ok"}
 
 
+@app.post("/api/pause")
+async def pause_trading():
+    """Pause (GitHub #78 fix, 2026-08-24, ported from AICryptoTrading's identical,
+    already-working feature) -- stops every AI-spend loop (position_monitor_loop,
+    position_deep_dive_loop, auto_scan_loop, near_miss_monitor_loop, the pre-open/
+    midday batch paths). Zero Claude calls. position_update_loop keeps running --
+    held positions stay fully protected (stop-loss/trailing-stop/protection-gap
+    checks/exit-order sync) -- see run_status()'s own docstring for the full
+    paused/stopped split. Persists to disk so this survives a restart/Apply
+    Update, unlike the pre-existing WebSocket "pause"/"resume" commands, which
+    never called _save_run_state() at all."""
+    state.paused = True
+    state._save_run_state()
+    entry = state.add_ai_log("SYSTEM", "SYSTEM",
+        "Trading paused — no scans or AI analysis will run until resumed.", "warning")
+    await state.broadcast({"type": "ai_log", "entry": entry})
+    await state.broadcast({"type": "run_status", "run_status": state.run_status()})
+    return {"status": "paused", "run_status": state.run_status()}
+
+
+@app.post("/api/resume")
+async def resume_trading():
+    """Counterpart to /api/pause -- clears paused only (does not affect stopped)."""
+    state.paused = False
+    state._save_run_state()
+    entry = state.add_ai_log("SYSTEM", "SYSTEM",
+        "Trading resumed — scans and AI analysis active again.", "info")
+    await state.broadcast({"type": "ai_log", "entry": entry})
+    await state.broadcast({"type": "run_status", "run_status": state.run_status()})
+    return {"status": "resumed", "run_status": state.run_status()}
+
+
+@app.post("/api/stop")
+async def stop_trading():
+    """Full stop (GitHub #78 fix, 2026-08-24, ported from AICryptoTrading's
+    identical, already-working feature) -- every loop halts, including
+    position_update_loop -- no broker-side position management of any kind
+    happens while stopped, on top of everything /api/pause already blocks.
+    Deliberately does NOT kill the process itself (same reasoning as
+    AICryptoTrading's own /api/stop) -- a real process kill has no self-service
+    recovery path for a non-technical operator (no dashboard to reach, no button
+    to click, only SSH+systemctl); this way the dashboard and Start System button
+    stay reachable, with the exact same real-world effect (zero AI spend, zero
+    broker-side management) while stopped."""
+    state.stopped = True
+    state._save_run_state()
+    entry = state.add_ai_log("SYSTEM", "SYSTEM",
+        "Trading STOPPED — no scans, AI analysis, or position management (stop-loss/"
+        "trailing-stop/take-profit) will run until Start System is clicked.", "warning")
+    await state.broadcast({"type": "ai_log", "entry": entry})
+    await state.broadcast({"type": "run_status", "run_status": state.run_status()})
+    return {"status": "stopped", "run_status": state.run_status()}
+
+
+@app.post("/api/start")
+async def start_trading():
+    """Clears both stopped and paused -- the counterpart to /api/stop, brings the
+    system back to fully running from either a pause or a full stop."""
+    state.paused = False
+    state.stopped = False
+    state._save_run_state()
+    entry = state.add_ai_log("SYSTEM", "SYSTEM",
+        "Trading started — all systems running normally.", "success")
+    await state.broadcast({"type": "ai_log", "entry": entry})
+    await state.broadcast({"type": "run_status", "run_status": state.run_status()})
+    return {"status": "running", "run_status": state.run_status()}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     # Auth gate (2026-07-22, GitHub #13) -- BaseHTTPMiddleware (what @app.middleware("http")
@@ -9988,11 +10067,22 @@ async def websocket_endpoint(websocket: WebSocket):
             cmd = data.get("command")
 
             if cmd == "pause":
+                # Fixed 2026-08-24 (GitHub #78 investigation) -- this WS path never
+                # called _save_run_state() at all, so a pause set here silently
+                # un-paused on the very next restart/Apply Update with no warning,
+                # exactly the gap the paused/stopped feature's own design comment
+                # says persistence exists to close. The dashboard's own Pause button
+                # now calls POST /api/pause instead (see that endpoint's docstring),
+                # but this command is kept working the same way for any other caller.
                 state.paused = True
+                state._save_run_state()
                 await state.broadcast({"type": "paused", "paused": True})
+                await state.broadcast({"type": "run_status", "run_status": state.run_status()})
             elif cmd == "resume":
                 state.paused = False
+                state._save_run_state()
                 await state.broadcast({"type": "paused", "paused": False})
+                await state.broadcast({"type": "run_status", "run_status": state.run_status()})
             elif cmd == "get_portfolio":
                 await websocket.send_json({"type": "portfolio", "portfolio": state.get_portfolio_snapshot()})
             elif cmd == "set_max_positions":
