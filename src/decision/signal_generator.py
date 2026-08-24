@@ -78,6 +78,17 @@ class SignalGenerator:
         # state.config[...] directly rather than caching it in an instance variable.
 
     def _evaluate_report(self, report: ResearchReport) -> TradeSignal | None:
+        # AI Data Integrity guard (added 2026-08-24, GitHub #80) -- every other real
+        # buy-decision call site in web/app.py checks is_fallback before treating a
+        # report as buy-eligible; this was the sole exception. Currently latent (the
+        # WS execute_buy/confirm_buy path this feeds has no live dashboard UI wired to
+        # it today), but a real gap if that ever changes, or if a future fallback
+        # source ever emits BUY (today's sole fallback, _rule_based_analysis, is
+        # capped to HOLD/SELL/STRONG_SELL and never does).
+        if getattr(report, "is_fallback", False):
+            logger.info("  %s REJECTED: fallback (non-AI) report", report.ticker)
+            return None
+
         min_conviction = self.config["research"]["min_conviction_score"]
         if report.conviction_score < min_conviction:
             logger.info("  %s REJECTED: conviction %d < %d", report.ticker, report.conviction_score, min_conviction)
