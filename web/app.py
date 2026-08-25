@@ -5447,6 +5447,25 @@ class DashboardState:
         asyncio.create_task(
             self.broadcast({"type": "promotion_attempt", "entry": entry}))
 
+    def _cash_reserve_insufficient(self, position_size: float, available_cash: float) -> bool:
+        """True if `available_cash` minus this candidate's `position_size` would leave
+        less than the configured `min_cash_reserve_pct` floor. Shared by
+        _attempt_near_miss_promotion's cheap pre-check (cached nm_snapshot price/stop,
+        raw self.portfolio.cash) and its later authoritative check (fresh re-analysis
+        price/stop, self.portfolio.cash netted against self._reserved_cash inside the
+        promotion-cash lock -- see GitHub #44) (2026-08-24, GitHub #92) -- these two
+        call sites used to write out this exact reserve-floor formula independently,
+        ~200 lines apart, risking a future tweak (e.g. adding a safety buffer) landing
+        on only one copy. `position_size` is passed in rather than computed here so
+        neither call site's own `calculate_position_size` call (needed independently
+        at the authoritative site, for the position-too-small gate before this check
+        even runs) gets duplicated or reordered. Pure comparison, no side effects --
+        `available_cash` is each caller's own responsibility to net against
+        self._reserved_cash where that matters."""
+        required_reserve = self.portfolio.total_value * (
+            self.config["risk_management"]["min_cash_reserve_pct"] / 100)
+        return available_cash - position_size < required_reserve
+
     async def _attempt_near_miss_promotion(
         self, ticker: str, nm_snapshot: dict | None = None, dip_low: float | None = None,
         sma_context: dict | None = None,
@@ -5551,9 +5570,7 @@ class DashboardState:
             if approx_price and approx_stop and approx_price > 0 and approx_stop > 0:
                 approx_size = self.risk_manager.calculate_position_size(
                     approx_price, approx_stop, self.portfolio.total_value)
-                approx_reserve = self.portfolio.total_value * (
-                    self.config["risk_management"]["min_cash_reserve_pct"] / 100)
-                if self.portfolio.cash - approx_size < approx_reserve:
+                if self._cash_reserve_insufficient(approx_size, self.portfolio.cash):
                     entry = self.add_ai_log(ticker, "ON_DECK",
                         "Insufficient cash reserve (pre-check against cached price) — "
                         "skipping before spending on a fresh AI re-analysis", "warning")
@@ -5784,14 +5801,12 @@ class DashboardState:
                 await _fail_gate("Position size too small", "Position size too small — skipping")
                 return
 
-            required_reserve = self.portfolio.total_value * (
-                self.config["risk_management"]["min_cash_reserve_pct"] / 100)
             # Lock scope is deliberately tight -- just the shared-state check-then-reserve,
             # not the failure-path logging/broadcast below (which await and don't need to
             # be serialized against other concurrent promotion attempts).
             async with self._promotion_cash_lock:
-                insufficient = (self.portfolio.cash - self._reserved_cash - position_size
-                                < required_reserve)
+                insufficient = self._cash_reserve_insufficient(
+                    position_size, self.portfolio.cash - self._reserved_cash)
                 if not insufficient:
                     self._reserved_cash += position_size
                     reserved_amount = position_size
