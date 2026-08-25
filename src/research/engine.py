@@ -587,14 +587,23 @@ class ResearchEngine:
     ) -> ResearchReport:
         logger.info("Starting research analysis for %s", ticker)
 
+        # Concurrent data-gathering (2026-08-24, GitHub #96) -- these 6 fetches used
+        # to run fully sequentially, paying each one's real network latency serially
+        # despite being independent I/O. get_long_term_trend is the one genuine
+        # exception: it takes quote.price as an input argument (used only to
+        # populate a fallback LongTermTrend on fetch failure -- the actual yfinance
+        # call itself doesn't need it), so quote must resolve first; the other 4 gain
+        # full concurrency alongside it via asyncio.gather.
         quote = await self.market_data.get_quote(ticker)
-        financials = await self.market_data.get_financials(ticker)
-        technicals = await self.market_data.get_technicals(ticker)
-        long_term_trend = await self.market_data.get_long_term_trend(
-            ticker, quote.price,
-            years=self.config.get("research", {}).get("long_term_trend_years", 5))
-        insider_summary = await self.insider_tracker.get_insider_summary(ticker)
-        news_items = await self.news_feed.get_company_news(ticker, days=7)
+        financials, technicals, long_term_trend, insider_summary, news_items = await asyncio.gather(
+            self.market_data.get_financials(ticker),
+            self.market_data.get_technicals(ticker),
+            self.market_data.get_long_term_trend(
+                ticker, quote.price,
+                years=self.config.get("research", {}).get("long_term_trend_years", 5)),
+            self.insider_tracker.get_insider_summary(ticker),
+            self.news_feed.get_company_news(ticker, days=7),
+        )
 
         fundamental_score = await self.fundamental_analyzer.analyze(financials)
         sentiment_analysis = await self.sentiment_analyzer.analyze(news_items)
@@ -1563,15 +1572,27 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         """Fetch and locally analyze everything analyze_stock() gathers, minus the Claude
         call itself. Used by submit_analysis_batch() so batch requests are built from the
         exact same data/prompt the sequential path would use for the same ticker — no
-        separate or thinner data path for batch mode (the mistake PO-1 already fixed once)."""
+        separate or thinner data path for batch mode (the mistake PO-1 already fixed once).
+
+        Fetches concurrently (2026-08-24, GitHub #96) -- same fix and same reasoning
+        as analyze_stock's own identical 6-fetch sequence (see that function's own
+        comment): quote must resolve first since get_long_term_trend takes quote.price
+        as an input argument, but the other 4 are independent I/O and gain full
+        concurrency alongside it via asyncio.gather. This is the per-ticker data-
+        gathering step submit_analysis_batch already fans out across up to 5 tickers
+        concurrently (its own semaphore-bounded asyncio.gather) -- this fix adds a
+        second, compounding layer of concurrency WITHIN each of those 5 slots, not a
+        replacement for the existing across-tickers one."""
         quote = await self.market_data.get_quote(ticker)
-        financials = await self.market_data.get_financials(ticker)
-        technicals = await self.market_data.get_technicals(ticker)
-        long_term_trend = await self.market_data.get_long_term_trend(
-            ticker, quote.price,
-            years=self.config.get("research", {}).get("long_term_trend_years", 5))
-        insider_summary_raw = await self.insider_tracker.get_insider_summary(ticker)
-        news_items = await self.news_feed.get_company_news(ticker, days=7)
+        financials, technicals, long_term_trend, insider_summary_raw, news_items = await asyncio.gather(
+            self.market_data.get_financials(ticker),
+            self.market_data.get_technicals(ticker),
+            self.market_data.get_long_term_trend(
+                ticker, quote.price,
+                years=self.config.get("research", {}).get("long_term_trend_years", 5)),
+            self.insider_tracker.get_insider_summary(ticker),
+            self.news_feed.get_company_news(ticker, days=7),
+        )
 
         fundamental_score = await self.fundamental_analyzer.analyze(financials)
         sentiment_analysis = await self.sentiment_analyzer.analyze(news_items)
