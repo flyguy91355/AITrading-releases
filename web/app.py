@@ -4786,14 +4786,26 @@ class DashboardState:
         if not self.on_deck_blocked:
             return
         breakout_pct = self.config["research"].get("on_deck_block_breakout_pct", 2.0)
+        tickers_with_peaks = []
         for ticker, raw in list(self.on_deck_blocked.items()):
-            entry = _normalize_block_entry(raw)
-            ref_peak = entry["ref_peak"]
-            if ref_peak is None:
-                continue
-            try:
-                quote = await self.market_data.get_quote(ticker)
-            except Exception:
+            ref_peak = _normalize_block_entry(raw)["ref_peak"]
+            if ref_peak is not None:
+                tickers_with_peaks.append((ticker, ref_peak))
+        if not tickers_with_peaks:
+            return
+
+        # Concurrent quote fetch (2026-08-24, GitHub #94) -- each ticker's quote is
+        # independent I/O (yfinance/Finnhub round-trip + thread hop); fetching them one
+        # at a time serially paid roughly N * (per-quote latency) of unnecessary
+        # wall-clock time every 60s tick for no reason. asyncio.gather with
+        # return_exceptions=True preserves the original try/except-and-skip semantics
+        # per ticker (a fetch failure for one ticker never blocks or fails the others).
+        quotes = await asyncio.gather(
+            *(self.market_data.get_quote(t) for t, _ in tickers_with_peaks),
+            return_exceptions=True)
+
+        for (ticker, ref_peak), quote in zip(tickers_with_peaks, quotes):
+            if isinstance(quote, Exception):
                 continue
             if _price_clears_block_breakout(quote.price, ref_peak, breakout_pct):
                 self.on_deck_blocked.pop(ticker, None)
@@ -4907,16 +4919,37 @@ class DashboardState:
                 to_evict_rr_floor: list[tuple[str, float, float]] = []
                 to_evict_above_gate: list[tuple[str, float, float, str]] = []
 
-                for ticker, nm in list(self.near_miss_candidates.items()):
-                    if ticker in self.portfolio.positions:
-                        self.near_miss_candidates.pop(ticker, None)
+                # Concurrent quote fetch (2026-08-24, GitHub #94) -- each candidate's
+                # quote is independent I/O; fetching them one at a time serially paid
+                # roughly N * (per-quote latency) of unnecessary wall-clock time every
+                # 60s tick, directly delaying how quickly this tick's promotion/eviction
+                # decisions could act on fresh prices. Scoped strictly to the fetch
+                # itself -- the rest of each candidate's processing below (including a
+                # real, conditional Claude call for an above-gate candidate) stays
+                # exactly as sequential as before; parallelizing the whole loop body
+                # would have meant firing many concurrent Claude calls per tick instead
+                # of one at a time, a real, unintended cost-control regression this
+                # codebase has repeatedly guarded against elsewhere.
+                candidate_tickers = []
+                for t in list(self.near_miss_candidates.keys()):
+                    if t in self.portfolio.positions:
+                        self.near_miss_candidates.pop(t, None)
+                    else:
+                        candidate_tickers.append(t)
+                quotes = await asyncio.gather(
+                    *(self.market_data.get_quote(t) for t in candidate_tickers),
+                    return_exceptions=True)
+                quotes_by_ticker = dict(zip(candidate_tickers, quotes))
+
+                for ticker in candidate_tickers:
+                    nm = self.near_miss_candidates.get(ticker)
+                    if nm is None:
                         continue
-                    try:
-                        quote = await self.market_data.get_quote(ticker)
-                        price = quote.price
-                    except Exception as e:
-                        logger.debug("%s: near-miss price fetch failed: %s", ticker, e)
+                    quote = quotes_by_ticker.get(ticker)
+                    if isinstance(quote, Exception):
+                        logger.debug("%s: near-miss price fetch failed: %s", ticker, quote)
                         continue
+                    price = quote.price
                     if price <= 0:
                         continue
 
