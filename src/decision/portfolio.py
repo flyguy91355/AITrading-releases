@@ -1,5 +1,6 @@
 """Portfolio state and tracking with SQLite persistence."""
 
+import asyncio
 import json
 import logging
 import re
@@ -715,40 +716,127 @@ class Portfolio:
                 )
 
     async def _save_state(self):
+        """Persists the portfolio-level snapshot (cash, peak_value, day_start_value/
+        date) -- called from 15 real sites across order_manager.py/web/app.py/this
+        file, several reachable from position_update_loop's own tick (the same
+        loop _save_position's own 2026-08-25 fix covers -- see that method's
+        docstring for the live incident: "Position update failed: database is
+        locked" recurring during an unusually write-heavy afternoon). Same
+        retry-then-warn treatment for the identical reason -- this is a real,
+        continuously-rewritten snapshot (self-healing on the next successful
+        save), not correctness-critical for any single tick, but worth one
+        retry before giving up rather than silently losing it with no attempt."""
         if not self._db:
             return
-        await self._db.execute(
-            "INSERT OR REPLACE INTO portfolio_state (id, cash, peak_value, day_start_value, day_start_date) VALUES (1, ?, ?, ?, ?)",
-            (self.cash, self.peak_value, self.day_start_value, self.day_start_date),
-        )
-        await self._db.commit()
+        for attempt in range(2):
+            try:
+                await self._db.execute(
+                    "INSERT OR REPLACE INTO portfolio_state (id, cash, peak_value, day_start_value, day_start_date) VALUES (1, ?, ?, ?, ?)",
+                    (self.cash, self.peak_value, self.day_start_value, self.day_start_date),
+                )
+                await self._db.commit()
+                return
+            except sqlite3.OperationalError as e:
+                if attempt == 0:
+                    logger.warning(
+                        "_save_state: database locked, retrying once in 2s: %s", e,
+                    )
+                    await asyncio.sleep(2)
+                    continue
+                logger.error(
+                    "_save_state: database still locked after one retry -- portfolio "
+                    "snapshot (cash=%.2f) may be stale until a later save succeeds: %s",
+                    self.cash, e,
+                )
 
     async def _save_position(self, position: Position):
+        """Persists the full Position row -- the canonical DB record for a held
+        position's state (shares, stop_loss, take_profit_targets, trailing_stop,
+        etc.), called from 15 real sites across order_manager.py/web/app.py/this
+        file (trailing-stop ratchets, tranche fills, AI-chosen-stop updates, and
+        more). Retries once on a locked database, then fails soft with a loud
+        warning rather than raising (fixed 2026-08-25, live incident -- caught
+        live as "Monitor re-analysis failed: database is locked" repeating
+        across several held tickers during an unusually write-heavy afternoon).
+
+        Deliberately retry-then-warn here, NOT the same silent skip-and-log
+        pattern set_scan_cursor/save_analysis_history use -- this write is more
+        consequential than either of those (a real position's persisted state,
+        not a losable convenience/history record), so it's worth one real retry
+        before giving up. Even after a failed retry, this is NOT a live
+        protection gap: the caller's own in-memory `position` object (e.g.
+        position.stop_loss, already updated by the caller before this method
+        was ever invoked) is what sync_exit_orders/check_protection_gaps
+        actually read on their own next cycle -- broker-side protection is
+        governed by that live in-memory state, not by whether this specific DB
+        write landed. The real, bounded risk is narrower: this one update could
+        be lost if the process restarts before a later save of the same
+        position succeeds."""
         if not self._db:
             return
-        await self._db.execute(
-            "INSERT OR REPLACE INTO positions (ticker, shares, entry_price, current_price, stop_loss, take_profit_targets, sector, opened_at, trailing_stop, day_open_price, final_tranche_start_price, realized_pnl, shares_sold, t1_target_price, t2_target_price, profit_target_hit, trade_id, buy_thesis, buy_reasoning, buy_conviction, buy_signal, buy_rr, buy_required_rr, buy_fair_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                position.ticker, position.shares, position.entry_price,
-                position.current_price, position.stop_loss,
-                json.dumps(position.take_profit_targets), position.sector,
-                position.opened_at.isoformat(), position.trailing_stop,
-                position.day_open_price, position.final_tranche_start_price,
-                position.realized_pnl, position.shares_sold,
-                position.t1_target_price, position.t2_target_price,
-                int(position.profit_target_hit), position.trade_id,
-                position.buy_thesis, position.buy_reasoning, position.buy_conviction,
-                position.buy_signal, position.buy_rr, position.buy_required_rr,
-                position.buy_fair_value,
-            ),
-        )
-        await self._db.commit()
+        for attempt in range(2):
+            try:
+                await self._db.execute(
+                    "INSERT OR REPLACE INTO positions (ticker, shares, entry_price, current_price, stop_loss, take_profit_targets, sector, opened_at, trailing_stop, day_open_price, final_tranche_start_price, realized_pnl, shares_sold, t1_target_price, t2_target_price, profit_target_hit, trade_id, buy_thesis, buy_reasoning, buy_conviction, buy_signal, buy_rr, buy_required_rr, buy_fair_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        position.ticker, position.shares, position.entry_price,
+                        position.current_price, position.stop_loss,
+                        json.dumps(position.take_profit_targets), position.sector,
+                        position.opened_at.isoformat(), position.trailing_stop,
+                        position.day_open_price, position.final_tranche_start_price,
+                        position.realized_pnl, position.shares_sold,
+                        position.t1_target_price, position.t2_target_price,
+                        int(position.profit_target_hit), position.trade_id,
+                        position.buy_thesis, position.buy_reasoning, position.buy_conviction,
+                        position.buy_signal, position.buy_rr, position.buy_required_rr,
+                        position.buy_fair_value,
+                    ),
+                )
+                await self._db.commit()
+                return
+            except sqlite3.OperationalError as e:
+                if attempt == 0:
+                    logger.warning(
+                        "_save_position(%s): database locked, retrying once in 2s: %s",
+                        position.ticker, e,
+                    )
+                    await asyncio.sleep(2)
+                    continue
+                logger.error(
+                    "_save_position(%s): database still locked after one retry -- "
+                    "this position's DB record may be stale (in-memory stop_loss=%.2f) "
+                    "until a later save succeeds. Broker-side protection is UNAFFECTED "
+                    "-- exit-order sync reads live in-memory state, not the DB: %s",
+                    position.ticker, position.stop_loss, e,
+                )
 
     async def _remove_position_db(self, ticker: str):
+        """Same retry-then-warn treatment as _save_position (2026-08-25) -- a
+        failed delete here leaves a stale row in the DB for a position that's
+        genuinely closed in memory; the position's own in-memory removal from
+        self.positions (done by the caller, not here) is what every real
+        decision actually reads, so this isn't a live gap, just a DB-tidiness
+        risk that self-heals on the next full portfolio sync."""
         if not self._db:
             return
-        await self._db.execute("DELETE FROM positions WHERE ticker = ?", (ticker,))
-        await self._db.commit()
+        for attempt in range(2):
+            try:
+                await self._db.execute("DELETE FROM positions WHERE ticker = ?", (ticker,))
+                await self._db.commit()
+                return
+            except sqlite3.OperationalError as e:
+                if attempt == 0:
+                    logger.warning(
+                        "_remove_position_db(%s): database locked, retrying once in 2s: %s",
+                        ticker, e,
+                    )
+                    await asyncio.sleep(2)
+                    continue
+                logger.error(
+                    "_remove_position_db(%s): database still locked after one retry -- "
+                    "a stale row may remain until the next full portfolio sync: %s",
+                    ticker, e,
+                )
 
     async def get_trade_history_summary(self, ticker: str) -> str:
         """Every trade_history row for this ticker, formatted as compact context for a
