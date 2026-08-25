@@ -1486,6 +1486,9 @@ class DashboardState:
         # freshness the way Day P/L does. Empty dict means "not computed yet"; the
         # frontend/get_portfolio_snapshot both treat that the same as zero trades.
         self._win_rate_cache: dict = {}
+        # Cheap "has trade_history actually changed since the last refresh" fingerprint
+        # (2026-08-24, GitHub #95) -- see _refresh_win_rate_cache's own docstring.
+        self._win_rate_cache_last_sell_id: int | None = None
         # AI-entry recommendation that actually triggered a near-miss promotion buy
         # (2026-07-20) — ticker -> {ai_entry_price, ai_entry_reasoning, recorded_at}.
         # Without this, the specific recommendation/reasoning that led to the buy
@@ -1933,7 +1936,41 @@ class DashboardState:
         reasoning as get_portfolio_health's existing split: a stat blending in trades
         decided by the pre-2026-07-17 Watchlist-based system (which no longer exists)
         isn't a fair read on how the current logic performs. All-time is kept alongside
-        it for the tile's popup detail view."""
+        it for the tile's popup detail view.
+
+        Skips the 2 real _closed_trades_since scans entirely when nothing in
+        trade_history has changed since the last successful refresh (2026-08-24,
+        GitHub #95) -- this is called unconditionally every 60s tick, even overnight
+        and on weekends (deliberately, by design -- see the call site's own comment:
+        a viewer checking the dashboard after close shouldn't see a stale win rate).
+        Without this, that meant 2 full table scans + Python-side trade_id grouping on
+        every single tick regardless of whether a trade had actually closed since the
+        last check -- roughly 1,440+ unnecessary scan-pairs/day. Uses `MAX(id) FROM
+        trade_history WHERE action = 'SELL'` (trade_history.id is a real INTEGER
+        PRIMARY KEY AUTOINCREMENT column; confirmed no DELETE statement against this
+        table exists anywhere in the codebase, so it's genuinely append-only and this
+        max strictly increases only when a new SELL is actually recorded) as a cheap,
+        self-correcting "has anything relevant changed" fingerprint -- deliberately
+        NOT a manually-bumped counter/flag at every SELL write path (the issue's own
+        alternative suggestion): a flag risks a future write site forgetting to bump
+        it and silently freezing this cache stale forever, whereas deriving the
+        signal directly from the database's own real state can never drift out of
+        sync with what's actually there."""
+        if self.portfolio._db:
+            async with self.portfolio._db.execute(
+                "SELECT MAX(id) FROM trade_history WHERE action = 'SELL'"
+            ) as cur:
+                row = await cur.fetchone()
+            latest_sell_id = row[0] if row else None
+            if self._win_rate_cache and latest_sell_id == self._win_rate_cache_last_sell_id:
+                return
+            # Recorded unconditionally whenever a full recompute is about to run below
+            # (not just inside the skip check above) -- including the very first real
+            # call, when self._win_rate_cache is still empty -- so the NEXT tick's
+            # comparison has a real baseline to compare against instead of staying at
+            # its __init__ default and forcing one extra redundant recompute.
+            self._win_rate_cache_last_sell_id = latest_sell_id
+
         current_arch_trades = await self._closed_trades_since(_CURRENT_ARCHITECTURE_START)
         all_time_trades = await self._closed_trades_since(self.live_account_start)
         closed_current_arch = len(current_arch_trades)
