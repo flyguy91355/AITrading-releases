@@ -1144,6 +1144,50 @@ class OrderManager:
             self._stop_order_ids[ticker] = result.broker_order_id
         return result
 
+    def _resolve_retry_quantity(self, original_quantity: float, error: Exception) -> tuple[float, bool]:
+        """Given a broker rejection already confirmed to be the "insufficient qty"
+        settlement-lag class (a tiny float-accumulation drift between our locally
+        computed share count and Alpaca's true available balance, or Alpaca not
+        yet having freed shares from a just-cancelled order), decides what
+        quantity a single retry should use. Returns (retry_quantity,
+        needs_settlement_wait).
+
+        Parses the broker's own "available: N" figure out of `error` via
+        _INSUFFICIENT_QTY_RE and uses it as the retry quantity when present and
+        positive (needs_settlement_wait=False) -- Alpaca's own exact number is
+        more trustworthy than our locally-computed one. When no usable number is
+        present (available == 0, or the error text doesn't parse at all -- Alpaca
+        omitting a number entirely is treated the same as available == 0, not as
+        "give up"), signals that a brief settlement wait is needed before the
+        caller retries once at the ORIGINAL requested quantity instead
+        (2026-07-28, MET incident: giving up immediately here left a position
+        genuinely unprotected until an unrelated trigger happened to close it via
+        a different code path).
+
+        Pure/sync -- no I/O, no sleep -- callers own the actual `await
+        asyncio.sleep(...)` and the retry submission itself; this only decides
+        the quantity. Extracted 2026-08-24 (GitHub #89) as the single shared
+        decision both _place_stop_only (its stop leg and its stop-breached
+        market-sell fallback) and _execute_take_profit_tranche now use, closing
+        off 3 independently-drifted copies of this exact parse-and-decide logic.
+
+        Deliberately NOT used by _execute_sell, which has a genuinely different
+        problem to solve there -- a stale LOCAL share count (e.g. a TP fill
+        happened while the process was offline), not just a broker-side
+        settlement lag -- via a real get_positions() re-fetch that corrects
+        persisted position state, something error-text parsing structurally
+        cannot do (it also can't detect "position already fully closed
+        elsewhere," which that re-fetch explicitly handles). Confirmed via
+        Alpaca's own docs (docs.alpaca.markets/reference/getallopenpositions,
+        .../reference/postorder) that qty_available on a live Position and this
+        rejection's error text are two separate, undocumented-as-related pieces
+        of API surface -- there's no single mechanism to unify them around."""
+        match = _INSUFFICIENT_QTY_RE.search(str(error))
+        available = float(match.group(1)) if match else 0.0
+        if available > 0:
+            return available, False
+        return original_quantity, True
+
     async def _place_stop_only(self, ticker: str, shares: float, stop_price: float) -> bool:
         """The stop-placement half of the old _place_exit_orders, extracted verbatim
         (2026-08-11) so both _place_exit_orders (the normal "no exit orders yet" path)
@@ -1224,30 +1268,14 @@ class OrderManager:
                         # "available: N" and retry once with that exact quantity, same
                         # fix already proven for the stop-order path above.
                         if "insufficient qty" in e2_str or "insufficient quantity" in e2_str:
-                            match = _INSUFFICIENT_QTY_RE.search(str(e2))
-                            available = float(match.group(1)) if match else 0.0
-                            if available > 0:
+                            retry_qty, needs_wait = self._resolve_retry_quantity(shares, e2)
+                            if not needs_wait:
                                 logger.warning(
                                     "Market-sell fallback for %s rejected on qty (requested "
-                                    "%.9f, available %s) — retrying with broker's exact "
+                                    "%.9f, available %.9f) — retrying with broker's exact "
                                     "available quantity",
-                                    ticker, shares, match.group(1),
+                                    ticker, shares, retry_qty,
                                 )
-                                try:
-                                    await self._build_and_submit_sell(ticker, OrderType.MARKET, available)
-                                    logger.info(
-                                        "Market sell submitted for %s (%.4g shares, "
-                                        "qty-corrected retry) — stop was already breached",
-                                        ticker, available,
-                                    )
-                                    stop_ok = True
-                                except Exception as e3:
-                                    logger.error(
-                                        "Market-sell fallback qty-corrected retry also failed "
-                                        "for %s: %s — position remains unprotected until next "
-                                        "sync_exit_orders cycle",
-                                        ticker, e3,
-                                    )
                             else:
                                 # available == 0 -- same settlement-lag case as the stop-order
                                 # path's available:0 retry, just one level deeper (stop
@@ -1261,21 +1289,23 @@ class OrderManager:
                                     ticker, shares,
                                 )
                                 await asyncio.sleep(2)
-                                try:
-                                    await self._build_and_submit_sell(ticker, OrderType.MARKET, shares)
-                                    logger.info(
-                                        "Market sell submitted for %s (%.4g shares, "
-                                        "available:0 retry) — stop was already breached",
-                                        ticker, shares,
-                                    )
-                                    stop_ok = True
-                                except Exception as e3:
-                                    logger.error(
-                                        "Market-sell fallback available:0 retry also failed "
-                                        "for %s: %s — position remains unprotected until next "
-                                        "sync_exit_orders cycle",
-                                        ticker, e3,
-                                    )
+                            try:
+                                await self._build_and_submit_sell(ticker, OrderType.MARKET, retry_qty)
+                                logger.info(
+                                    "Market sell submitted for %s (%.4g shares, %s) — "
+                                    "stop was already breached",
+                                    ticker, retry_qty,
+                                    "qty-corrected retry" if not needs_wait else "available:0 retry",
+                                )
+                                stop_ok = True
+                            except Exception as e3:
+                                logger.error(
+                                    "Market-sell fallback %s also failed for %s: %s — "
+                                    "position remains unprotected until next "
+                                    "sync_exit_orders cycle",
+                                    "qty-corrected retry" if not needs_wait else "available:0 retry",
+                                    ticker, e3,
+                                )
                         else:
                             logger.error(
                                 "Market-sell fallback also failed for %s: %s — "
@@ -1315,53 +1345,42 @@ class OrderManager:
                     # and Alpaca's true available balance (e.g. requesting 2.485746103 shares
                     # when Alpaca's real available is 2.485746102 — a sub-billionth-of-a-share
                     # difference) can make Alpaca reject an otherwise-correct stop order
-                    # outright. Parse the broker's own "available: N" figure from the error
-                    # and retry once with that exact quantity instead of our computed one.
-                    match = _INSUFFICIENT_QTY_RE.search(str(e))
-                    available = float(match.group(1)) if match else 0.0
-                    if available > 0:
+                    # outright. _resolve_retry_quantity parses the broker's own "available: N"
+                    # figure from the error and returns it as the retry quantity; if Alpaca
+                    # gave no usable number (available == 0 -- hasn't finished freeing the
+                    # shares yet, 2026-07-28 MET incident), it signals a settlement wait is
+                    # needed before retrying once at the ORIGINAL requested quantity instead
+                    # of giving up after a single attempt.
+                    retry_qty, needs_wait = self._resolve_retry_quantity(stop_shares, e)
+                    if not needs_wait:
                         logger.warning(
-                            "Stop order for %s rejected on qty (requested %.9f, available %s) — "
+                            "Stop order for %s rejected on qty (requested %.9f, available %.9f) — "
                             "retrying with broker's exact available quantity",
-                            ticker, stop_shares, match.group(1),
+                            ticker, stop_shares, retry_qty,
                         )
-                        try:
-                            await self._build_and_submit_sell(
-                                ticker, OrderType.STOP, available, stop_price=stop_price)
-                            logger.info(
-                                "Stop placed for %s: %.4g shares @ $%.2f (qty-corrected retry)",
-                                ticker, available, stop_price,
-                            )
-                            stop_ok = True
-                        except Exception as e2:
-                            logger.warning("Stop order qty-corrected retry also failed for %s: %s", ticker, e2)
                     else:
-                        # available == 0 (not just a tiny float-drift mismatch) -- Alpaca
-                        # hasn't finished freeing the shares yet (2026-07-28, MET incident).
-                        # The qty-corrected retry above can't help here since Alpaca gave no
-                        # usable number to retry with; wait a bit longer for settlement and
-                        # retry once at the ORIGINAL requested quantity instead of giving up
-                        # after a single attempt.
                         logger.warning(
                             "Stop order for %s rejected with available:0 (requested %.9f) — "
                             "waiting 2s for settlement then retrying once",
                             ticker, stop_shares,
                         )
                         await asyncio.sleep(2)
-                        try:
-                            await self._build_and_submit_sell(
-                                ticker, OrderType.STOP, stop_shares, stop_price=stop_price)
-                            logger.info(
-                                "Stop placed for %s: %.4g shares @ $%.2f (available:0 retry)",
-                                ticker, stop_shares, stop_price,
-                            )
-                            stop_ok = True
-                        except Exception as e2:
-                            logger.warning(
-                                "Stop order available:0 retry also failed for %s: %s — "
-                                "position remains unprotected until next sync_exit_orders cycle",
-                                ticker, e2,
-                            )
+                    try:
+                        await self._build_and_submit_sell(
+                            ticker, OrderType.STOP, retry_qty, stop_price=stop_price)
+                        logger.info(
+                            "Stop placed for %s: %.4g shares @ $%.2f (%s)",
+                            ticker, retry_qty, stop_price,
+                            "qty-corrected retry" if not needs_wait else "available:0 retry",
+                        )
+                        stop_ok = True
+                    except Exception as e2:
+                        logger.warning(
+                            "Stop order %s also failed for %s: %s%s",
+                            "qty-corrected retry" if not needs_wait else "available:0 retry",
+                            ticker, e2,
+                            "" if not needs_wait else " — position remains unprotected until next sync_exit_orders cycle",
+                        )
                 else:
                     logger.warning("Stop order failed for %s: %s", ticker, e)
 
@@ -2040,37 +2059,24 @@ class OrderManager:
 
             sell_qty = round(tranche_shares, 9)
             try:
-                tp_order = Order(
-                    ticker=ticker, side=OrderSide.SELL,
-                    order_type=OrderType.MARKET,
-                    quantity=sell_qty,
-                )
-                result = await self.broker.submit_order(tp_order)
-                self.active_orders[result.broker_order_id] = result
+                result = await self._build_and_submit_sell(ticker, OrderType.MARKET, sell_qty)
             except Exception as e:
                 # Same settlement-lag "insufficient qty" class this codebase has hit
-                # repeatedly for the stop leg (see _place_stop_only) -- the stop was
-                # JUST cancelled above, and Alpaca doesn't always free those shares as
-                # immediately available. One retry with the broker's own exact
-                # available quantity (or, if unparseable, a short wait and a retry at
-                # the original quantity) before giving up and restoring protection.
+                # repeatedly for the stop leg (see _place_stop_only, which shares this
+                # exact retry-decision logic via _resolve_retry_quantity, 2026-08-24
+                # GitHub #89) -- the stop was JUST cancelled above, and Alpaca doesn't
+                # always free those shares as immediately available. One retry with the
+                # broker's own exact available quantity (or, if unparseable, a short
+                # wait and a retry at the original quantity) before giving up and
+                # restoring protection.
                 err_str = str(e).lower()
                 retried = False
                 if "insufficient qty" in err_str or "insufficient quantity" in err_str:
-                    match = _INSUFFICIENT_QTY_RE.search(str(e))
-                    available = float(match.group(1)) if match else 0.0
-                    if available > 0:
-                        sell_qty = available
-                    else:
+                    sell_qty, needs_wait = self._resolve_retry_quantity(sell_qty, e)
+                    if needs_wait:
                         await asyncio.sleep(2)
                     try:
-                        tp_order = Order(
-                            ticker=ticker, side=OrderSide.SELL,
-                            order_type=OrderType.MARKET,
-                            quantity=sell_qty,
-                        )
-                        result = await self.broker.submit_order(tp_order)
-                        self.active_orders[result.broker_order_id] = result
+                        result = await self._build_and_submit_sell(ticker, OrderType.MARKET, sell_qty)
                         retried = True
                     except Exception as e2:
                         logger.warning(
