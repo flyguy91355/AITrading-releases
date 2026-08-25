@@ -811,6 +811,24 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
+          <div class="setting-label">SMA Crossover Max Age (days) <button type="button" class="info-btn" onclick="showInfo(event,'A hard ceiling on how old a KNOWN SMA golden-cross date can be before Track 2 excludes the candidate entirely -- never spending a real Claude call on it. Does not apply when no crossover was found at all within the Lookback Days window above (a sustained, longer-standing relationship rather than a dated event) -- that case is still left to the AI\'s own judgment. Does not affect Track 1 at all.')">i</button></div>
+          <div class="setting-desc">Mechanically exclude a Track 2 candidate whose crossover is older than this</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.sma_crossover_max_age_days"
+               value="{{ cfg.research.sma_crossover_max_age_days }}" min="1" max="252">
+        <div class="default-label">default<br><span class="default-val">21</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">SMA Near-Crossover Threshold (%) <button type="button" class="info-btn" onclick="showInfo(event,'A not-yet-crossed On Shore candidate is still sent through Track 2 (a real Claude call, with a distinct \'approaching, not yet crossed\' prompt framing) if the gap between SMA50 and SMA200, as a percentage of price, is within this many percent -- a cheap, zero-extra-fetch proxy for \'about to cross.\' Does not attempt to judge whether the gap is narrowing vs. just persistently close. Does not affect Track 1 at all.')">i</button></div>
+          <div class="setting-desc">How close (as % of price) a not-yet-crossed SMA gap must be to still get a look</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.sma_near_crossover_threshold_pct"
+               value="{{ cfg.research.sma_near_crossover_threshold_pct }}" min="0" max="20">
+        <div class="default-label">default<br><span class="default-val">2.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
           <div class="setting-label">On Deck Entry Mode <button type="button" class="info-btn" onclick="showInfo(event,'How On Deck decides a dip has recovered enough to buy. AI mode: once a real dip starts recovering (2+ consecutive upticks off the low), asks Claude once for a specific entry price given the actual observed peak/low/current price -- a judgment call informed by real price action, not a prediction made before any dip happened. Retracement % mode: a fixed mechanical rule instead -- price must recover a set percentage of the dip depth (see the setting below). Both modes share the same underlying peak/low/depth detection; only how the final entry price is decided differs. The other mode\'s number is still shown on the chart for comparison even while inactive.')">i</button></div>
           <div class="setting-desc">How the entry price for a recovering dip gets decided</div>
         </div>
@@ -1471,6 +1489,8 @@ const DEFAULTS = {
   'research.on_deck_rr_floor': 1.5,
   'research.long_term_trend_years': 5,
   'research.sma_crossover_lookback_days': 252,
+  'research.sma_crossover_max_age_days': 21,
+  'research.sma_near_crossover_threshold_pct': 2.0,
   'research.on_deck_entry_mode': 'ai',
   'research.on_deck_ai_entry_low_refresh_pct': 1.0,
   'research.on_deck_ai_entry_arm_band_pct': 2.0,

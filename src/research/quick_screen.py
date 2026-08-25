@@ -64,44 +64,59 @@ def _rsi(closes: np.ndarray, period: int = 14) -> float:
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
-def quick_screen(ticker: str) -> tuple[bool, str]:
-    """Return (passes, reason). Synchronous — run in executor from async code."""
+def quick_screen(ticker: str) -> tuple[bool, str, float | None, float | None]:
+    """Return (passes, reason, sma_50, sma_200). Synchronous — run in executor from
+    async code.
+
+    sma_50/sma_200 (added 2026-08-25) are Yahoo's own `fast_info` moving-average
+    fields — already fetched here as part of this function's own existing 50-/
+    200-day trend check, previously computed and then discarded. Returned as soon
+    as both are available (even on an early rejection from a LATER check -- RSI/
+    momentum/P/E), so a caller iterating the universe for its own purposes can
+    reuse them for free instead of a second, fully independent per-ticker fetch.
+    None/None whenever the function returns before reaching that point (the
+    volume or price checks failed first) or on any error — a caller must treat
+    None as "not available this pass," not "definitely no golden/death cross."
+    This is a coarse, Yahoo-precomputed value suitable for a cheap mechanical
+    pre-filter only; a caller needing precise, freshly-computed SMAs (e.g. the
+    real AI-facing crossover context) should still fetch its own via
+    get_technicals()/get_sma_crossover_info(), same as before."""
     try:
         t = yf.Ticker(ticker)
         info = t.fast_info
 
         avg_vol = getattr(info, "three_month_average_volume", 0) or 0
         if avg_vol < _MIN_AVG_VOLUME:
-            return False, f"low volume ({avg_vol:,.0f} avg)"
+            return False, f"low volume ({avg_vol:,.0f} avg)", None, None
 
         price = getattr(info, "last_price", None)
         if not price or price <= 0:
-            return False, "no price data"
+            return False, "no price data", None, None
 
         ma50 = getattr(info, "fifty_day_average", None)
-        if ma50 and price < ma50:
-            return False, f"below 50-day trend (${price:.2f} < 50-MA ${ma50:.2f})"
-
         ma200 = getattr(info, "two_hundred_day_average", None)
+
+        if ma50 and price < ma50:
+            return False, f"below 50-day trend (${price:.2f} < 50-MA ${ma50:.2f})", ma50, ma200
         if ma200 and price < ma200:
-            return False, f"below long-term trend (${price:.2f} < 200-MA ${ma200:.2f})"
+            return False, f"below long-term trend (${price:.2f} < 200-MA ${ma200:.2f})", ma50, ma200
         # Golden-cross (50-MA > 200-MA) requirement removed in v6 — see module docstring.
 
         hist = t.history(period="2mo", interval="1d")
         if hist.empty or len(hist) < 15:
-            return False, "insufficient history"
+            return False, "insufficient history", ma50, ma200
 
         closes = hist["Close"].values
         rsi = _rsi(closes)
 
         if rsi > _RSI_HIGH:
-            return False, f"overbought (RSI {rsi:.0f})"
+            return False, f"overbought (RSI {rsi:.0f})", ma50, ma200
         if rsi < _RSI_LOW:
-            return False, f"oversold (RSI {rsi:.0f})"
+            return False, f"oversold (RSI {rsi:.0f})", ma50, ma200
 
         if len(closes) >= 20 and closes[-1] < closes[-20] * _MOMENTUM_MIN_GAIN:
             chg = (closes[-1] / closes[-20] - 1) * 100
-            return False, f"insufficient momentum ({chg:+.1f}% vs 20d ago)"
+            return False, f"insufficient momentum ({chg:+.1f}% vs 20d ago)", ma50, ma200
 
         # P/E check last — needs yfinance's slower full .info call, so only pay that
         # cost for stocks that already survived every free/instant check above.
@@ -110,10 +125,10 @@ def quick_screen(ticker: str) -> tuple[bool, str]:
         except Exception:
             pe = None
         if pe is not None and pe > _MAX_TRAILING_PE:
-            return False, f"overvalued (P/E {pe:.0f})"
+            return False, f"overvalued (P/E {pe:.0f})", ma50, ma200
 
-        return True, f"RSI {rsi:.0f} | vol {avg_vol / 1e6:.1f}M | momentum OK"
+        return True, f"RSI {rsi:.0f} | vol {avg_vol / 1e6:.1f}M | momentum OK", ma50, ma200
 
     except Exception as e:
         logger.debug("Quick screen error for %s: %s", ticker, e)
-        return False, "data error"
+        return False, "data error", None, None

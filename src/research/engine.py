@@ -466,6 +466,7 @@ def _build_market_context_section(market_change_pct: float | None) -> str:
 def _build_sma_trend_section(
     sma_50: float, sma_200: float, crossover_date: str | None,
     days_since_crossover: int | None, market_cap: float,
+    approaching: bool = False, gap_pct: float | None = None,
 ) -> str:
     """Prompt section for a Track 2 (SMA Trend-Confirmation Track, 2026-08-24 design,
     ported from AIShortTrading) candidate -- states the real SMA50/SMA200
@@ -475,12 +476,41 @@ def _build_sma_trend_section(
     _market_cap_tier_label's own "how stale is too stale depends on company size"
     judgment already used by recommend_dip_entry. Returns "" when sma_50/sma_200 are
     non-positive (no usable data), same graceful-omission pattern as every other
-    optional prompt section in this file."""
+    optional prompt section in this file.
+
+    approaching/gap_pct (2026-08-25, owner request: "what it needs to look for..
+    is just about to cross, and has already just crossed") -- a second, distinct
+    case alongside the original already-crossed one: a candidate whose SMA50/
+    SMA200 gap is small (see _sma_near_crossover, web/app.py) but hasn't actually
+    flipped yet. Deliberately a SEPARATE phrasing, not a reuse of the confirmed-
+    cross text with different numbers -- stating "a golden cross state... is a
+    mechanical signal of a confirmed uptrend" about a stock that HASN'T crossed
+    would be factually false and could mislead the judgment. The approaching
+    framing asks a narrower question (early entry ahead of mechanical
+    confirmation) rather than the confirmed framing's "is this still meaningful
+    now that some time has passed" question."""
     if sma_50 <= 0 or sma_200 <= 0:
         return ""
-    relationship = "above" if sma_50 > sma_200 else "below"
     tier = _market_cap_tier_label(market_cap)
     tier_text = tier if tier else "unknown size"
+    if approaching:
+        gap_text = f"{gap_pct:.2f}%" if gap_pct is not None else "a small amount"
+        return (
+            f"\n── SMA TREND SIGNAL (approaching, not yet crossed) ──\n"
+            f"SMA50 (${sma_50:.2f}) is still below SMA200 (${sma_200:.2f}), but the gap "
+            f"between them is only {gap_text} of the current price — close enough that a "
+            f"continuation of the recent trend would flip this into a golden cross soon. "
+            f"This is NOT yet a confirmed crossover; it's an early read on one that may be "
+            f"forming. Company size: {tier_text}.\n"
+            f"Judge whether the underlying trend is genuinely strong and durable enough to "
+            f"justify entering AHEAD of the mechanical confirmation, or whether this gap is "
+            f"just as likely to widen back out as it is to close — a larger, more stable "
+            f"company's trend is generally more reliable to anticipate this way than a "
+            f"small, volatile one's. Set trend_confirms_entry to true only if you genuinely "
+            f"believe early entry is justified here — this is a higher bar than the "
+            f"already-crossed case, since the cross itself hasn't actually happened yet.\n"
+        )
+    relationship = "above" if sma_50 > sma_200 else "below"
     if crossover_date and days_since_crossover is not None:
         day_word = "day" if days_since_crossover == 1 else "days"
         recency = (
@@ -1426,7 +1456,8 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             sma_trend_section = _build_sma_trend_section(
                 sma_context.get("sma_50", 0.0), sma_context.get("sma_200", 0.0),
                 sma_context.get("crossover_date"), sma_context.get("days_since_crossover"),
-                sma_context.get("market_cap", 0.0))
+                sma_context.get("market_cap", 0.0),
+                sma_context.get("approaching", False), sma_context.get("gap_pct"))
         else:
             sma_trend_section = ""
 

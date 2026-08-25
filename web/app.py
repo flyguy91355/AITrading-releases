@@ -60,14 +60,15 @@ _SQLITE_TIMEOUT_SECS = 20.0
 from src.research.rr_curve import dip_summary, price_sparkline, rr_at_price, rr_points, rr_sparkline
 
 
-async def _quick_screen_with_timeout(ticker: str) -> tuple[bool, str] | None:
+async def _quick_screen_with_timeout(ticker: str) -> tuple[bool, str, float | None, float | None] | None:
     """Shared wrapper for quick_screen() with the 15s hang-protection timeout above --
     extracted (2026-08-03) after the identical try/except block was independently
     copy-pasted into both _run_pre_open_batch's and _run_midday_rescan's inner chunk
     generators, including the same comment -- the exact "duplicated logic drifts"
     failure class this project has hit before (population floor, composite score,
     admission gates). Returns None on any error or timeout (caller should `continue`
-    to the next ticker); returns quick_screen()'s real (passes, reason) tuple otherwise."""
+    to the next ticker); returns quick_screen()'s real (passes, reason, sma_50, sma_200)
+    tuple otherwise."""
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(quick_screen, ticker), timeout=_QUICK_SCREEN_TIMEOUT_SECS)
@@ -75,22 +76,6 @@ async def _quick_screen_with_timeout(ticker: str) -> tuple[bool, str] | None:
         # Exception already covers asyncio.TimeoutError (an alias for the builtin
         # TimeoutError, itself an OSError subclass) -- no separate branch needed.
         logger.debug("Quick screen error/timeout for %s: %s", ticker, _qs_err)
-        return None
-
-
-async def _get_technicals_with_timeout(market_data, ticker: str):
-    """Shared hang-protection wrapper for get_technicals(), mirroring
-    _quick_screen_with_timeout's own 15s timeout above (2026-08-24, SMA
-    Trend-Confirmation Track design, ported from AIShortTrading) -- Stage 1 of
-    Track 2 calls this once per universe ticker, so a single unresponsive ticker
-    must not freeze the whole scan. Returns None on any error or timeout (caller
-    should `continue` to the next ticker); returns the real TechnicalIndicators
-    otherwise."""
-    try:
-        return await asyncio.wait_for(
-            market_data.get_technicals(ticker), timeout=_QUICK_SCREEN_TIMEOUT_SECS)
-    except Exception as _gt_err:
-        logger.debug("get_technicals error/timeout for %s: %s", ticker, _gt_err)
         return None
 from src.decision.signal_generator import SignalGenerator
 from src.decision.risk_manager import RiskManager
@@ -962,6 +947,57 @@ def _sma_golden_cross_qualifies(sma_50: float, sma_200: float) -> bool:
     return sma_50 > 0 and sma_200 > 0 and sma_50 > sma_200
 
 
+def _sma_crossover_too_stale(days_since_crossover: int | None, max_age_days: int) -> bool:
+    """Mechanical Stage 2 staleness ceiling for Track 2 (2026-08-25, owner request:
+    "just becasue the sma crossed more than a month ago.. doesnt work well for this
+    program"). Before this, a crossover of ANY age still reached a real Claude call --
+    the AI's own judgment (see _build_sma_trend_section) was the only thing standing
+    between a genuinely fresh cross and one from months ago, with no hard floor at
+    all. Mirrors this project's own established R/R-ceiling pattern (a hard
+    mechanical exclude beyond a margin, AI judgment reserved for genuinely close
+    calls within the band, not asked to evaluate everything) rather than leaving this
+    entirely to AI judgment.
+
+    True (too stale, mechanically exclude -- never even reaches Claude) when a real
+    crossover date was found AND it's older than max_age_days. Deliberately does NOT
+    cover days_since_crossover=None (get_sma_crossover_info found no crossover at all
+    within the whole lookback window, meaning the relationship has been sustained,
+    not freshly triggered) -- the owner's own framing was specifically about a KNOWN
+    crossover being old ("the sma crossed more than a month ago"), a different
+    situation from one that's simply always been this way with no dated event to
+    measure staleness against; that case is left to the AI's own existing "sustained,
+    longer-standing state" framing, unchanged."""
+    return days_since_crossover is not None and days_since_crossover > max_age_days
+
+
+def _sma_near_crossover(sma_50: float, sma_200: float, price: float, threshold_pct: float) -> bool:
+    """True when SMA50 is still below SMA200 (not yet a golden cross -- that's Stage
+    1's own `_sma_golden_cross_qualifies` case, not this one) but the gap between
+    them, as a percentage of price, is within threshold_pct -- a cheap, zero-extra-
+    fetch proxy for "about to cross" (2026-08-25, owner request: "what it needs to
+    look for.. is just about to cross, and has already just crossed"). Reuses
+    exactly the same quick_screen-cached sma_50/sma_200 data Stage 1's existing
+    golden-cross check already has in hand, plus a recently-cached price (see
+    _run_sma_trend_scan's own call site) -- no new fetch, consistent with the
+    broader On-Shore-scoping cost reduction this whole track went through the same
+    day.
+
+    Deliberately does NOT attempt to distinguish a genuinely NARROWING gap from one
+    that's simply persistently close (that would need a second historical data
+    point per candidate -- a short recent series -- reopening exactly the kind of
+    per-ticker fetch cost that rework eliminated). A small gap is treated as a
+    real, useful signal on its own regardless of trend direction, since price
+    action moving either way from here is close to flipping the relationship --
+    the AI prompt this feeds (_build_sma_trend_section's approaching=True branch)
+    explicitly asks Claude to judge durability, not just proximity."""
+    if sma_50 <= 0 or sma_200 <= 0 or price <= 0:
+        return False
+    if sma_50 >= sma_200:
+        return False
+    gap_pct = (sma_200 - sma_50) / price * 100
+    return gap_pct <= threshold_pct
+
+
 def _track2_rr_override_applies(
     is_track2: bool, trend_confirms_entry: bool, rr: float, rr_floor: float,
 ) -> bool:
@@ -1558,6 +1594,22 @@ class DashboardState:
         # above, since this is a genuinely separate, additive mechanism from Track
         # 1's own scans.
         self._sma_trend_scan_in_progress: bool = False
+
+        # Shared SMA50/SMA200 cache, ticker -> (sma_50, sma_200) (2026-08-25, owner
+        # concern: "why cant it do both track 1 and 2 withe the same scan... does it
+        # scan the same stocks again?") -- Track 1's own quick_screen() already fetches
+        # both values as part of its existing 50-/200-day trend check (previously
+        # discarded); every real _quick_screen_with_timeout call site now stashes them
+        # here regardless of pass/fail, so _run_sma_trend_scan (Track 2) can read a
+        # ticker's SMA relationship for free instead of independently re-fetching
+        # technicals for the entire universe a second time. Deliberately never cleared
+        # between runs (not reset per-scan) -- SMA50/200 barely move within a single
+        # trading day, so an entry left over from this morning's pre-open pass is still
+        # accurate context for an afternoon mid-day-rescan's own Track 2 pass; each
+        # entry naturally refreshes itself the next time quick_screen touches that
+        # ticker again (which happens for nearly the whole universe once per day, since
+        # quick_screen is the very first check every pre-open run applies).
+        self._quick_screen_sma_cache: dict[str, tuple[float, float]] = {}
 
         # Update-available apply guard (2026-08-12, owner concern: "someone would push
         # the button again") -- the frontend already disables the clicked button for
@@ -3723,7 +3775,7 @@ class DashboardState:
             if ticker in held_tickers or ticker in self.watchlist_manager.get_active_tickers():
                 continue
             try:
-                passes, _ = await asyncio.to_thread(quick_screen, ticker)
+                passes, _, _, _ = await asyncio.to_thread(quick_screen, ticker)
                 if not passes:
                     await asyncio.sleep(0.5)
                     continue
@@ -3787,7 +3839,7 @@ class DashboardState:
         for ticker in available:
             is_batch = ticker in batch_set
             if not is_batch:
-                passes, reason = await asyncio.to_thread(quick_screen, ticker)
+                passes, reason, _, _ = await asyncio.to_thread(quick_screen, ticker)
                 if not passes:
                     logger.debug("Quick screen rejected %s: %s", ticker, reason)
                     if ticker in STOCK_UNIVERSE:
@@ -4537,6 +4589,34 @@ class DashboardState:
         candidate that can't legally be bought for the next N days shouldn't sit on the
         dashboard showing a live "Buy" badge as if it's a real prospect."""
         return not self.risk_manager.check_wash_sale_cooldown(ticker, self.portfolio)
+
+    def _on_shore_tickers(self, today_str: str | None = None) -> set[str]:
+        """The current "On Shore" ticker set -- cleared quick_screen and got a real
+        analysis today via the universe scan, but didn't qualify for On Deck. Extracted
+        (2026-08-25) from GET /api/today-scan-rejects's own filter loop, now shared with
+        _run_sma_trend_scan -- owner request/live incident: Track 2 was independently
+        re-walking the ENTIRE universe every run instead of only looking at stocks that
+        had already cleared today's real screen ("why cant it do both track 1 and 2
+        withe the same scan... this would take hours and hours scanning the universe
+        and cost me a lot of money" / "i cant have it scan like that"). Same "duplicated
+        logic drifts" risk this project has hit before with population floors/composite
+        scores if this filter were left independently copy-pasted in two places."""
+        today_str = today_str or self._now_et().strftime("%Y-%m-%d")
+        held = set(self.portfolio.positions.keys())
+        result = set()
+        for ticker, r in self.research_reports.items():
+            if r.get("source") != "universe_scan":
+                continue
+            if not r.get("generated_at", "").startswith(today_str):
+                continue
+            if ticker in self.near_miss_candidates or ticker in held:
+                continue
+            if self._is_on_deck_blocked(ticker):
+                continue
+            if self._wash_sale_blocked(ticker):
+                continue
+            result.add(ticker)
+        return result
 
     async def remove_on_deck_candidate(
         self, ticker: str, permanent: bool, days, note: str = "", initiated_by: str = "user",
@@ -7506,7 +7586,9 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     result = await _quick_screen_with_timeout(ticker)
                     if result is None:
                         continue
-                    passes, _reason = result
+                    passes, _reason, sma_50, sma_200 = result
+                    if sma_50 is not None and sma_200 is not None:
+                        self._quick_screen_sma_cache[ticker] = (sma_50, sma_200)
 
                     if not passes:
                         screened_out += 1
@@ -7560,39 +7642,89 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         end of both _run_pre_open_batch and _run_midday_rescan (see their own call
         sites), matching Track 1's existing scan cadence.
 
+        Scoped to On Shore only, not the full universe (rewritten 2026-08-25, live
+        incident + owner request) -- the original design walked every ticker in
+        STOCK_UNIVERSE independently, re-fetching technicals for the whole
+        universe a second time regardless of what Track 1 had already covered.
+        Confirmed live: a real pre-open run still hadn't reached Track 2 after
+        over an hour, and the owner was explicit ("i cant have it scan like
+        that... this would take hours and hours scanning the universe and cost
+        me a lot of money"). On Shore tickers (self._on_shore_tickers()) already
+        cleared quick_screen and got a real Claude analysis TODAY -- exactly the
+        "worth a second look" pool Track 2 should be drawing from, not the raw
+        universe. Their SMA50/SMA200 values come from self._quick_screen_sma_cache
+        (populated for free by Track 1's own quick_screen pass, see that dict's
+        own docstring at __init__) -- zero additional fetch needed, since an On
+        Shore ticker is by definition one quick_screen already touched today.
         Skips any ticker already held or already on Track 1's near_miss_candidates
-        list -- avoids a wasteful concurrent double-analysis of the same ticker by
-        both tracks at once."""
+        list too (both already excluded by _on_shore_tickers itself)."""
         if self._sma_trend_scan_in_progress:
             return
         self._sma_trend_scan_in_progress = True
         try:
-            held_tickers = set(self.portfolio.positions.keys())
             lookback_days = self.config["research"].get("sma_crossover_lookback_days", 252)
+            max_age_days = self.config["research"].get("sma_crossover_max_age_days", 21)
+            near_threshold_pct = self.config["research"].get("sma_near_crossover_threshold_pct", 2.0)
             checked = 0
             stage1_qualified = 0
+            too_stale = 0
+            near_crossover = 0
             attempted = 0
 
             entry = self.add_ai_log("SYSTEM", source_label,
                 "SMA trend-confirmation scan (Track 2) starting...", "info")
             await self.broadcast({"type": "ai_log", "entry": entry})
 
-            for ticker in STOCK_UNIVERSE:
+            for ticker in self._on_shore_tickers():
                 if self.paused:
                     break
-                if ticker in held_tickers or ticker in self.near_miss_candidates:
+                cached = self._quick_screen_sma_cache.get(ticker)
+                if cached is None:
                     continue
-
+                sma_50, sma_200 = cached
                 checked += 1
-                technicals = await _get_technicals_with_timeout(self.market_data, ticker)
-                if technicals is None:
-                    continue
-                if not _sma_golden_cross_qualifies(technicals.sma_50, technicals.sma_200):
-                    continue
-                stage1_qualified += 1
 
-                crossover_info = await self.market_data.get_sma_crossover_info(
-                    ticker, direction="above", lookback_days=lookback_days)
+                if _sma_golden_cross_qualifies(sma_50, sma_200):
+                    stage1_qualified += 1
+
+                    crossover_info = await self.market_data.get_sma_crossover_info(
+                        ticker, direction="above", lookback_days=lookback_days)
+
+                    if _sma_crossover_too_stale(crossover_info.days_since_crossover, max_age_days):
+                        too_stale += 1
+                        continue
+
+                    try:
+                        financials = await self.market_data.get_financials(ticker)
+                        market_cap = getattr(financials, "market_cap", 0.0)
+                    except Exception:
+                        market_cap = 0.0
+
+                    sma_context = {
+                        "sma_50": crossover_info.sma_50 or sma_50,
+                        "sma_200": crossover_info.sma_200 or sma_200,
+                        "crossover_date": crossover_info.crossover_date,
+                        "days_since_crossover": crossover_info.days_since_crossover,
+                        "market_cap": market_cap,
+                    }
+
+                    attempted += 1
+                    entry = self.add_ai_log(ticker, source_label,
+                        "SMA golden cross confirmed — running Track 2 trend-confirmation analysis...",
+                        "info")
+                    await self.broadcast({"type": "ai_log", "entry": entry})
+                    await self._attempt_near_miss_promotion(ticker, sma_context=sma_context)
+                    continue
+
+                # Not yet crossed -- check whether it's close enough to be worth a
+                # look anyway (2026-08-25, owner request: "what it needs to look
+                # for.. is just about to cross"). Reuses the most recent cached
+                # price from today's own research_reports entry (this ticker is On
+                # Shore, so it was analyzed today) rather than a fresh fetch.
+                cached_price = self.research_reports.get(ticker, {}).get("entry_price", 0.0)
+                if not _sma_near_crossover(sma_50, sma_200, cached_price, near_threshold_pct):
+                    continue
+                near_crossover += 1
 
                 try:
                     financials = await self.market_data.get_financials(ticker)
@@ -7600,24 +7732,27 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 except Exception:
                     market_cap = 0.0
 
+                gap_pct = (sma_200 - sma_50) / cached_price * 100 if cached_price > 0 else None
                 sma_context = {
-                    "sma_50": crossover_info.sma_50 or technicals.sma_50,
-                    "sma_200": crossover_info.sma_200 or technicals.sma_200,
-                    "crossover_date": crossover_info.crossover_date,
-                    "days_since_crossover": crossover_info.days_since_crossover,
+                    "sma_50": sma_50,
+                    "sma_200": sma_200,
                     "market_cap": market_cap,
+                    "approaching": True,
+                    "gap_pct": gap_pct,
                 }
 
                 attempted += 1
                 entry = self.add_ai_log(ticker, source_label,
-                    "SMA golden cross confirmed — running Track 2 trend-confirmation analysis...",
+                    "SMA approaching a golden cross — running Track 2 trend-confirmation analysis...",
                     "info")
                 await self.broadcast({"type": "ai_log", "entry": entry})
                 await self._attempt_near_miss_promotion(ticker, sma_context=sma_context)
 
             entry = self.add_ai_log("SYSTEM", source_label,
                 f"SMA trend-confirmation scan complete — {checked:,} tickers checked, "
-                f"{stage1_qualified} in a golden cross, {attempted} sent for analysis.",
+                f"{stage1_qualified} in a golden cross, {too_stale} too stale "
+                f"(crossed >{max_age_days}d ago), {near_crossover} approaching a cross, "
+                f"{attempted} sent for analysis.",
                 "success")
             await self.broadcast({"type": "ai_log", "entry": entry})
         finally:
@@ -7723,7 +7858,11 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 result = await _quick_screen_with_timeout(ticker)
                 if result is None:
                     continue
-                passes, _reason = result
+                passes, _reason, sma_50, sma_200 = result
+                # Cached regardless of pass/fail (2026-08-25, Track 2 cost-sharing) --
+                # see _quick_screen_sma_cache's own docstring at __init__ for why.
+                if sma_50 is not None and sma_200 is not None:
+                    self._quick_screen_sma_cache[ticker] = (sma_50, sma_200)
 
                 if not passes:
                     screened_out += 1
@@ -7992,6 +8131,8 @@ async def save_settings(payload: dict):
         "research.watchlist_size": int,
         "research.long_term_trend_years": int,
         "research.sma_crossover_lookback_days": int,
+        "research.sma_crossover_max_age_days": int,
+        "research.sma_near_crossover_threshold_pct": float,
         "research.on_deck_entry_mode": str,
         "research.on_deck_ai_entry_low_refresh_pct": float,
         "research.on_deck_ai_entry_arm_band_pct": float,
@@ -8762,21 +8903,8 @@ async def get_today_scan_rejects():
     rr_step = state.config["research"].get("on_deck_rr_conviction_step", 0.1)
     rr_floor = state.config["research"].get("on_deck_rr_floor", 1.5)
     default_stop_pct = state.config["take_profit"]["stop_loss_pct"]
-    held = set(state.portfolio.positions.keys())
 
-    candidates = {}
-    for ticker, r in state.research_reports.items():
-        if r.get("source") != "universe_scan":
-            continue
-        if not r.get("generated_at", "").startswith(today_str):
-            continue
-        if ticker in state.near_miss_candidates or ticker in held:
-            continue
-        if state._is_on_deck_blocked(ticker):
-            continue  # user explicitly removed this one -- respect the block, don't resurface it
-        if state._wash_sale_blocked(ticker):
-            continue  # can't legally be bought right now -- see _wash_sale_blocked's docstring
-        candidates[ticker] = r
+    candidates = {t: state.research_reports[t] for t in state._on_shore_tickers(today_str)}
 
     # Concurrent, capped quote + chart-history fetch (2026-07-19 follow-up, full parity with
     # On Deck cards including the R/R sparkline). Measured directly before building this: a

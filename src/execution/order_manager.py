@@ -328,6 +328,7 @@ class OrderManager:
                     t1_target_price=pending["take_profit_targets"][0] if len(pending["take_profit_targets"]) > 0 else None,
                     t2_target_price=pending["take_profit_targets"][1] if len(pending["take_profit_targets"]) > 1 else None,
                     trade_id=str(uuid.uuid4()),
+                    **pending.get("buy_snapshot", {}),
                 ))
                 logger.info(
                     "%s pending buy resolved via trade_updates stream: %.4g shares @ $%.2f",
@@ -990,6 +991,40 @@ class OrderManager:
             return await self._execute_sell(signal)
         return await self._execute_buy(signal)
 
+    @staticmethod
+    def _buy_snapshot_fields(signal) -> dict:
+        """"Why AI Bought This" snapshot (2026-08-21, extracted as a shared helper
+        2026-08-25) -- the real conviction/signal/thesis/reasoning/R-R numbers behind
+        THIS buy decision, captured once from whatever real report/numbers the signal
+        actually carries. research_report is None for a handful of non-AI-driven
+        signal sources (e.g. a legacy rebuy) -- falls back to empty/None fields
+        rather than guessing, same precedent as every other nullable Position field.
+
+        Extracted from _execute_buy's own immediate FILLED/PARTIAL Position(...) call
+        (2026-08-25, live incident -- owner noticed every held position's buy_thesis
+        etc. were blank, including one from days before this session even started)
+        so the two OTHER real "pending buy resolved later" reconciliation paths --
+        _handle_trade_update's trade_updates-stream resolution and
+        update_positions's REST-polling fallback, both of which build their own
+        Position(...) from a stored _pending_stops entry, not from `signal` directly
+        -- can compute and stash this dict into that SAME _pending_stops entry at
+        registration time (see _execute_buy's PENDING/SUBMITTED branch below) and
+        read it back when the real fill eventually resolves. A notional buy is
+        submitted as PENDING/SUBMITTED far more often than it resolves
+        synchronously as FILLED/PARTIAL, so those two other paths -- not this one --
+        are the ones that actually created nearly every real held position's blank
+        snapshot fields."""
+        _report = getattr(signal, "research_report", None)
+        return {
+            "buy_thesis": _report.thesis if _report else "",
+            "buy_reasoning": _report.reasoning if _report else "",
+            "buy_conviction": signal.conviction,
+            "buy_signal": signal.signal.value if hasattr(signal.signal, "value") else str(signal.signal),
+            "buy_rr": getattr(signal, "rr", None),
+            "buy_required_rr": getattr(signal, "required_rr", None),
+            "buy_fair_value": _report.fair_value_estimate if _report else None,
+        }
+
     async def _execute_buy(self, signal) -> Order | None:
         order = Order(
             ticker=signal.ticker,
@@ -1018,12 +1053,6 @@ class OrderManager:
             _trade_id = str(uuid.uuid4())
             if hasattr(signal, "trade_id"):
                 signal.trade_id = _trade_id
-            # "Why AI Bought This" snapshot (2026-08-21) -- captured once, here, from
-            # whatever real report/numbers this signal actually carries. research_report
-            # is None for a handful of non-AI-driven signal sources (e.g. a legacy
-            # rebuy) -- falls back to empty/None fields rather than guessing, same
-            # precedent as every other nullable Position field.
-            _report = getattr(signal, "research_report", None)
             await self.portfolio.add_position_async(Position(
                 ticker=signal.ticker,
                 shares=actual_shares,
@@ -1036,13 +1065,7 @@ class OrderManager:
                 t1_target_price=signal.take_profit_targets[0] if len(signal.take_profit_targets) > 0 else None,
                 t2_target_price=signal.take_profit_targets[1] if len(signal.take_profit_targets) > 1 else None,
                 trade_id=_trade_id,
-                buy_thesis=_report.thesis if _report else "",
-                buy_reasoning=_report.reasoning if _report else "",
-                buy_conviction=signal.conviction,
-                buy_signal=signal.signal.value if hasattr(signal.signal, "value") else str(signal.signal),
-                buy_rr=getattr(signal, "rr", None),
-                buy_required_rr=getattr(signal, "required_rr", None),
-                buy_fair_value=_report.fair_value_estimate if _report else None,
+                **self._buy_snapshot_fields(signal),
             ))
             # Locked so sync_exit_orders can't independently discover this brand-new
             # position mid-placement and race to "cover" it a second time — a gap that
@@ -1073,6 +1096,12 @@ class OrderManager:
                 "take_profit_targets": signal.take_profit_targets,
                 "sector": getattr(signal, 'sector', ''),
                 "order_id": result.broker_order_id,
+                # "Why AI Bought This" snapshot (2026-08-25) -- computed now, from the
+                # real signal, since neither real place this pending buy eventually
+                # resolves (the trade_updates stream, or update_positions's REST-poll
+                # fallback) has access to `signal` itself -- only to whatever's stored
+                # here. See _buy_snapshot_fields's own docstring for the full incident.
+                "buy_snapshot": self._buy_snapshot_fields(signal),
             }
         else:
             # REJECTED, CANCELLED — no shares were purchased
@@ -2394,6 +2423,7 @@ class OrderManager:
                         t1_target_price=_pending_targets[0] if len(_pending_targets) > 0 else None,
                         t2_target_price=_pending_targets[1] if len(_pending_targets) > 1 else None,
                         trade_id=str(uuid.uuid4()),
+                        **pending.get("buy_snapshot", {}),
                     ))
                     # Alpaca deducts cash at order submission, so _sync_portfolio already
                     # captured the reduced balance. add_position_async deducted it again —
