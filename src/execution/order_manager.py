@@ -1435,6 +1435,22 @@ class OrderManager:
                     # system was offline or before our state updated).  Re-sync from
                     # Alpaca and retry once with the real available quantity so the
                     # position is actually closed and exit orders can be correctly sized.
+                    #
+                    # Deliberately a DIFFERENT mechanism from _resolve_retry_quantity
+                    # (used by _place_stop_only/_execute_take_profit_tranche for this
+                    # same class of Alpaca error -- 2026-08-24, GitHub #89/#93
+                    # investigation) -- that one parses the broker's own "available: N"
+                    # figure out of the rejection text, which this problem structurally
+                    # can't use: get_positions() (below) only returns each position's
+                    # total qty, never qty_available (that field only exists on the
+                    # singular get_position() lookup -- confirmed via Alpaca's own API
+                    # reference, docs.alpaca.markets/reference/getallopenpositions,
+                    # before standardizing on one mechanism was ruled out). This path's
+                    # real problem is different anyway: a stale LOCAL share count (e.g.
+                    # a TP fill that happened while offline), not a broker-side
+                    # settlement lag -- get_positions() is the right tool for THAT,
+                    # since it also corrects the persisted position.shares below, which
+                    # error-text parsing has no way to do.
                     try:
                         _alpaca_pos = await self.broker.get_positions()
                         _real_shares = next(
