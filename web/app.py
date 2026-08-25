@@ -7867,7 +7867,29 @@ def _coerce_settings_payload(payload: dict, coercions: dict) -> dict:
     the old behavior of mutating state.config field-by-field inside the same loop that
     could still raise partway through, which left every field processed before the bad
     one silently live while config/settings.yaml was never written and the user was
-    told the save failed."""
+    told the save failed.
+
+    A BLANK field is skipped rather than treated as a fatal error (fixed 2026-08-25,
+    live incident -- a genuinely new COERCIONS entry, e.g. research.
+    sma_crossover_lookback_days, was added to this dict and to the Settings page
+    template ahead of config/settings.yaml actually having that key on a given
+    install, since settings.yaml is deliberately never touched by the normal deploy
+    path (see CLAUDE.md's "Deploy path"). The page rendered fine (Jinja2 silently
+    prints a missing attribute as ""), but every settings save on that install then
+    hit `int("")`/`float("")` on this one never-configured field and aborted the
+    ENTIRE ~90-field payload with a 422 -- confirmed live via journalctl. This isn't
+    limited to that one field or this one install: ANY newly-added numeric setting
+    is blank on every existing install until its config/settings.yaml is manually
+    updated, so this failure mode was really "add any new numeric setting, and every
+    other install's Settings page stops saving anything at all until it's patched" --
+    a real, recurring class of incident (AICryptoTrading's own _SETTINGS_FIELDS hit
+    the identical shape on 2026-08-20). A blank field is skipped, not silently
+    defaulted to anything -- its dotkey is absent from the result, so the caller
+    leaves whatever value state.config/settings.yaml already has for it untouched;
+    everything else in the payload still saves normally. A non-blank value that
+    still fails to coerce (a real typo/malformed entry, not a missing-key gap) still
+    raises and aborts the whole payload exactly as before -- this only widens
+    tolerance for genuinely empty input, not for bad input."""
     coerced: dict = {}
     for dotkey, raw_val in payload.items():
         if dotkey not in coercions:
@@ -7875,6 +7897,12 @@ def _coerce_settings_payload(payload: dict, coercions: dict) -> dict:
         try:
             coerced[dotkey] = coercions[dotkey](raw_val)
         except (ValueError, TypeError) as e:
+            if raw_val == "":
+                logger.warning(
+                    "_coerce_settings_payload: skipping blank field %s "
+                    "(config/settings.yaml likely missing this key on this install)",
+                    dotkey)
+                continue
             raise ValueError(f"Invalid value for {dotkey}: {e}")
     return coerced
 
