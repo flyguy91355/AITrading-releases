@@ -6289,6 +6289,28 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 try:
                     report = await self.research_engine.analyze_stock(
                         ticker, analysis_history_summary=_history.get(ticker, ""))
+                    if getattr(report, "is_account_locked", False):
+                        # A hard, account-wide Claude API lockout (2026-08-25, live
+                        # incident) -- every remaining ticker in this run is guaranteed
+                        # to fail identically, so grinding through the rest wastes time
+                        # for zero benefit. Auto-pauses (not stops) so position_update_loop
+                        # keeps protecting held positions -- same halt severity /api/pause
+                        # already uses for "AI is unavailable right now" -- and reports it
+                        # plainly on the AI Research Engine log so it's never mistaken for
+                        # ordinary silence. Resuming (once the account issue is actually
+                        # resolved) is the same one-click Resume button as any other pause.
+                        self.paused = True
+                        self._save_run_state()
+                        entry = self.add_ai_log(
+                            "SYSTEM", "SYSTEM",
+                            f"⚠ Claude API account lockout detected ({report.thesis}) — "
+                            "auto-paused to stop wasting scan time; held positions remain "
+                            "protected. Resolve the account issue, then click Resume.",
+                            "error",
+                        )
+                        await self.broadcast({"type": "ai_log", "entry": entry})
+                        await self.broadcast({"type": "run_status", "run_status": self.run_status()})
+                        return
                     await on_result(ticker, report)
                 except Exception as e:
                     logger.error("Sequential fallback failed for %s: %s", ticker, e)

@@ -127,6 +127,16 @@ class ResearchReport:
     # Used by _track2_rr_override_applies (web/app.py) to decide whether this
     # candidate can buy despite R/R falling short of its usual gate.
     trend_confirms_entry: bool = False
+    # True only when is_fallback=True AND the underlying failure was
+    # is_account_lockout_error() -- a hard, account-wide Claude API lockout (e.g. an
+    # exhausted usage/spend cap), as opposed to an ordinary one-off transient failure
+    # (a single bad response, a momentary timeout) that the next ticker is likely to
+    # succeed at normally. Added 2026-08-25 (live incident) so a caller iterating many
+    # tickers can distinguish "this one ticker had a bad day" from "every remaining
+    # call in this run is guaranteed to fail identically" and react accordingly
+    # (web/app.py's _sequential_fallback auto-pauses and reports it rather than
+    # grinding through the rest of the run for no benefit).
+    is_account_locked: bool = False
 
 
 @dataclass
@@ -540,6 +550,29 @@ def _build_trade_history_section(trade_history_summary: str) -> str:
         "and technicals as the primary basis for your decision) ──\n"
         f"{trade_history_summary}\n"
     )
+
+
+def is_account_lockout_error(error: Exception) -> bool:
+    """True for a hard, account-wide Claude API lockout that every subsequent call is
+    guaranteed to fail identically against (an exhausted usage/spend cap being the real
+    live example, 2026-08-25 incident) -- as opposed to an ordinary transient failure
+    (a momentary timeout, a single malformed response, a 429 rate limit that a later
+    retry can succeed past) that _call_claude_with_retry's own 3-attempt retry loop
+    already exists to smooth over.
+
+    Anthropic's SDK raises anthropic.BadRequestError specifically for a 400 response --
+    a class of error that, unlike RateLimitError (429) or APIConnectionError/
+    InternalServerError (network/5xx), retrying the identical request can never fix.
+    Requiring BOTH the specific exception type AND the distinctive "usage limit"/
+    "regain access" wording (rather than either alone) avoids false-positiving on some
+    other, unrelated 400 (e.g. a single ticker's prompt somehow exceeding a length
+    limit) as if it were the same account-wide condition -- only the exact real message
+    Anthropic returns for this specific scenario should trigger the caller's
+    auto-pause-and-report response, not any arbitrary bad request."""
+    if not isinstance(error, anthropic.BadRequestError):
+        return False
+    msg = str(error).lower()
+    return "usage limit" in msg or "regain access" in msg
 
 
 class ResearchEngine:
@@ -1529,6 +1562,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             position_size_pct=0,
             stop_loss=current_price * 0.95,
             is_fallback=True,
+            is_account_locked=is_account_lockout_error(error),
         )
 
     async def _claude_analysis(
