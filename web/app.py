@@ -5244,13 +5244,11 @@ class DashboardState:
                 # exactly (same wording, same "warning" level) so the two are indistinguishable
                 # in the log except for how quickly each one can catch a given candidate.
                 for ticker, rr_val, required_rr in to_evict_rr_floor:
-                    self.near_miss_candidates.pop(ticker, None)
-                    self._mark_universe_reject(ticker)
-                    entry = self.add_ai_log(ticker, "ON_DECK",
+                    self._evict_on_deck_automatic(
+                        ticker,
                         f"Removed from On Deck — R/R {rr_val:.2f} below min R/R floor "
                         f"({required_rr + floor_margin:.2f}, its own gate {required_rr:.2f} "
-                        f"+ {floor_margin:.2f} margin)", "warning")
-                    asyncio.create_task(self.broadcast({"type": "ai_log", "entry": entry}))
+                        f"+ {floor_margin:.2f} margin)")
                 if to_evict_rr_floor:
                     asyncio.create_task(
                         asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
@@ -5261,13 +5259,11 @@ class DashboardState:
                 # from it in this same pass. Mirrors the persist-check sweep's own above-gate
                 # eviction message exactly (same wording, same "warning" level).
                 for ticker, rr_val, required_rr, reasoning in to_evict_above_gate:
-                    self.near_miss_candidates.pop(ticker, None)
-                    self._mark_universe_reject(ticker)
-                    entry = self.add_ai_log(ticker, "ON_DECK",
+                    self._evict_on_deck_automatic(
+                        ticker,
                         f"Removed from On Deck — R/R {rr_val:.2f} above its own gate "
                         f"({required_rr:.2f}), AI judged it's no longer a good buy: "
-                        f"{reasoning}", "warning")
-                    asyncio.create_task(self.broadcast({"type": "ai_log", "entry": entry}))
+                        f"{reasoning}")
                 if to_evict_above_gate:
                     asyncio.create_task(
                         asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
@@ -6479,6 +6475,36 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         r["source"] = "universe_scan"
         r["generated_at"] = self._now_et().isoformat()
         asyncio.create_task(asyncio.to_thread(_save_report_cache, self.research_reports))
+
+    def _evict_on_deck_automatic(self, ticker: str, log_msg: str) -> None:
+        """Shared pop + mark-universe-reject + log + broadcast sequence for an
+        AUTOMATIC On Deck eviction (extracted 2026-08-24, GitHub #91) --
+        near_miss_monitor_loop's to_evict_rr_floor and to_evict_above_gate
+        processing both independently repeated this exact sequence, differing
+        only in their log message.
+
+        Deliberately does NOT route through remove_on_deck_candidate (the
+        issue's own secondary suggestion) -- that method is this codebase's
+        MANUAL-removal mechanism: it sets a re-add block via on_deck_blocked,
+        broadcasts a different "on_deck_removed" message, and deliberately
+        skips _mark_universe_reject per its own docstring ("the user's own
+        manual removal ... has its own block mechanism -- reappearing on On
+        Shore immediately would defeat the point"). An automatic R/R-floor or
+        above-gate eviction is the opposite case: it should reappear on On
+        Shore immediately (via _mark_universe_reject, called here) and must
+        never block a future re-add, same as every other automatic removal
+        path (conviction-drop, over-cap trim). Routing these through
+        remove_on_deck_candidate would have silently added an unwanted re-add
+        block and suppressed the immediate On-Shore reappearance -- confirmed
+        by reading that method's own body before implementing this fix.
+
+        Caller owns the conditional cache-save -- each of the 2 real call
+        sites saves once per BATCH of evictions (only `if <list>:`), not once
+        per ticker, so that stays outside this per-ticker helper."""
+        self.near_miss_candidates.pop(ticker, None)
+        self._mark_universe_reject(ticker)
+        entry = self.add_ai_log(ticker, "ON_DECK", log_msg, "warning")
+        asyncio.create_task(self.broadcast({"type": "ai_log", "entry": entry}))
 
     async def _enforce_on_deck_cap(self, phase_tag: str = "PRE-OPEN") -> int:
         """Trims near_miss_candidates down to research.on_deck_max_size (2026-07-19), keeping
