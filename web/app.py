@@ -6267,8 +6267,25 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         in_flight: dict[asyncio.Task, float] = {}
 
         async def _sequential_fallback(chunk: list[str]) -> None:
+            """Checks self.paused/self.stopped/should_stop() before EVERY ticker (fixed
+            2026-08-25, live incident) -- unlike _try_submit_next's own gate on pulling a
+            NEW chunk, this loop previously had no interrupt check of its own at all, so
+            once it started it ground through every remaining ticker in the chunk (up to
+            ~100) regardless of a Pause/Stop issued mid-run. Live-caught: a real account-
+            wide Anthropic usage-limit lockout meant every single call in this loop was
+            failing, but /api/stop (which DOES correctly stop new chunks/batches from
+            starting per _try_submit_next below) had no effect on this already-running
+            loop -- the owner's explicit "stop the scan" request could only actually be
+            honored by a full service restart, which kills every in-flight asyncio task
+            unconditionally. A mid-chunk Pause/Stop now breaks out within one ticker
+            instead of requiring a restart to actually take effect."""
             _history = analysis_history_summaries or {}
             for ticker in chunk:
+                if self.paused or self.stopped or should_stop():
+                    logger.info(
+                        "Sequential fallback interrupted (paused/stopped) with %d "
+                        "ticker(s) still remaining in this chunk", len(chunk))
+                    return
                 try:
                     report = await self.research_engine.analyze_stock(
                         ticker, analysis_history_summary=_history.get(ticker, ""))
