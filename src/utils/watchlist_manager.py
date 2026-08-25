@@ -183,13 +183,36 @@ class WatchlistManager:
         return int(row[0]) if row else 0
 
     def set_scan_cursor(self, index: int):
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO scan_state (key, value) VALUES ('universe_cursor', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(index),),
+        """Fails soft on a locked database (fixed 2026-08-25, live incident) --
+        called synchronously, directly on the event loop, once per scanned ticker
+        during a pre-open batch (potentially hundreds of calls in one run), racing
+        every other loop that also writes to this same shared database (
+        position_update_loop, ai_log persistence, trade history, BenchmarkStore --
+        see the 2026-08-19 SQLite Concurrency Hardening note). The 2026-08-19 fix
+        (WAL mode + this connection's own 20.0s timeout) is real and confirmed still
+        active, but a real pre-open batch run hit contention that outlasted even
+        that generous window and raised sqlite3.OperationalError -- which, being
+        unhandled, killed the ENTIRE remaining batch scan outright (an unhandled
+        asyncio Task exception), not just this one cursor update. The cursor is a
+        pure "resume from here next time" convenience -- losing one update in the
+        rare case of a still-locked database after 20s is a trivial, self-healing
+        cost (the next pre-open batch just resumes from a slightly stale position)
+        compared to abandoning an entire in-progress scan that already paid for
+        real Claude analysis on however many tickers it had gotten through."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO scan_state (key, value) VALUES ('universe_cursor', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(index),),
+                )
+                conn.commit()
+        except sqlite3.OperationalError as e:
+            logger.warning(
+                "set_scan_cursor(%d): database still locked after the connection's "
+                "own timeout -- skipping this cursor update rather than crashing "
+                "the caller: %s", index, e,
             )
-            conn.commit()
 
     def size(self) -> int:
         with self._connect() as conn:
