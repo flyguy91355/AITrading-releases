@@ -5680,14 +5680,33 @@ class DashboardState:
             track2_override = _track2_rr_override_applies(
                 sma_context is not None, getattr(report, "trend_confirms_entry", False),
                 rr, rr_floor)
-            if rr < min_rr and not track2_override:
-                entry = self.add_ai_log(ticker, "ON_DECK",
-                    f"R/R fell back below gate on fresh data — {rr:.2f} < {min_rr:.2f}", "warning")
+            async def _fail_gate(reason: str, log_msg: str, level: str = "warning"):
+                # Shared 5-step failure sequence (2026-08-24, GitHub #90) -- every gate
+                # check from here down (R/R below gate, above-gate AI decline, daily loss
+                # limit, drawdown state, sector concentration, position too small,
+                # insufficient cash) repeated the identical add_ai_log -> broadcast ->
+                # _record_promotion_attempt -> _refresh_nm_from_report -> return sequence,
+                # differing only in the reason string and log message. A fix to one
+                # (e.g. adding an 8th gate, or changing what gets persisted on failure)
+                # used to require editing 7 near-identical call sites by memory -- easy to
+                # update six and miss one, leaving that one gate silently out of sync
+                # (e.g. forgetting to refresh nm_snapshot, leaving a stale card on the
+                # dashboard for just that gate). `report`/`rr`/`min_rr`/`ticker`/`dip_low`
+                # are all already in scope by the time this closure is defined -- every
+                # one of the 7 real call sites has rr/min_rr computed by this point in the
+                # function, which is exactly why the earlier "No longer qualifies" branch
+                # (before rr/min_rr exist yet) is NOT migrated to this helper.
+                entry = self.add_ai_log(ticker, "ON_DECK", log_msg, level)
                 await self.broadcast({"type": "ai_log", "entry": entry})
                 self._record_promotion_attempt(
-                    ticker, dip_low, f"R/R fell below gate ({rr:.2f} < {min_rr:.2f})",
+                    ticker, dip_low, reason,
                     conviction=report.conviction_score, rr=rr, price=report.entry_price)
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
+
+            if rr < min_rr and not track2_override:
+                await _fail_gate(
+                    f"R/R fell below gate ({rr:.2f} < {min_rr:.2f})",
+                    f"R/R fell back below gate on fresh data — {rr:.2f} < {min_rr:.2f}")
                 return
             if track2_override and rr < min_rr:
                 entry = self.add_ai_log(ticker, "ON_DECK",
@@ -5718,15 +5737,10 @@ class DashboardState:
                     conviction_score=report.conviction_score, fail_default=False,
                 )
                 if not still_good_buy:
-                    entry = self.add_ai_log(ticker, "ON_DECK",
-                        f"R/R {rr:.2f} above its own gate ({min_rr:.2f}) at the buy trigger "
-                        f"— AI judged it's not a genuine opportunity: {reasoning}", "warning")
-                    await self.broadcast({"type": "ai_log", "entry": entry})
-                    self._record_promotion_attempt(
-                        ticker, dip_low,
+                    await _fail_gate(
                         f"R/R above gate, AI declined at buy trigger ({rr:.2f} > {min_rr:.2f})",
-                        conviction=report.conviction_score, rr=rr, price=report.entry_price)
-                    _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
+                        f"R/R {rr:.2f} above its own gate ({min_rr:.2f}) at the buy trigger "
+                        f"— AI judged it's not a genuine opportunity: {reasoning}")
                     return
 
             if ticker in self.portfolio.positions:  # re-check post-await race
@@ -5746,22 +5760,13 @@ class DashboardState:
             # average, since they're actively watching the dashboard).
 
             if not self.risk_manager.check_daily_loss(self.portfolio):
-                entry = self.add_ai_log(ticker, "ON_DECK", "Daily loss limit reached — skipping", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, "Daily loss limit reached",
-                    conviction=report.conviction_score, rr=rr, price=report.entry_price)
-                _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
+                await _fail_gate("Daily loss limit reached", "Daily loss limit reached — skipping")
                 return
             dd_state = self.risk_manager.check_drawdown(self.portfolio)
             if dd_state in ("halt", "exit_review", "defensive"):
-                entry = self.add_ai_log(ticker, "ON_DECK",
-                    f"Portfolio in {dd_state} state — skipping ({self._drawdown_diagnostic()})", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"Portfolio in {dd_state} state",
-                    conviction=report.conviction_score, rr=rr, price=report.entry_price)
-                _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
+                await _fail_gate(
+                    f"Portfolio in {dd_state} state",
+                    f"Portfolio in {dd_state} state — skipping ({self._drawdown_diagnostic()})")
                 return
 
             # Sector concentration (fixed 2026-08-02, GitHub #42) -- check_all_rules already
@@ -5771,25 +5776,16 @@ class DashboardState:
             # nothing here despite being turned on in Settings.
             sector = getattr(report, "sector", "")
             if not self.risk_manager.check_sector_concentration(self.portfolio, sector):
-                entry = self.add_ai_log(ticker, "ON_DECK",
-                    f"Sector concentration limit reached ({sector}) — skipping", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"Sector concentration limit reached ({sector})",
-                    conviction=report.conviction_score, rr=rr, price=report.entry_price)
-                _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
+                await _fail_gate(
+                    f"Sector concentration limit reached ({sector})",
+                    f"Sector concentration limit reached ({sector}) — skipping")
                 return
 
             position_size = self.risk_manager.calculate_position_size(
                 report.entry_price, report.stop_loss, self.portfolio.total_value)
             shares = position_size / report.entry_price if report.entry_price > 0 else 0
             if shares < 0.001:
-                entry = self.add_ai_log(ticker, "ON_DECK", "Position size too small — skipping", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, "Position size too small",
-                    conviction=report.conviction_score, rr=rr, price=report.entry_price)
-                _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
+                await _fail_gate("Position size too small", "Position size too small — skipping")
                 return
 
             required_reserve = self.portfolio.total_value * (
@@ -5804,12 +5800,7 @@ class DashboardState:
                     self._reserved_cash += position_size
                     reserved_amount = position_size
             if insufficient:
-                entry = self.add_ai_log(ticker, "ON_DECK", "Insufficient cash reserve — skipping", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, "Insufficient cash reserve",
-                    conviction=report.conviction_score, rr=rr, price=report.entry_price)
-                _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
+                await _fail_gate("Insufficient cash reserve", "Insufficient cash reserve — skipping")
                 return
 
             targets = (list(report.take_profit_targets) if report.take_profit_targets else [
@@ -5844,12 +5835,7 @@ class DashboardState:
             try:
                 order = await self.order_manager.execute(signal)
             except Exception as e:
-                entry = self.add_ai_log(ticker, "ON_DECK", f"Buy failed: {e}", "error")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"Buy failed: {e}",
-                    conviction=report.conviction_score, rr=rr, price=report.entry_price)
-                _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
+                await _fail_gate(f"Buy failed: {e}", f"Buy failed: {e}", level="error")
                 return
 
             if order and order.status not in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
@@ -5886,13 +5872,9 @@ class DashboardState:
                     ticker, dip_low, "Bought",
                     conviction=report.conviction_score, rr=rr, price=_fp)
             elif order:
-                entry = self.add_ai_log(ticker, "ON_DECK",
-                    f"Buy rejected by broker: {order.status.value}", "error")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"Rejected by broker: {order.status.value}",
-                    conviction=report.conviction_score, rr=rr, price=report.entry_price)
-                _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
+                await _fail_gate(
+                    f"Rejected by broker: {order.status.value}",
+                    f"Buy rejected by broker: {order.status.value}", level="error")
         finally:
             if reserved_amount:
                 self._reserved_cash -= reserved_amount
