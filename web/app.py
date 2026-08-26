@@ -5494,6 +5494,17 @@ class DashboardState:
                 # from it in this same pass. Mirrors the persist-check sweep's own above-gate
                 # eviction message exactly (same wording, same "warning" level).
                 for ticker, rr_val, required_rr, reasoning in to_evict_above_gate:
+                    # 2026-08-26, MGY incident -- record this decline in the same
+                    # memory _backfill_on_deck_from_on_shore's own free-gate checks
+                    # against, so that mechanism can't immediately re-add a candidate
+                    # this continuous above-gate sweep just evicted for the identical
+                    # "R/R is mechanically inflated" reason. Confirmed live: MGY was
+                    # evicted here, then re-added by the backfill's free gate 14
+                    # minutes later (its cached numbers still looked buyable, since
+                    # this eviction's own verdict was invisible to that dict), costing
+                    # a real backfill call + a real auto-deep-dive call for a candidate
+                    # that had just been judged not worth holding.
+                    self._on_deck_backfill_declined_at_rr[ticker] = rr_val
                     self._evict_on_deck_automatic(
                         ticker,
                         f"Removed from On Deck — R/R {rr_val:.2f} above its own gate "
@@ -7463,6 +7474,11 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     already_gone += 1
                     return
                 if not still_good_buy:
+                    # 2026-08-26, MGY incident -- see the near_miss_monitor_loop
+                    # sibling eviction's own comment for the full incident. Same
+                    # write here so a persist-check/midday-reanalysis eviction is
+                    # equally visible to the backfill's free-gate decline memory.
+                    self._on_deck_backfill_declined_at_rr[ticker] = rr_val
                     self.near_miss_candidates.pop(ticker, None)
                     self._mark_universe_reject(ticker)
                     removed += 1
