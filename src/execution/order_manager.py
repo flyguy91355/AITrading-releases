@@ -25,6 +25,36 @@ _INSUFFICIENT_QTY_RE = re.compile(r"available:\s*([\d.]+)")
 _EXIT_ORDER_RETRY_BACKOFF_SECONDS = [10, 30, 60, 120, 300]
 
 
+def _is_regular_trading_hours(now_et: datetime) -> bool:
+    """True only during real, live NYSE trading hours (9:30 AM - 4:00 PM ET,
+    Monday-Friday) -- 2026-08-26, AYI/AFG/AIT/CCEP incident. Deliberately does NOT
+    check holidays (a holiday already has no real trading either way, so the
+    weekday+time check alone already yields the correct answer for this specific
+    use -- gating the stop-breach market-sell fallback below, not anything that
+    needs full calendar precision).
+
+    Used to gate _place_stop_only's stop-breach market-sell fallback specifically,
+    NOT the exit-order maintenance window itself (_exit_order_maintenance_window_open
+    in web/app.py, which deliberately DOES include the pre-open lead time so a fresh
+    stop gets placed ahead of the open -- that's correct, unrelated behavior). The
+    bug this guards against: a stop-placement rejection ("stop price must be...
+    current price") during the pre-open lead time reflects Alpaca's own live NBBO at
+    that moment, which for a thin/no-liquidity pre-market print can be wildly
+    unrepresentative of where the stock will actually open -- confirmed live (AYI,
+    AFG, 2026-08-26): both were market-sold in response to this rejection at
+    ~7:45 AM ET, based on a stop price Alpaca's pre-market quote judged already
+    breached, then the resulting market order sat queued until the real 9:30 AM
+    open and filled $16+ ABOVE the level that had supposedly already been breached
+    -- proof the pre-market "breach" was an artifact of unreliable pre-market
+    pricing, not a genuine decline. "Already breached, sell now" is only a
+    meaningful, trustworthy signal once the real trading session has actually
+    started."""
+    if now_et.weekday() >= 5:
+        return False
+    minutes = now_et.hour * 60 + now_et.minute
+    return 9 * 60 + 30 <= minutes < 16 * 60
+
+
 class FillStillSettlingError(Exception):
     """Raised by _reconcile_untracked_fill when the real order behind an observed
     share-count delta is still partially_filled at Alpaca (2026-08-11, SBRA incident).
@@ -217,6 +247,13 @@ class OrderManager:
         # by this — only REMEDIATION attempts back off, and only after they've actually
         # failed; a ticker that's never failed, or that just succeeded, is never throttled.
         self._exit_order_retry_backoff: dict[str, tuple[datetime, int]] = {}
+
+    def _now_et(self) -> datetime:
+        """A real, overridable method (not an inline datetime.now() call) specifically
+        so tests can control it -- 2026-08-26, needed by _is_regular_trading_hours'
+        wiring into _place_stop_only, mirrors DashboardState._now_et() in web/app.py."""
+        tz_name = self.config.get("research", {}).get("market_timezone", "America/New_York")
+        return datetime.now(ZoneInfo(tz_name))
 
     def _lock_for(self, ticker: str) -> asyncio.Lock:
         """The single per-ticker coordination point for order mutation. Every code path
@@ -1247,14 +1284,38 @@ class OrderManager:
                 stop_ok = True
             except Exception as e:
                 err_str = str(e).lower()
-                if "stop price must be" in err_str and "current price" in err_str:
+                if "stop price must be" in err_str and "current price" in err_str and not _is_regular_trading_hours(
+                        self._now_et()):
+                    # 2026-08-26, AYI/AFG incident -- this exact rejection ALSO fires
+                    # during the exit-order maintenance window's pre-open lead time
+                    # (deliberately included so a fresh stop gets placed ahead of the
+                    # open -- see _exit_order_maintenance_window_open in web/app.py),
+                    # not just right after the real 9:30 AM open the way the original
+                    # 2026-07-16 "Auto-close market-open race" fix was validated
+                    # against. Confirmed live: AYI and AFG were both market-sold at
+                    # ~7:45 AM ET off a stop rejection based on Alpaca's own pre-market
+                    # NBBO, then the resulting market order queued until the real open
+                    # and filled $16+ ABOVE the level that had supposedly already been
+                    # breached -- proof the pre-market "breach" reflected unreliable
+                    # thin-liquidity pricing, not a genuine decline. Skip the fallback
+                    # entirely here (stop_ok stays False) -- the existing
+                    # sync_exit_orders/check_protection_gaps retry cycle will attempt
+                    # this again once the market is genuinely open, using a real,
+                    # trustworthy quote to decide whether a breach is real.
+                    logger.warning(
+                        "Stop price $%.2f for %s rejected as already invalid outside "
+                        "regular trading hours (likely unreliable pre-market pricing) "
+                        "-- NOT market-selling; will retry once the market opens",
+                        stop_price, ticker,
+                    )
+                elif "stop price must be" in err_str and "current price" in err_str:
                     # Price has already moved through the intended stop level (e.g. a
                     # trailing-stop trigger held off pre-market, then price kept falling
                     # before sync_exit_orders got a chance to re-place a valid stop —
                     # see CLAUDE.md "Auto-close market-open race"). A sell-stop must sit
                     # below current price to be valid, so a rejection with this exact
-                    # error means the position should already be sold, not left with an
-                    # unplaceable stop.
+                    # error DURING REAL TRADING HOURS means the position should already
+                    # be sold, not left with an unplaceable stop.
                     #
                     # Sell the ENTIRE remaining position (`shares`), not just
                     # `stop_shares` (2026-07-30, ADC/SCHW incident) -- once the stop
