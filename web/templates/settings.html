@@ -964,7 +964,7 @@ input[type=time].setting-input { font-family: monospace; }
         </div>
         <input type="number" step="1" class="setting-input" name="research.on_deck_above_gate_recheck_cooldown_minutes"
                value="{{ cfg.research.on_deck_above_gate_recheck_cooldown_minutes }}" min="0" max="120">
-        <div class="default-label">default<br><span class="default-val">20</span></div>
+        <div class="default-label">default<br><span class="default-val">30</span></div>
       </div>
       <div class="setting-row">
         <div>
@@ -973,7 +973,7 @@ input[type=time].setting-input { font-family: monospace; }
         </div>
         <input type="number" step="1" class="setting-input" name="research.on_deck_backfill_above_gate_decline_cooldown_minutes"
                value="{{ cfg.research.on_deck_backfill_above_gate_decline_cooldown_minutes }}" min="0" max="360">
-        <div class="default-label">default<br><span class="default-val">60</span></div>
+        <div class="default-label">default<br><span class="default-val">90</span></div>
       </div>
       <div class="setting-row">
         <div>
@@ -985,6 +985,26 @@ input[type=time].setting-input { font-family: monospace; }
           <option value="false" {% if not cfg.research.on_deck_auto_deep_dive %}selected{% endif %}>Disabled</option>
         </select>
         <div class="default-label">default<br><span class="default-val">Enabled</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Auto Deep Dive — Detail Level <button type="button" class="info-btn" onclick="showInfo(event,'Full asks for the complete report (catalysts, bull/base/bear scenarios, monitoring checklist, full narrative). Brief asks for only the valuation/entry core (signal, thesis, fair value, entry/stop, brief risk factors) — same underlying judgment, substantially fewer output tokens since those dropped sections are the most expensive part of the response. Only affects the AUTOMATIC on-entry deep dive; the dashboard\'s manual Deep Dive button always produces the full report regardless of this setting.')">i</button></div>
+          <div class="setting-desc">Full detail vs. a cheaper, valuation-only version for the automatic on-entry deep dive</div>
+        </div>
+        <select class="setting-input" name="research.on_deck_auto_deep_dive_brief">
+          <option value="false" {% if not cfg.research.on_deck_auto_deep_dive_brief %}selected{% endif %}>Full</option>
+          <option value="true" {% if cfg.research.on_deck_auto_deep_dive_brief %}selected{% endif %}>Brief</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Full</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">On Deck Auto Deep Dive — Daily Cap <button type="button" class="info-btn" onclick="showInfo(event,'A hard ceiling on how many automatic on-entry deep dives can fire in one calendar day, regardless of how much On Deck churns. 0 disables the cap. This is a backstop, not the primary control — an automatic deep dive already only fires for a candidate that clears the real buy gate (a watch-only addition never triggers one).')">i</button></div>
+          <div class="setting-desc">Max automatic deep dives per day, 0 = unlimited</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.on_deck_auto_deep_dive_daily_cap"
+               value="{{ cfg.research.on_deck_auto_deep_dive_daily_cap }}" min="0" max="200">
+        <div class="default-label">default<br><span class="default-val">20</span></div>
       </div>
       <div class="setting-row">
         <div>
@@ -1505,10 +1525,12 @@ const DEFAULTS = {
   'research.on_deck_backfill_enabled': 'true',
   'research.on_deck_swap_margin': 2.0,
   'research.on_deck_backfill_retry_cooldown_minutes': 5,
-  'research.on_deck_above_gate_recheck_cooldown_minutes': 20,
-  'research.on_deck_backfill_above_gate_decline_cooldown_minutes': 60,
+  'research.on_deck_above_gate_recheck_cooldown_minutes': 30,
+  'research.on_deck_backfill_above_gate_decline_cooldown_minutes': 90,
   'research.wash_sale_cooldown_days': 31,
   'research.on_deck_auto_deep_dive': 'true',
+  'research.on_deck_auto_deep_dive_brief': 'false',
+  'research.on_deck_auto_deep_dive_daily_cap': 20,
   'research.on_deck_block_breakout_pct': 2.0,
   'research.position_deep_dive_enabled': 'true',
   'research.position_deep_dive_interval_hours': 3,

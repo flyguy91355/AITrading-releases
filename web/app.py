@@ -1752,6 +1752,14 @@ class DashboardState:
         # itself an intentional, harmless leniency.
         self._on_deck_backfill_declined_at_rr: dict[str, float] = {}
 
+        # Auto deep-dive daily cap counter (2026-08-26, cost-reduction request) -- see
+        # _maybe_auto_deep_dive's own docstring. In-memory only; a restart simply
+        # re-earns a fresh day's worth of budget, same not-worth-persisting precedent
+        # as this file's other same-day cooldown dicts -- worst case after a restart
+        # is a few extra auto deep-dives, not a real cost risk.
+        self._auto_deep_dive_count_today: int = 0
+        self._auto_deep_dive_count_date: str = ""
+
         self.position_monitor_interval = research_cfg.get("position_monitor_interval_minutes", 60)
         self._is_holiday: bool = False
         self._holiday_check_date: str = ""
@@ -5258,7 +5266,7 @@ class DashboardState:
                     # together, not just a style preference.
                     if _on_deck_rr_above_gate(rr, min_rr):
                         cooldown_min = self.config["research"].get(
-                            "on_deck_above_gate_recheck_cooldown_minutes", 20)
+                            "on_deck_above_gate_recheck_cooldown_minutes", 30)
                         now_et = self._now_et()
                         due = not (
                             _on_deck_cooldown_active(self._on_deck_above_gate_cooldown, ticker, now_et)
@@ -6990,7 +6998,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     # comment in __init__ for why this decline specifically needs a
                     # much longer gap before being real-Claude-re-asked again.
                     above_gate_cooldown_min = self.config["research"].get(
-                        "on_deck_backfill_above_gate_decline_cooldown_minutes", 60)
+                        "on_deck_backfill_above_gate_decline_cooldown_minutes", 90)
                     self._on_deck_backfill_above_gate_cooldown[ticker] = (
                         self._now_et() + timedelta(minutes=above_gate_cooldown_min))
                     entry = self.add_ai_log(ticker, "ON_DECK",
@@ -7015,7 +7023,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 return False
             self.near_miss_candidates[ticker] = entry_dict
             self._on_deck_backfill_declined_at_rr.pop(ticker, None)
-            asyncio.create_task(self._maybe_auto_deep_dive(ticker, "ON_DECK"))
+            asyncio.create_task(self._maybe_auto_deep_dive(ticker, "ON_DECK", buy_eligible=rr_ok))
 
             status = "clears R/R now" if rr_ok else f"R/R {rr_val:.2f} < {required_rr:.2f} — watching"
             entry = self.add_ai_log(ticker, "ON_DECK",
@@ -7079,16 +7087,16 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         await self.broadcast({"type": "ai_log", "entry": entry})
         asyncio.create_task(asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
 
-    async def _maybe_auto_deep_dive(self, ticker: str, phase_tag: str) -> None:
-        """Fires one real Deep Dive (Sonnet, the richer DCF/moat/growth/catalysts/scenarios
-        prompt) automatically the moment a stock ENTERS On Deck (2026-07-19) — once per entry
-        event, not a recurring refresh, since On Deck is deliberately capped small (10-25
-        stocks via on_deck_max_size) so the added per-candidate Sonnet cost stays bounded.
-        Called from both places a ticker is newly added to near_miss_candidates: Phase 2's
-        universe-scan additions and _refill_on_deck_from_shore's restores. Deliberately NOT
-        called from the persist-check's "kept, still on the list" branch — that would re-run
-        this on every existing candidate twice a day, which is a different, much larger cost
-        the user didn't ask for.
+    async def _maybe_auto_deep_dive(self, ticker: str, phase_tag: str, buy_eligible: bool = True) -> None:
+        """Fires one real Deep Dive automatically the moment a stock ENTERS On Deck
+        (2026-07-19) — once per entry event, not a recurring refresh, since On Deck is
+        deliberately capped small (10-25 stocks via on_deck_max_size) so the added
+        per-candidate cost stays bounded. Called from all three places a ticker is
+        newly added to near_miss_candidates: the universe-scan admission path,
+        _refill_on_deck_from_shore's restores, and _backfill_on_deck_from_on_shore's
+        successful adds. Deliberately NOT called from the persist-check's "kept, still
+        on the list" branch — that would re-run this on every existing candidate twice
+        a day, which is a different, much larger cost the user didn't ask for.
 
         Purely a DISPLAY-layer enrichment — populates state.deep_dive_reports[ticker] so
         clicking into the stock shows the full Deep Dive modal (richer thesis, valuation
@@ -7113,11 +7121,42 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         this feature shipped, at the user's request for an easy off-switch) — checked here
         rather than at each call site so any future call site inherits the same gate for
         free. Disabling this has no effect on the manual "Deep Dive" button, which always
-        works regardless."""
+        works regardless.
+
+        Three more cost-reduction gates, all added 2026-08-26 (same "do not call an ai
+        when you can get the info or calculate from the info" cost review as the On Shore
+        backfill free-gate fix earlier the same day):
+        - `buy_eligible` (passed by the caller, which already computed rr_ok/rr_val vs
+          required_rr for its own log message) skips this call entirely for a watch-only
+          addition -- On Deck churn adds many candidates that never clear the real buy
+          gate at all, and this is display polish, not decision-critical, so it's spent
+          only on candidates actually close to being bought. Confirmed live 2026-08-26
+          this was a real driver: 10 auto deep-dives fired in the first ~2.5 hours of a
+          single trading day.
+        - research.on_deck_auto_deep_dive_daily_cap (default 20, 0 disables the cap)
+          bounds the worst case regardless of churn rate -- a hard ceiling, not a
+          replacement for the eligibility gate above.
+        - research.on_deck_auto_deep_dive_brief (default False, preserves existing
+          behavior) routes through deep_dive_analysis(brief=True) -- see that function's
+          own docstring for what's dropped. Owner's explicit request: keep full detail
+          available (manual Deep Dive always stays full), just make the AUTOMATIC
+          pre-warm cheaper when enabled."""
         if not self.config["research"].get("on_deck_auto_deep_dive", True):
             return
+        if not buy_eligible:
+            return
+        today_str = self._now_et().strftime("%Y-%m-%d")
+        if self._auto_deep_dive_count_date != today_str:
+            self._auto_deep_dive_count_date = today_str
+            self._auto_deep_dive_count_today = 0
+        daily_cap = self.config["research"].get("on_deck_auto_deep_dive_daily_cap", 20)
+        if daily_cap and self._auto_deep_dive_count_today >= daily_cap:
+            logger.debug("%s: auto deep-dive skipped -- daily cap (%d) reached", ticker, daily_cap)
+            return
+        self._auto_deep_dive_count_today += 1
         try:
-            report = await self.research_engine.deep_dive_analysis(ticker)
+            brief = self.config["research"].get("on_deck_auto_deep_dive_brief", False)
+            report = await self.research_engine.deep_dive_analysis(ticker, brief=brief)
         except Exception as e:
             logger.warning("Auto deep-dive failed for %s: %s", ticker, e)
             return
@@ -7233,7 +7272,8 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 f"Restored to On Deck from On Shore — Conviction {entry['conviction_score']}/10 "
                 f"| R/R {entry['rr']:.2f}", "success")
             await self.broadcast({"type": "ai_log", "entry": log_entry})
-            asyncio.create_task(self._maybe_auto_deep_dive(ticker, phase_tag))
+            asyncio.create_task(
+                self._maybe_auto_deep_dive(ticker, phase_tag, buy_eligible=rr_val >= required_rr))
         return restored
 
     def _persist_report(self, report, source: str = "") -> None:
@@ -7619,7 +7659,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             f"Added — {report.signal.value} | Conviction {report.conviction_score}/10 | "
             f"R/R {rr_val:.2f} | {status}{below_entry}", "success")
         await self.broadcast({"type": "ai_log", "entry": entry})
-        asyncio.create_task(self._maybe_auto_deep_dive(ticker, phase_tag))
+        asyncio.create_task(self._maybe_auto_deep_dive(ticker, phase_tag, buy_eligible=rr_ok))
         return True
 
     async def _run_midday_rescan(self, slot_label: str = "") -> None:
@@ -8272,6 +8312,8 @@ async def save_settings(payload: dict):
         "research.on_deck_backfill_above_gate_decline_cooldown_minutes": int,
         "research.wash_sale_cooldown_days": int,
         "research.on_deck_auto_deep_dive": lambda v: v == "true",
+        "research.on_deck_auto_deep_dive_brief": lambda v: v == "true",
+        "research.on_deck_auto_deep_dive_daily_cap": int,
         "research.position_deep_dive_enabled": lambda v: v == "true",
         "research.position_deep_dive_interval_hours": float,
         "research.auto_buy_cutoff_time": str,
