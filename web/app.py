@@ -7265,7 +7265,21 @@ Respond with ONLY the summary text, no preamble, no markdown."""
 
         open_slots = max_size - len(self.near_miss_candidates)
         if open_slots > 0:
-            for ticker, d in candidates[:open_slots]:
+            # Capped per tick (2026-08-27, owner request) -- open_slots can be much
+            # larger than a handful (a bad sell-off day, or a persist-check purge
+            # can open many slots at once), and without a cap this loop would
+            # attempt a real AI re-check on ALL of them in the SAME 60s tick. The
+            # On Shore list is already free-sorted by the same composite score used
+            # everywhere else, so the top-ranked candidates are exactly the ones
+            # worth spending on first -- capping to a small N spreads a big
+            # backfill need across a few ticks instead of bursting, at zero cost to
+            # quality (each attempt is still the current best-ranked candidate;
+            # anything past the cap just gets picked up on the next tick, re-sorted
+            # fresh). Each attempt is still gated by _try_add_inner's own free
+            # live-quote R/R pre-check before it ever spends a real Claude call, so
+            # this cap is a ceiling on ATTEMPTS, not a claim that all of them spend.
+            max_per_tick = self.config["research"].get("on_deck_backfill_max_per_tick", 5)
+            for ticker, d in candidates[:min(open_slots, max_per_tick)]:
                 await _try_add(ticker, d, "Backfilled to On Deck from On Shore (slot opened up)")
             asyncio.create_task(asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
             return
@@ -8616,6 +8630,7 @@ async def save_settings(payload: dict):
         "research.on_deck_max_size": int,
         "research.on_deck_backfill_enabled": lambda v: v == "true",
         "research.on_deck_swap_margin": float,
+        "research.on_deck_backfill_max_per_tick": int,
         "research.on_deck_backfill_retry_cooldown_minutes": int,
         "research.on_deck_above_gate_recheck_cooldown_minutes": int,
         "research.on_deck_backfill_above_gate_decline_cooldown_minutes": int,

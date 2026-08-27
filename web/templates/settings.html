@@ -950,6 +950,15 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
+          <div class="setting-label">On Deck Backfill Max Per Tick <button type="button" class="info-btn" onclick="showInfo(event,'Caps how many On Shore candidates the backfill loop attempts a real AI re-check on in a single 60-second tick when filling open On Deck slots. Without this cap, if many slots open at once (a bad sell-off day, or a persist-check purge), the loop would burst a real Claude call for every open slot in that same tick. The On Shore list is already free-sorted by the same composite score used everywhere else, so capping to the top N spreads a big backfill need across a few ticks with zero quality loss -- anything past the cap is simply picked up on the next tick, re-sorted fresh.')">i</button></div>
+          <div class="setting-desc">Max real AI re-checks the On Deck backfill loop fires per 60s tick</div>
+        </div>
+        <input type="number" step="1" class="setting-input" name="research.on_deck_backfill_max_per_tick"
+               value="{{ cfg.research.on_deck_backfill_max_per_tick }}" min="1" max="25">
+        <div class="default-label">default<br><span class="default-val">5</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
           <div class="setting-label">On Deck Backfill Retry Cooldown (min) <button type="button" class="info-btn" onclick="showInfo(event,'After a backfill candidate fails a fresh re-check (no longer qualifies, or falls outside the R/R band), skip re-trying it for this many minutes. It is the top-ranked On Shore candidate by definition, so without this it gets retried -- a real Claude call -- on literally every 60-second check until it either stabilizes back into range or something else outranks it.')">i</button></div>
           <div class="setting-desc">Minutes to wait before re-trying a backfill candidate that just failed</div>
         </div>
@@ -1535,6 +1544,7 @@ const DEFAULTS = {
   'research.on_deck_max_size': 5,
   'research.on_deck_backfill_enabled': 'true',
   'research.on_deck_swap_margin': 2.0,
+  'research.on_deck_backfill_max_per_tick': 5,
   'research.on_deck_backfill_retry_cooldown_minutes': 5,
   'research.on_deck_above_gate_recheck_cooldown_minutes': 30,
   'research.on_deck_backfill_above_gate_decline_cooldown_minutes': 90,
