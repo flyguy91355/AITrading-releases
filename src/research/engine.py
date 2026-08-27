@@ -1751,6 +1751,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
 
     async def submit_analysis_batch(
         self, tickers: list[str], analysis_history_summaries: dict[str, str] | None = None,
+        sma_contexts: dict[str, dict] | None = None,
     ) -> tuple[str | None, dict[str, dict]]:
         """Gather inputs for a chunk of tickers concurrently, build one Batch API request
         per ticker using the identical ANALYSIS_PROMPT the sequential path uses, and submit
@@ -1766,7 +1767,19 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         passes one; the once-a-day full universe scan (often 1,000+ largely
         never-before-seen tickers) doesn't, same cost/relevance-scoped exclusion
         precedent as trade_history_summary. Missing/omitted-per-ticker entries default to
-        "" (no section), never raise."""
+        "" (no section), never raise.
+
+        sma_contexts (2026-08-27, Track 1/Track 2 merge, optional, keyed by ticker)
+        folds each qualifying candidate's SMA trend context directly into its normal
+        universe-scan prompt -- the same section _attempt_near_miss_promotion has
+        always been able to pass via its own sma_context parameter, just supplied
+        here instead so a candidate never needs a second, separate Claude call later
+        just to add it. Built by the caller (web/app.py's chunk-building loop) from
+        the free SMA data quick_screen already returns for every survivor, plus a
+        real crossover-date lookup for the (small) subset that mechanically
+        qualifies -- see _run_pre_open_batch's own docstring for the full Stage
+        1/Stage 2 sequencing. Missing/omitted-per-ticker entries default to None
+        (no section), same as analysis_history_summaries above."""
         if not self.client:
             return None, {}
 
@@ -1802,6 +1815,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         # first-ticker's real network call being on this loop's critical path repeatedly.
         market_change_pct = await self.market_data.get_market_change_pct()
         _history = analysis_history_summaries or {}
+        _sma = sma_contexts or {}
         requests = []
         for ticker, inp in inputs_by_ticker.items():
             prompt = self._build_quick_scan_prompt(
@@ -1811,6 +1825,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 long_term_trend_summary=inp.get("long_term_trend_summary", ""),
                 market_change_pct=market_change_pct,
                 analysis_history_summary=_history.get(ticker, ""),
+                sma_context=_sma.get(ticker),
             )
             requests.append({
                 "custom_id": ticker,
