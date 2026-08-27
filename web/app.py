@@ -5829,13 +5829,23 @@ class DashboardState:
         return available_cash - position_size < required_reserve
 
     def _no_buying_capacity(self) -> bool:
-        """True when there is zero realistic room for ANY new position -- cash is
-        already at or below the reserve floor (2026-08-27, owner request: "when
+        """True when there isn't enough cash above the reserve floor to fund even
+        one realistically-sized new position (2026-08-27, owner request: "when
         there is not enough cash to buy anything.. i want all scans stopped except
-        for necessary ones"). Reuses _cash_reserve_insufficient with a $0 position
-        size, so this can never disagree with the real per-candidate cash checks
-        elsewhere -- same reserve-floor formula, just asking whether there's room
-        for a position of ANY size rather than one specific candidate's.
+        for necessary ones" -- corrected same day after an initial version checked
+        only whether cash was above the reserve floor AT ALL, not whether enough
+        was left above it to actually buy something: "it needs to be insuffient
+        cash... not at or below reserve floor... if were doing 7% for a buy then
+        there needs to be that much in there abouve the floor to buy").
+
+        Uses `risk_management.max_position_pct` (the real, live setting -- the cap
+        `calculate_position_size` itself applies to any single position) as the
+        assumed minimum position size, since no specific candidate's price/stop is
+        known yet at any of this check's call sites. Reuses
+        _cash_reserve_insufficient with that size, so this can never disagree with
+        the real per-candidate cash checks elsewhere -- same reserve-floor formula,
+        just sized off the live position cap rather than one specific candidate's
+        already-computed size.
 
         Used to skip AI calls whose only purpose is enabling or pricing a
         brand-new position when there's structurally no way to act on the
@@ -5847,7 +5857,9 @@ class DashboardState:
         a sub-step of those same scans, not a separate cost), or sell
         post-mortems (about already-closed trades, cash-irrelevant by
         design)."""
-        return self._cash_reserve_insufficient(0.0, self.portfolio.cash)
+        max_position_pct = self.config["risk_management"].get("max_position_pct", 7.0) / 100
+        assumed_position_size = self.portfolio.total_value * max_position_pct
+        return self._cash_reserve_insufficient(assumed_position_size, self.portfolio.cash)
 
     async def _attempt_near_miss_promotion(
         self, ticker: str, nm_snapshot: dict | None = None, dip_low: float | None = None,
