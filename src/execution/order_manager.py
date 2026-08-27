@@ -247,6 +247,16 @@ class OrderManager:
         # by this — only REMEDIATION attempts back off, and only after they've actually
         # failed; a ticker that's never failed, or that just succeeded, is never throttled.
         self._exit_order_retry_backoff: dict[str, tuple[datetime, int]] = {}
+        # Set on every successful connect() -- backs _within_reconnect_confirm_window's
+        # own copy of the post-reconnect confirm gate (2026-08-27, see that method's
+        # docstring). OrderManager has no reference to DashboardState, so it can't share
+        # web/app.py's own _broker_connected_at and tracks this independently.
+        self._broker_connected_at: datetime | None = None
+        # ticker -> the take-profit target price already seen once as "reached" within
+        # the post-reconnect confirm window (2026-08-27) -- lets check_take_profits defer
+        # only the FIRST sighting of a given target while the window is active, not every
+        # tick it stays open.
+        self._tp_pending_confirm: dict[str, float] = {}
 
     def _now_et(self) -> datetime:
         """A real, overridable method (not an inline datetime.now() call) specifically
@@ -278,8 +288,39 @@ class OrderManager:
         else:
             raise ValueError(f"Unknown broker: {broker_name}")
         await self.broker.connect()
+        self._broker_connected_at = self._now_et()
         await self._sync_portfolio()
         await self.sync_exit_orders()
+
+    def _within_reconnect_confirm_window(self) -> bool:
+        """True for a short window right after connect() last succeeded (2026-08-27) --
+        check_take_profits() uses this to require one extra confirming tick before
+        executing a tranche whose target was FIRST seen reached in this window, rather
+        than acting on the very first reading.
+
+        This is OrderManager's own copy of web/app.py's DashboardState._within_
+        reconnect_confirm_window -- same root cause class (a freshly-reconnected
+        broker's position snapshot can be momentarily stale/wrong), just applied to
+        check_take_profits' own pos.current_price comparison rather than the stop-loss/
+        trailing-stop checks that prompted the original AIT/CCEP fix. Found by a
+        follow-up audit of order_manager.py for the same unguarded-immediate-action
+        shape (2026-08-27) -- check_take_profits had zero freshness guard and zero
+        first-seen debounce before this, unlike the stop-loss checks. Never actually
+        triggered live (milder than the stop-loss bug too, since a stale price here can
+        only give up an already-earned tranche's profit level early via a real market
+        fill, not invent a loss out of nothing) -- fixed proactively from the audit, not
+        a live incident. (Built first on AIShortTrading's own copy of this file the same
+        day, then ported back here.)
+
+        Deliberately time-boxed, and deliberately shares research.stop_loss_reconnect_
+        confirm_window_seconds (default 60) with the stop-loss checks rather than a
+        separate setting -- both exist for the identical "don't trust the first reading
+        right after a reconnect" reason, so one dial covers both."""
+        if self._broker_connected_at is None:
+            return False
+        window_secs = self.config.get("research", {}).get(
+            "stop_loss_reconnect_confirm_window_seconds", 60)
+        return (self._now_et() - self._broker_connected_at).total_seconds() < window_secs
 
     async def start_trade_updates_stream(self) -> None:
         """Sets up the real-time Alpaca trade_updates WebSocket stream and launches it as
@@ -2110,14 +2151,37 @@ class OrderManager:
         deliberately never checked here -- it's a reference price for the graduated
         trailing stop's own curve, not a real, actionable target (same "final tranche
         rides the trailing stop alone" design this codebase already had before this
-        redesign, just no longer expressed as tp_shares == 0 in a tranche split)."""
+        redesign, just no longer expressed as tp_shares == 0 in a tranche split).
+
+        A target's first "reached" reading seen within the post-reconnect confirm
+        window (2026-08-27, see _within_reconnect_confirm_window's docstring) is
+        deferred one tick rather than executed immediately -- pos.current_price comes
+        from the same broker snapshot that caused the real AIT/CCEP false stop-loss
+        trigger, and this function had no freshness guard at all before this fix.
+        _tp_pending_confirm is keyed on ticker AND the specific target price so a
+        target that changes mid-flight (e.g. an AI-chosen-stop-tp re-analysis) can't
+        inherit a stale confirmation."""
         if not self.broker:
             return
         for ticker, pos in list(self.portfolio.positions.items()):
             if len(pos.take_profit_targets) < 2:
+                self._tp_pending_confirm.pop(ticker, None)
                 continue
             if pos.current_price is None or pos.current_price < pos.take_profit_targets[0]:
+                self._tp_pending_confirm.pop(ticker, None)
                 continue
+            target_price = pos.take_profit_targets[0]
+            if (self._tp_pending_confirm.get(ticker) != target_price
+                    and self._within_reconnect_confirm_window()):
+                self._tp_pending_confirm[ticker] = target_price
+                logger.warning(
+                    "%s take-profit target $%.2f reached within the post-reconnect "
+                    "confirm window (price $%.2f) — deferring execution one tick to "
+                    "confirm against a fresh quote",
+                    ticker, target_price, pos.current_price,
+                )
+                continue
+            self._tp_pending_confirm.pop(ticker, None)
             await self._execute_take_profit_tranche(ticker)
 
     async def _execute_take_profit_tranche(self, ticker: str) -> bool:
