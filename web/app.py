@@ -638,8 +638,32 @@ def _on_shore_live_rr(entry_price: float, stop_loss: float, fair_value: float,
     return (fair_value - live_price) / risk
 
 
+def _backfill_rr_changed_meaningfully(
+        last_declined_rr: float | None, new_rr: float, refresh_pct: float) -> bool:
+    """Whether new_rr is a genuinely higher R/R than last_declined_rr, worth re-asking
+    Claude about (2026-08-27, MGY incident) -- mirrors _dip_low_changed_meaningfully's
+    exact shape (a real percentage move required, not a bare inequality), applied to a
+    RISING R/R instead of a falling dip low. _on_shore_backfill_worth_ai_check's own
+    original docstring already claimed to mirror that pattern, but its actual
+    implementation was a bare `rr <= last_declined_rr` check -- zero margin, so any
+    live-quote noise (a fraction of a cent of price movement) counted as a "new high"
+    and re-opened a real Claude call. Confirmed live: MGY's free R/R bounced
+    2.67->2.05->2.64->2.60->2.63->2.67->2.71 across one trading day, each swing firing a
+    fresh real re-analysis, auto deep-dive, and dip-entry pricing call for what was
+    substantively the same "mechanically inflated by price decay, not genuine value"
+    situation Claude had already judged minutes or hours earlier. Returns True only if
+    new_rr is at least refresh_pct% above last_declined_rr -- a genuinely higher ratio,
+    not noise. A missing/invalid last_declined_rr (nothing declined yet) always counts
+    as meaningfully different, and an rr that hasn't actually risen never does."""
+    if last_declined_rr is None or last_declined_rr <= 0:
+        return True
+    if new_rr <= last_declined_rr:
+        return False
+    return (new_rr - last_declined_rr) / last_declined_rr * 100 >= refresh_pct
+
+
 def _on_shore_backfill_worth_ai_check(
-        rr: float, required_rr: float, floor_margin, last_declined_rr) -> bool:
+        rr: float, required_rr: float, floor_margin, last_declined_rr, refresh_pct: float = 0.0) -> bool:
     """True only if a FREE, no-Claude R/R check justifies spending a real
     analyze_stock() call on this On Shore backfill candidate (2026-08-26,
     cost-reduction redesign -- see _on_deck_backfill_declined_at_rr's own
@@ -657,18 +681,17 @@ def _on_shore_backfill_worth_ai_check(
        zero Claude spend, not a call every few minutes regardless.
     2. If Claude already declined this exact ticker at some past free rr
        level (last_declined_rr), rr must have risen to a genuine NEW HIGH
-       past that level -- not just any upward move. A margin-based
-       re-trigger was explicitly considered and rejected by the owner: "not
-       moved by a real margin, that could casue it to scan every minute
-       while it jumps up and down" -- a quote oscillating around one level
-       could cross a fixed margin repeatedly. Requiring a genuine new high
-       mirrors this codebase's own established _dip_low_changed_meaningfully
-       pattern (only a real new extreme re-opens a question Claude already
-       answered), just applied to a rising R/R instead of a falling dip low.
+       past that level by at least refresh_pct% (2026-08-27, MGY incident --
+       see _backfill_rr_changed_meaningfully's own docstring for the real
+       live incident this margin fixes; a bare `rr <= last_declined_rr`
+       check with zero margin let live-quote noise re-trigger a real Claude
+       call repeatedly for the same substantive situation). Mirrors this
+       codebase's own established _dip_low_changed_meaningfully pattern
+       exactly, just applied to a rising R/R instead of a falling dip low.
     """
     if _on_deck_rr_floor_not_met(rr, required_rr, floor_margin):
         return False
-    if last_declined_rr is not None and rr <= last_declined_rr:
+    if not _backfill_rr_changed_meaningfully(last_declined_rr, rr, refresh_pct):
         return False
     return True
 
@@ -7146,8 +7169,9 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 self.config["research"].get("on_deck_rr_floor", 1.5))
             floor_margin = self.config["research"].get("on_deck_rr_floor_margin")
             last_declined = self._on_deck_backfill_declined_at_rr.get(ticker)
+            refresh_pct = self.config["research"].get("on_deck_backfill_rr_refresh_pct", 2.0)
             if not _on_shore_backfill_worth_ai_check(
-                    free_rr, free_required_rr, floor_margin, last_declined):
+                    free_rr, free_required_rr, floor_margin, last_declined, refresh_pct):
                 logger.debug(
                     "%s: On Shore backfill skipped — free R/R %.2f doesn't clear its own "
                     "gate (%.2f) or hasn't set a new high past the last AI decline (%s); "
@@ -8631,6 +8655,7 @@ async def save_settings(payload: dict):
         "research.on_deck_backfill_enabled": lambda v: v == "true",
         "research.on_deck_swap_margin": float,
         "research.on_deck_backfill_max_per_tick": int,
+        "research.on_deck_backfill_rr_refresh_pct": float,
         "research.on_deck_backfill_retry_cooldown_minutes": int,
         "research.on_deck_above_gate_recheck_cooldown_minutes": int,
         "research.on_deck_backfill_above_gate_decline_cooldown_minutes": int,

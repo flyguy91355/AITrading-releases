@@ -959,6 +959,15 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
+          <div class="setting-label">On Deck Backfill R/R Refresh % <button type="button" class="info-btn" onclick="showInfo(event,'How much higher (in %) a previously-declined On Shore candidate\'s live R/R must rise past the level it was declined at before the backfill loop asks Claude about it again. Without a real margin here, ordinary live-quote noise (a fraction of a cent of price movement) counts as a \"new high\" and re-triggers a real Claude call -- a stock oscillating in a tight range near its own gate can get asked substantially the same question over and over. Mirrors the same meaningful-change pattern already used for dip-entry recommendations.')">i</button></div>
+          <div class="setting-desc">Min. % R/R must rise past its last-declined level before re-asking Claude</div>
+        </div>
+        <input type="number" step="0.1" class="setting-input" name="research.on_deck_backfill_rr_refresh_pct"
+               value="{{ cfg.research.on_deck_backfill_rr_refresh_pct }}" min="0" max="20">
+        <div class="default-label">default<br><span class="default-val">2.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
           <div class="setting-label">On Deck Backfill Retry Cooldown (min) <button type="button" class="info-btn" onclick="showInfo(event,'After a backfill candidate fails a fresh re-check (no longer qualifies, or falls outside the R/R band), skip re-trying it for this many minutes. It is the top-ranked On Shore candidate by definition, so without this it gets retried -- a real Claude call -- on literally every 60-second check until it either stabilizes back into range or something else outranks it.')">i</button></div>
           <div class="setting-desc">Minutes to wait before re-trying a backfill candidate that just failed</div>
         </div>
@@ -1545,6 +1554,7 @@ const DEFAULTS = {
   'research.on_deck_backfill_enabled': 'true',
   'research.on_deck_swap_margin': 2.0,
   'research.on_deck_backfill_max_per_tick': 5,
+  'research.on_deck_backfill_rr_refresh_pct': 2.0,
   'research.on_deck_backfill_retry_cooldown_minutes': 5,
   'research.on_deck_above_gate_recheck_cooldown_minutes': 30,
   'research.on_deck_backfill_above_gate_decline_cooldown_minutes': 90,
