@@ -1580,6 +1580,13 @@ class DashboardState:
         # it -- exactly one "triggered" + one "recovered" message per episode, regardless
         # of how many hours it persists or whether the market is even open.
         self._risk_condition_active: dict[str, set[str]] = {}
+        # Timestamp of the most recent successful connect_broker() (2026-08-27,
+        # AIT/CCEP incident) -- lets the stop-loss/trailing-stop checks below know
+        # whether a just-detected breach happened in the narrow window right after a
+        # fresh broker (re)connection, when Alpaca's own get_positions() snapshot
+        # price can be momentarily stale/wrong. See _within_reconnect_confirm_window's
+        # docstring for the full incident and design.
+        self._broker_connected_at: datetime | None = None
         # Per-ticker cooldown for the event-triggered position re-analysis (2026-07-27) --
         # a comfortably profitable position only gets re-analyzed when price nears its
         # trailing stop or next target (see position_monitor_loop's docstring), checked
@@ -2685,6 +2692,7 @@ class DashboardState:
         try:
             await self.order_manager.connect()
             self.broker_connected = True
+            self._broker_connected_at = self._now_et()
             broker = self.config["trading"]["broker"]
             mode = "PAPER" if self.config["trading"]["paper_trading"] else "LIVE"
             entry = self.add_ai_log("SYSTEM", "BROKER", f"Connected to {broker.upper()} ({mode})", "success")
@@ -2865,7 +2873,21 @@ class DashboardState:
                             entry = self.add_ai_log(ticker, "RISK",
                                 f"STOP LOSS triggered at ${pos.current_price:.2f}", "sell")
                             await self.broadcast({"type": "ai_log", "entry": entry})
-                        if self.config["trading"].get("auto_execute", False) and market_open and not _on_cooldown:
+                        # First reading of a brand-new breach, seen within the post-
+                        # reconnect confirm window -- defer the close one tick rather
+                        # than acting on a possibly-stale just-reconnected snapshot
+                        # (2026-08-27, AIT/CCEP incident -- see
+                        # _within_reconnect_confirm_window's docstring).
+                        _needs_confirm = not _was_active and self._within_reconnect_confirm_window()
+                        if _needs_confirm:
+                            logger.warning(
+                                "%s stop-loss breach seen within the post-reconnect confirm "
+                                "window (price $%.2f, stop $%.2f) — deferring auto-close one "
+                                "tick to confirm against a fresh quote",
+                                ticker, pos.current_price, pos.stop_loss,
+                            )
+                        if (self.config["trading"].get("auto_execute", False) and market_open
+                                and not _on_cooldown and not _needs_confirm):
                             self._auto_close_cooldown[ticker] = datetime.now() + timedelta(minutes=5)
                             await self._auto_close_position(ticker, pos, "Stop loss hit")
                         elif _on_cooldown:
@@ -2952,7 +2974,18 @@ class DashboardState:
                                     f"{_label} triggered at ${pos.current_price:.2f} "
                                     f"(trail: ${pos.trailing_stop:.2f})", "sell")
                                 await self.broadcast({"type": "ai_log", "entry": entry})
-                            if self.config["trading"].get("auto_execute", False) and market_open and not _on_cooldown:
+                            # Same post-reconnect deferral as the plain stop-loss check
+                            # above (2026-08-27, AIT/CCEP incident).
+                            _needs_confirm = not _was_active and self._within_reconnect_confirm_window()
+                            if _needs_confirm:
+                                logger.warning(
+                                    "%s trailing-stop breach seen within the post-reconnect "
+                                    "confirm window (price $%.2f, trail $%.2f) — deferring "
+                                    "auto-close one tick to confirm against a fresh quote",
+                                    ticker, pos.current_price, pos.trailing_stop,
+                                )
+                            if (self.config["trading"].get("auto_execute", False) and market_open
+                                    and not _on_cooldown and not _needs_confirm):
                                 self._auto_close_cooldown[ticker] = datetime.now() + timedelta(minutes=5)
                                 _close_reason = ("Profit-target trailing stop hit" if _pt_hit
                                                  else "Trailing stop hit")
@@ -3613,6 +3646,35 @@ class DashboardState:
 
     def _now_et(self) -> datetime:
         return datetime.now(self.market_tz)
+
+    def _within_reconnect_confirm_window(self) -> bool:
+        """True for a short window right after connect_broker() last succeeded
+        (2026-08-27, AIT/CCEP incident) -- position_update_loop's stop-loss and
+        trailing-stop checks use this to require one extra confirming tick before
+        auto-closing a position whose breach was FIRST seen in this window, rather
+        than acting on the very first reading.
+
+        Root cause: on a real restart, AIT and CCEP were both market-sold within
+        ~12 seconds of connect_broker() completing, reason "Stop loss hit" -- but
+        their real fills (confirmed via trade_history) came back at $336.80 (stop
+        was $333.00) and $109.83 (stop was $103.42), both comfortably ABOVE the
+        supposed stop level. Neither position was actually anywhere near its stop;
+        Alpaca's own get_positions() snapshot price (what update_positions() feeds
+        into pos.current_price) was momentarily stale/wrong immediately after the
+        fresh reconnection, and the unconditional pos.current_price <= pos.stop_loss
+        check in position_update_loop acted on it before a corrected quote arrived.
+
+        Deliberately time-boxed, not a permanent gate -- once update_positions() has
+        been polling normally for a while, there's no reason to distrust it, and a
+        blanket confirm-every-trigger rule would add a needless ~10s delay to every
+        stop-loss close for the life of the process. research.stop_loss_reconnect_
+        confirm_window_seconds (default 60) bounds it; a stop/trailing-stop reading
+        outside this window is trusted immediately, exactly as before this fix."""
+        if self._broker_connected_at is None:
+            return False
+        window_secs = self.config.get("research", {}).get(
+            "stop_loss_reconnect_confirm_window_seconds", 60)
+        return (self._now_et() - self._broker_connected_at).total_seconds() < window_secs
 
     def _past_auto_buy_cutoff(self) -> bool:
         """True once today's real ET clock has passed research.auto_buy_cutoff_time
