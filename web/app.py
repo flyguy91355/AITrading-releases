@@ -3027,6 +3027,23 @@ class DashboardState:
         ai_log wording so the AI Research Engine feed makes clear which path fired it."""
         if ticker not in self.portfolio.positions:
             return
+        # research.position_monitor_enabled (2026-08-27, owner request, default False) --
+        # single gate covering all 3 real callers of this function (the periodic 2-hour
+        # sweep, and both event-triggered checks: profitable-position proximity-to-exit,
+        # underwater-position loss-crossing). Owner asked directly whether any of these
+        # had ever actually driven a sell, and the real data said no: a full scan of
+        # every closed position in trade_history found zero SELL rows attributable to an
+        # AI re-analysis verdict -- every real close came from the broker-side mechanical
+        # stop-loss/trailing-stop/take-profit system, which is completely independent of
+        # this function and is NOT affected by this toggle. The only concrete effect these
+        # calls had ever produced was occasionally tightening a stop-loss a bit sooner
+        # ("Stop tightened $51.80→$53.50", 2 instances found in the real log). Turned off
+        # entirely for now rather than picking and choosing which of the 3 triggers to
+        # keep, per explicit owner instruction ("turn them all off for now") -- read live
+        # each call (not cached), so re-enabling via the Settings page takes effect
+        # immediately with no restart needed.
+        if not self.config["research"].get("position_monitor_enabled", False):
+            return
         try:
             entry = self.add_ai_log(ticker, "MONITOR", f"{trigger_label} re-analysis starting...")
             await self.broadcast({"type": "ai_log", "entry": entry})
@@ -3518,6 +3535,21 @@ class DashboardState:
 
     def _now_et(self) -> datetime:
         return datetime.now(self.market_tz)
+
+    def _past_auto_buy_cutoff(self) -> bool:
+        """True once today's real ET clock has passed research.auto_buy_cutoff_time
+        (2026-08-27, MGY dip-entry-after-cutoff incident) -- shared by
+        _attempt_near_miss_promotion's own existing check (extracted here, not
+        duplicated) and _compute_ai_dip_entry's new gate below, so the two can't
+        drift on what "past cutoff" means. Owner caught this live: a real, paid
+        dip-entry price recommendation fired at 3:42 PM ET for a candidate that
+        could never actually be bought that day, since the buy-trigger check right
+        after it is already correctly blocked past cutoff -- the dip-entry call
+        itself just wasn't gated at all, wasting the one real Claude call whose
+        entire purpose is enabling that now-impossible buy."""
+        cutoff_str = self.config["research"].get("auto_buy_cutoff_time", "14:00")
+        ch, cm = cutoff_str.split(":")
+        return self._now_et().time() >= dtime(int(ch), int(cm))
 
     def _drawdown_diagnostic(self) -> str:
         """Total value / peak value / computed drawdown %, for appending to any halt log
@@ -5433,7 +5465,22 @@ class DashboardState:
                             continue
                         if (nm.get("direction") == "up" and nm.get("streak", 0) >= 2
                                 and not nm.get("ai_entry_pending")
-                                and low_changed):
+                                and low_changed
+                                and not self._past_auto_buy_cutoff()):
+                            # 2026-08-27, MGY incident -- owner caught this live: a real
+                            # dip-entry price recommendation fired at 3:42 PM ET, a full
+                            # 12 minutes past the 3:30 PM auto-buy cutoff, pricing an
+                            # entry for a buy that could never happen that day (the
+                            # buy-trigger check right after it was already correctly
+                            # blocked). This call's entire purpose is enabling an
+                            # imminent buy attempt, so once that's impossible today,
+                            # spending it is pure waste -- see _past_auto_buy_cutoff's
+                            # own docstring. Deliberately does NOT set ai_entry_pending
+                            # or otherwise touch this candidate's state when skipped for
+                            # this reason -- it's simply not attempted yet, so the exact
+                            # same real recovery pattern is picked up fresh tomorrow
+                            # (or immediately if the loop notices before cutoff on a
+                            # later, faster tick some other day).
                             nm["ai_entry_pending"] = True
                             asyncio.create_task(self._compute_ai_dip_entry(ticker))
                         if low_changed or nm.get("ai_entry_price") is None:
@@ -5757,13 +5804,14 @@ class DashboardState:
             if not self.config["trading"].get("auto_execute", False) or not self.broker_connected:
                 return
             # Auto-buy cutoff, now a real Settings value (2026-07-20, moved from a hardcoded
-            # 2:00 PM) — read fresh from config each call rather than parsed once at startup,
-            # matching the pattern most other settings already use, so a change takes effect
-            # immediately without a restart. Read live, not cached: this loop already re-reads
-            # config every tick for other values (min_rr, retracement_pct, etc.).
-            _cutoff_str = self.config["research"].get("auto_buy_cutoff_time", "14:00")
-            _ch, _cm = _cutoff_str.split(":")
-            if self._now_et().time() >= dtime(int(_ch), int(_cm)):
+            # 2:00 PM) — read fresh from config each call via _past_auto_buy_cutoff() rather
+            # than parsed once at startup, so a change takes effect immediately without a
+            # restart. Read live, not cached: this loop already re-reads config every tick
+            # for other values (min_rr, retracement_pct, etc.). Extracted into the shared
+            # _past_auto_buy_cutoff() helper 2026-08-27 so _compute_ai_dip_entry's own new
+            # cutoff gate can't drift from this one -- see that helper's docstring.
+            if self._past_auto_buy_cutoff():
+                _cutoff_str = self.config["research"].get("auto_buy_cutoff_time", "14:00")
                 entry = self.add_ai_log(ticker, "ON_DECK",
                     f"R/R + uptick confirmed but past {_cutoff_str} ET cutoff — skipping", "warning")
                 await self.broadcast({"type": "ai_log", "entry": entry})
@@ -8333,6 +8381,7 @@ async def save_settings(payload: dict):
         "research.position_deep_dive_enabled": lambda v: v == "true",
         "research.position_deep_dive_interval_hours": float,
         "research.auto_buy_cutoff_time": str,
+        "research.position_monitor_enabled": lambda v: v == "true",
         "research.position_monitor_interval_minutes": int,
         "research.position_monitor_profitable_skip_pct": float,
         "research.position_monitor_event_proximity_pct": float,

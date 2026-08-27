@@ -1037,7 +1037,18 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">Position Monitor Interval (min) <button type="button" class="info-btn" onclick="showInfo(event,'How often (in minutes) an underwater or flat position gets a periodic re-check during market hours. A comfortably profitable position (see Profitable Skip % below) is intentionally skipped by this periodic cycle -- its downside is already mechanically protected by the trailing stop, so it instead gets event-triggered re-analysis (see the settings below) only when price actually nears its stop or next target. Shorter intervals are more responsive but use more compute.')">i</button></div>
+          <div class="setting-label">Position Monitor <button type="button" class="info-btn" onclick="showInfo(event,'Master on/off switch for ALL held-position AI re-analysis -- the periodic underwater/flat sweep below, plus both event-triggered checks (profitable positions nearing their exit, losing positions crossing the loss trigger). Disabled by owner request (2026-08-27) after a real check of the full trade history found zero closed positions were ever actually sold because of one of these calls -- every real close came from the broker-side mechanical stop-loss/trailing-stop/take-profit system, which is completely separate and NOT affected by this switch. Your stop-loss and take-profit protection keeps working exactly the same either way. Re-enable here any time -- takes effect immediately, no restart needed.')">i</button></div>
+          <div class="setting-desc">Master switch for all held-position AI re-checks (does not affect stop-loss/take-profit protection)</div>
+        </div>
+        <select class="setting-input" name="research.position_monitor_enabled">
+          <option value="true" {% if cfg.research.position_monitor_enabled %}selected{% endif %}>Enabled</option>
+          <option value="false" {% if not cfg.research.position_monitor_enabled %}selected{% endif %}>Disabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Disabled</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Position Monitor Interval (min) <button type="button" class="info-btn" onclick="showInfo(event,'How often (in minutes) an underwater or flat position gets a periodic re-check during market hours. A comfortably profitable position (see Profitable Skip % below) is intentionally skipped by this periodic cycle -- its downside is already mechanically protected by the trailing stop, so it instead gets event-triggered re-analysis (see the settings below) only when price actually nears its stop or next target. Shorter intervals are more responsive but use more compute. Has no effect while Position Monitor above is Disabled.')">i</button></div>
           <div class="setting-desc">How often underwater/flat positions get a periodic re-check (profitable positions use event triggers instead)</div>
         </div>
         <input type="number" class="setting-input" name="research.position_monitor_interval_minutes"
@@ -1534,6 +1545,7 @@ const DEFAULTS = {
   'research.on_deck_block_breakout_pct': 2.0,
   'research.position_deep_dive_enabled': 'true',
   'research.position_deep_dive_interval_hours': 3,
+  'research.position_monitor_enabled': 'false',
   'research.position_monitor_interval_minutes': 120,
   'research.position_monitor_profitable_skip_pct': 2.0,
   'research.position_monitor_event_proximity_pct': 2.0,
