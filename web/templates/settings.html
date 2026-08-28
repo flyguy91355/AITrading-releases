@@ -775,6 +775,33 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
+          <div class="setting-label">Stop ATR Min Multiplier <button type="button" class="info-btn" onclick="showInfo(event,'Volatility floor on the AI-chosen stop, expressed as a multiple of this stock\'s own 14-period ATR% -- only applies when AI-Chosen Stop-Loss/TP is enabled above. Prevents an accidentally razor-tight stop (which mechanically inflates R/R) by requiring the stop to sit at least this many ATRs away from entry. Still clamped within the flat Min/Max % above regardless of how this computes.')">i</button></div>
+          <div class="setting-desc">Minimum AI-chosen stop distance, as a multiple of this stock's own ATR%</div>
+        </div>
+        <input type="number" class="setting-input" name="research.stop_atr_min_mult"
+               value="{{ cfg.research.stop_atr_min_mult if cfg.research.stop_atr_min_mult is not none else 1.0 }}" min="0.1" max="10" step="0.1">
+        <div class="default-label">default<br><span class="default-val">1.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Stop ATR Max Multiplier <button type="button" class="info-btn" onclick="showInfo(event,'Volatility ceiling on the AI-chosen stop, same ATR%-multiple idea as the floor above but bounding the wide side instead -- prevents an unusually wide stop from crushing R/R toward zero. Still clamped within the flat Min/Max % above regardless.')">i</button></div>
+          <div class="setting-desc">Maximum AI-chosen stop distance, as a multiple of this stock's own ATR%</div>
+        </div>
+        <input type="number" class="setting-input" name="research.stop_atr_max_mult"
+               value="{{ cfg.research.stop_atr_max_mult if cfg.research.stop_atr_max_mult is not none else 3.0 }}" min="0.1" max="20" step="0.1">
+        <div class="default-label">default<br><span class="default-val">3.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Reward ATR Max Multiplier <button type="button" class="info-btn" onclick="showInfo(event,'Caps the reward side of every R/R gate calculation at this many multiples of the stock\'s own ATR% -- there is no other bound on how large Claude\'s perceived valuation gap can be, so without this an outlier fair-value estimate against a tight stop can produce a runaway R/R that never lands anywhere near a real gate. Never changes the displayed Fair Value Estimate itself -- only the number fed into the gate.')">i</button></div>
+          <div class="setting-desc">Caps the R/R gate's reward side at this many multiples of the stock's own ATR%</div>
+        </div>
+        <input type="number" class="setting-input" name="research.reward_atr_max_mult"
+               value="{{ cfg.research.reward_atr_max_mult if cfg.research.reward_atr_max_mult is not none else 6.0 }}" min="0.5" max="20" step="0.5">
+        <div class="default-label">default<br><span class="default-val">6.0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
           <div class="setting-label">On Deck R/R Conviction Discount <button type="button" class="info-btn" onclick="showInfo(event,'How much the required R/R drops for each conviction point above the minimum. A higher-conviction thesis needs less reward-to-risk margin to be worth taking. Example: with base 2.1 and this set to 0.1, a conviction-10 stock only needs R/R 1.8 instead of 2.1. Deliberately small -- this narrows the gap for an already-qualified high-conviction stock, it never turns R/R into a rubber stamp.')">i</button></div>
           <div class="setting-desc">R/R reduction per conviction point above the minimum</div>
         </div>
@@ -1534,6 +1561,9 @@ const DEFAULTS = {
   'research.min_risk_reward_ratio': 2.1,
   'research.on_deck_rr_floor_margin': -0.4,
   'research.on_deck_rr_ceiling_margin': 0.15,
+  'research.stop_atr_min_mult': 1.0,
+  'research.stop_atr_max_mult': 3.0,
+  'research.reward_atr_max_mult': 6.0,
   'research.on_deck_rr_conviction_step': 0.1,
   'research.on_deck_rr_floor': 1.5,
   'research.long_term_trend_years': 5,

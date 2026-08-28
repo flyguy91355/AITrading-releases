@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import httpx
+import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class TechnicalIndicators:
     avg_volume_30d: int = 0
     support_level: float = 0.0
     resistance_level: float = 0.0
+    atr_pct: float = 0.0
 
 
 @dataclass
@@ -387,6 +389,7 @@ class MarketDataFetcher:
             avg_volume_30d=avg_volume_30d,
             support_level=round(support_level, 2),
             resistance_level=round(resistance_level, 2),
+            atr_pct=round(self._compute_atr_pct(hist), 4),
         )
 
     async def get_long_term_trend(
@@ -473,3 +476,31 @@ class MarketDataFetcher:
 
         rs = avg_gain / avg_loss
         return float(100 - (100 / (1 + rs)))
+
+    @staticmethod
+    def _compute_atr_pct(hist, period: int = 14) -> float:
+        """14-period Average True Range, as a percentage of the latest close --
+        2026-08-28, volatility-bounded R/R design (see that design doc for the full
+        rationale). True range per bar is max(high-low, |high-prev_close|,
+        |low-prev_close|), matching the standard Wilder definition -- the
+        prev-close terms matter on a gap day, where the bar's own high-low range
+        understates how far price actually moved. Returns 0.0 (never raises) when
+        there isn't enough history for even one 14-bar average, or the latest close
+        is non-positive -- every consumer treats 0.0 as "cannot volatility-bound
+        this one" and falls back to its existing flat behavior."""
+        if len(hist) < period + 1:
+            return 0.0
+        high = hist["High"]
+        low = hist["Low"]
+        close = hist["Close"]
+        prev_close = close.shift(1)
+        true_range = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        atr = float(true_range.tail(period).mean())
+        last_close = float(close.iloc[-1])
+        if last_close <= 0:
+            return 0.0
+        return atr / last_close * 100

@@ -86,6 +86,32 @@ def _clamp_ai_stop_loss(
     return max(floor, min(raw_stop, ceiling))
 
 
+def _volatility_scaled_stop_bounds(
+    atr_pct: float, stop_atr_min_mult: float, stop_atr_max_mult: float,
+    flat_min_pct: float, flat_max_pct: float,
+) -> tuple[float, float]:
+    """Computes the min/max stop-loss % to feed into _clamp_ai_stop_loss, scaled to
+    this ticker's own recent volatility (2026-08-28, volatility-bounded R/R design --
+    see that design doc for the full incident this fixes) instead of a flat min/max
+    that let an accidentally tight or wide AI-chosen stop distort the R/R ratio
+    computed from it.
+
+    Falls back to the existing flat bounds unchanged when atr_pct is unavailable
+    (<=0) -- same fail-toward-prior-behavior convention as every other market-data-
+    dependent guard in this codebase. The scaled result is ALSO clamped within
+    [flat_min_pct, flat_max_pct] regardless of how extreme the volatility reading
+    is -- the flat bounds remain an outer safety rail a volatility reading can never
+    exceed, exactly as they already are today."""
+    if atr_pct <= 0:
+        return flat_min_pct, flat_max_pct
+    vol_min = atr_pct * stop_atr_min_mult
+    vol_max = atr_pct * stop_atr_max_mult
+    return (
+        max(flat_min_pct, min(vol_min, flat_max_pct)),
+        max(flat_min_pct, min(vol_max, flat_max_pct)),
+    )
+
+
 @dataclass
 class ResearchReport:
     ticker: str
@@ -138,6 +164,11 @@ class ResearchReport:
     # (web/app.py's _sequential_fallback auto-pauses and reports it rather than
     # grinding through the rest of the run for no benefit).
     is_account_locked: bool = False
+    # This ticker's own 14-period ATR%, captured at analysis time (2026-08-28,
+    # volatility-bounded R/R design) -- used by web/app.py's compute_bounded_rr to
+    # cap the reward side of every R/R gate calculation. 0.0 means "not available,"
+    # same convention TechnicalIndicators.atr_pct itself uses.
+    atr_pct: float = 0.0
 
 
 @dataclass
@@ -754,6 +785,7 @@ class ResearchEngine:
                 model,
                 analysis_history_summary,
                 sma_context,
+                atr_pct=technicals.atr_pct,
             )
         else:
             logger.warning("No ANTHROPIC_API_KEY — generating rule-based report for %s", ticker)
@@ -1537,6 +1569,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         self, ticker: str, company_name: str, current_price: float,
         fundamental_summary: str, insider_summary: str,
         news_summary: str, competitive_summary: str, response_text: str,
+        atr_pct: float = 0.0,
     ) -> ResearchReport:
         """Shared by the sequential path and the batch path — parses a raw Claude text
         response (from either call type) into an identical ResearchReport. Raises on
@@ -1562,11 +1595,14 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         raw_stop_loss = float(data["stop_loss"]) if data.get("stop_loss") is not None else current_price * 0.95
         research_cfg = self.config.get("research", {})
         if research_cfg.get("ai_chosen_stop_tp_enabled", False):
-            stop_loss = _clamp_ai_stop_loss(
-                raw_stop_loss, entry_price,
+            min_pct, max_pct = _volatility_scaled_stop_bounds(
+                atr_pct,
+                research_cfg.get("stop_atr_min_mult", 1.0),
+                research_cfg.get("stop_atr_max_mult", 3.0),
                 research_cfg.get("ai_stop_loss_min_pct", 2.0),
                 research_cfg.get("ai_stop_loss_max_pct", 10.0),
             )
+            stop_loss = _clamp_ai_stop_loss(raw_stop_loss, entry_price, min_pct, max_pct)
         else:
             stop_loss = raw_stop_loss
 
@@ -1616,6 +1652,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             margin_of_safety_pct=float(data["margin_of_safety_pct"]) if data.get("margin_of_safety_pct") is not None else 0.0,
             watch_condition=str(data.get("watch_condition", "") or "").strip(),
             trend_confirms_entry=_parse_json_bool(data.get("trend_confirms_entry"), default=False),
+            atr_pct=atr_pct,
         )
 
     def _fallback_report(self, ticker: str, company_name: str, current_price: float,
@@ -1655,6 +1692,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         model: str | None = None,
         analysis_history_summary: str = "",
         sma_context: dict | None = None,
+        atr_pct: float = 0.0,
     ) -> ResearchReport:
         # market_change_pct fetch retired 2026-08-27 (owner request) -- see
         # _build_market_context_section's own docstring for the full removal
@@ -1679,6 +1717,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             return self._parse_quick_scan_response(
                 ticker, company_name, current_price, fundamental_summary,
                 insider_summary, news_summary, competitive_summary, response_text,
+                atr_pct=atr_pct,
             )
         except Exception as e:
             return self._fallback_report(
@@ -1745,6 +1784,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             "competitive_summary": competitive_analysis.summary,
             "technical_summary": technical_summary,
             "long_term_trend_summary": format_long_term_trend_summary(long_term_trend),
+            "atr_pct": technicals.atr_pct,
         }
 
     async def submit_analysis_batch(
@@ -1903,6 +1943,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                         ticker, inp["company_name"], inp["current_price"],
                         inp["fundamental_summary"], inp["insider_summary"],
                         inp["news_summary"], inp["competitive_summary"], text_block.text,
+                        atr_pct=inp.get("atr_pct", 0.0),
                     )
                 except Exception as e:
                     report = self._fallback_report(
