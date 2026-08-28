@@ -1178,8 +1178,8 @@ input[type=time].setting-input { font-family: monospace; }
 
       <div class="setting-row" style="grid-template-columns: 1fr auto 90px;">
         <div>
-          <div class="setting-label">Scan Times (ET) <button type="button" class="info-btn" onclick="showInfo(event,'The two scheduled times each trading day (Eastern Time) the auto-scan loop fires — neither buys directly anymore (real buying happens continuously via the On Deck promotion pipeline whenever a candidate clears its gates). The first slot is a heartbeat/trigger point; the second also fires the midday On Deck re-analysis, refreshing conviction/R/R on every current On Deck candidate. A third late-day scan was intentionally removed as redundant with the next pre-open scan.')">i</button></div>
-          <div class="setting-desc">Two daily scan times in Eastern Time (HH:MM)</div>
+          <div class="setting-label">On Deck Re-Check Times (ET) <button type="button" class="info-btn" onclick="showInfo(event,'NOT a universe scan -- these two times only ever look at candidates already on On Deck, never the broader stock universe (see Pre-Open Full Universe Scan and Mid-Day Full Universe Scan Times below for the ones that do). The first slot is a heartbeat/trigger point that does nothing on its own; the second re-checks conviction/R/R on every current On Deck candidate. A third late-day slot was intentionally removed as redundant with the next pre-open scan.')">i</button></div>
+          <div class="setting-desc">Heartbeat + a re-check of existing On Deck candidates only -- no universe scan (HH:MM)</div>
         </div>
         <div style="display:flex;gap:8px;align-items:center;">
           {% set scan_times = cfg.research.scan_times or ['09:45','12:30'] %}
@@ -1190,8 +1190,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">Mid-Day Re-Scan <button type="button" class="info-btn" onclick="showInfo(event,'When Enabled, two additional scan times each day re-run the free quick-screen check against the full universe and spend a real Claude call only on stocks not already analyzed today by any other pass -- catches a stock that develops a qualifying setup after the morning pre-open scan.')">i</button></div>
-          <div class="setting-desc">Catch new setups during the day with two extra scan passes</div>
+          <div class="setting-label">Mid-Day Full Universe Scan <button type="button" class="info-btn" onclick="showInfo(event,'When Enabled, two additional times each day re-run the free quick-screen check against the FULL STOCK UNIVERSE (same scope as the Pre-Open scan) and spend a real Claude call only on stocks not already analyzed today by any other pass -- catches a stock that develops a qualifying setup after the morning pre-open scan.')">i</button></div>
+          <div class="setting-desc">Catch new setups during the day by re-screening the full universe, not just On Deck</div>
         </div>
         <select class="setting-input" name="research.midday_scan_enabled">
           <option value="false" {% if not cfg.research.midday_scan_enabled %}selected{% endif %}>Disabled</option>
@@ -1201,8 +1201,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row" style="grid-template-columns: 1fr auto 90px;">
         <div>
-          <div class="setting-label">Mid-Day Re-Scan Times (ET) <button type="button" class="info-btn" onclick="showInfo(event,'The two times each trading day the mid-day re-scan fires. Only tickers not already analyzed today by any other pass get a real Claude call, so this stays cheap regardless of how many stocks pass the free quick-screen check.')">i</button></div>
-          <div class="setting-desc">Two daily re-scan times in Eastern Time (HH:MM)</div>
+          <div class="setting-label">Mid-Day Full Universe Scan Times (ET) <button type="button" class="info-btn" onclick="showInfo(event,'The two times each trading day this FULL-UNIVERSE re-scan fires (same 1,500+ stock scope as the Pre-Open scan, not just On Deck). Only tickers not already analyzed today by any other pass get a real Claude call, so this stays cheap regardless of how many stocks pass the free quick-screen check.')">i</button></div>
+          <div class="setting-desc">Two full-universe re-scan times in Eastern Time (HH:MM)</div>
         </div>
         <div style="display:flex;gap:8px;align-items:center;">
           {% set midday_scan_times = cfg.research.midday_scan_times or ['10:30','13:30'] %}
@@ -1213,8 +1213,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">Pre-Open Scan (hrs before open) <button type="button" class="info-btn" onclick="showInfo(event,'How many hours before the 9:30 AM ET market open the overnight universe screen fires. At 1.5 hours, it runs at 8:00 AM. This scan screens 1,500+ stocks and populates On Deck and On Shore with the day\'s real candidates. Weekends and market holidays are automatically skipped.')">i</button></div>
-          <div class="setting-desc">Hours before market open to run the overnight universe scan</div>
+          <div class="setting-label">Pre-Open Full Universe Scan (hrs before open) <button type="button" class="info-btn" onclick="showInfo(event,'How many hours before the 9:30 AM ET market open this FULL-UNIVERSE screen fires. At 1.5 hours, it runs at 8:00 AM. This scan screens 1,500+ stocks and populates On Deck and On Shore with the day\'s real candidates. Weekends and market holidays are automatically skipped.')">i</button></div>
+          <div class="setting-desc">Hours before market open to run the full overnight universe scan</div>
         </div>
         <input type="number" class="setting-input" name="research.pre_open_batch_hours"
                value="{{ cfg.research.pre_open_batch_hours }}" min="1" max="8">
