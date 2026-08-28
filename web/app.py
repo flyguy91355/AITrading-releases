@@ -88,7 +88,7 @@ from src.decision.risk_tier import (
     risk_tier_label,
     RISK_TIER_DOTKEYS,
 )
-from src.execution.order_manager import OrderManager
+from src.execution.order_manager import OrderManager, _is_regular_trading_hours
 from src.execution.broker import OrderStatus
 from src.reporting.trade_logger import TradeLogger
 from src.utils.watchlist_manager import WatchlistManager
@@ -2801,7 +2801,24 @@ class DashboardState:
                         if _ticker not in self._protection_gap_first_seen:
                             self._protection_gap_first_seen[_ticker] = self._now_et()
                         _elapsed = (self._now_et() - self._protection_gap_first_seen[_ticker]).total_seconds()
-                        if _elapsed >= _gap_alert_delay:
+                        # Loud alert (ai_log + push notification) suppressed outside real
+                        # trading hours (2026-08-28, AIZ incident) -- confirmed against
+                        # Alpaca's own docs that a plain stop order is not extended-hours
+                        # eligible at all, so a rejection of this kind before 9:30 AM ET
+                        # cannot be resolved by retrying harder or waiting a few more
+                        # minutes; sync_exit_orders' own remediation loop below is
+                        # completely unaffected by this and keeps retrying on its existing
+                        # backoff schedule exactly as before. Alerting on every ~5-minute
+                        # retry all night for something structurally unfixable until the
+                        # market opens is alarm fatigue, not actionable signal -- real
+                        # AIZ incident: 11 identical alerts over 17 hours, all before the
+                        # market ever opened. _protection_gap_first_seen keeps accruing
+                        # unconditionally in the background the whole time, so the instant
+                        # real trading hours begin, a still-open gap (now genuinely
+                        # fixable, and therefore genuinely urgent) is alerted immediately
+                        # with no additional wait -- _gap_alert_delay was already satisfied
+                        # hours ago.
+                        if _elapsed >= _gap_alert_delay and _is_regular_trading_hours(self._now_et()):
                             _last = self._protection_gap_alerted.get(_ticker)
                             if _last is None or (self._now_et() - _last).total_seconds() >= 300:
                                 self._protection_gap_alerted[_ticker] = self._now_et()
@@ -2813,6 +2830,14 @@ class DashboardState:
                                     f"⚠️ {_ticker} unprotected",
                                     _g["reason"],
                                     priority="urgent", tags="rotating_light"))
+                        elif _elapsed >= _gap_alert_delay:
+                            logger.info(
+                                "Protection gap for %s outside regular trading hours (a "
+                                "stop order isn't extended-hours eligible at Alpaca) -- "
+                                "remediation keeps retrying below; loud alert suppressed "
+                                "until the market opens: %s",
+                                _ticker, _g["reason"],
+                            )
                     if _gaps:
                         # Attempt an immediate fix on every cycle regardless of alert-display
                         # gating above — most gaps (missing/mispriced order) are exactly what
