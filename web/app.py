@@ -3467,6 +3467,14 @@ class DashboardState:
             if order and order.status == OrderStatus.FILLED:
                 # Order confirmed filled — clear the cooldown so future genuine signals work
                 self._auto_close_cooldown.pop(ticker, None)
+                # Also clear this ticker's stop-loss/trailing-stop alert-tracking flag
+                # (2026-08-28, audit finding) -- left uncleared, a stale "stop_loss
+                # already seen" entry could survive into a legitimate later rebuy of
+                # the same ticker (this system supports and exercises same-ticker
+                # rebuys after the wash-sale cooldown) and silently bypass the
+                # one-tick post-reconnect confirmation deferral for a brand-new
+                # position's very first breach reading.
+                self._risk_condition_active.pop(ticker, None)
                 # Log the real fill price, not the pre-trade pos.current_price snapshot
                 # sell_signal was built from (2026-08-08, GitHub #53).
                 if order.filled_price is not None:
@@ -6544,7 +6552,17 @@ class DashboardState:
                     # grow further, same as if only one had fired.
                     nm_snapshot["no_dip_failed_at_pct_gain"] = nm_snapshot.get("no_dip_pct_gain", 0.0)
                     nm_snapshot["no_dip_failed_at_up_count"] = nm_snapshot.get("no_dip_up_count", 0)
-                self.near_miss_candidates[ticker] = nm_snapshot
+                # Re-check right before writing (2026-08-28, audit finding — same
+                # "first-to-land wins" guard GitHub #50 already added to the On Deck
+                # backfill's own write). This attempt's analyze_stock() call (plus,
+                # if R/R landed above gate, a second AI judgment call) can take long
+                # enough for a concurrent backfill to have already legitimately
+                # re-added this same ticker with fresher conviction/R/R/thesis while
+                # this attempt was still in flight -- an unconditional overwrite here
+                # would silently discard that fresher data with this attempt's own
+                # stale pre-attempt snapshot.
+                if ticker not in self.near_miss_candidates:
+                    self.near_miss_candidates[ticker] = nm_snapshot
 
     async def _capture_daily_performance_snapshot(self):
         """One entry per trading day: portfolio value + the 3 major index closes, so a
