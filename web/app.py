@@ -6075,6 +6075,27 @@ class DashboardState:
         try:
             if not self.config["trading"].get("auto_execute", False) or not self.broker_connected:
                 return
+            # Not-yet-open gate (2026-08-28, JNJ/RRC premarket-fill incident) -- the
+            # symmetric counterpart to the auto-buy cutoff below, which only ever
+            # guarded the LATE side of the trading day. The SMA Track 2 override
+            # (both the confirmed-cross merged-call path and the approaching-a-cross
+            # scan) can call this function during the pre-open batch, well before the
+            # exchange opens -- live-caught: JNJ and RRC were both bought this way,
+            # analyzed and submitted at 8:27/8:30 AM ET against a real, live
+            # PREMARKET quote (not stale/cached data), but a market order can't fill
+            # before 9:30 AM regardless, so Alpaca queued both for over an hour and
+            # filled them against the real opening print instead -- 0.5-0.7% away
+            # from the premarket price this exact re-analysis reasoned about.
+            # Checked first (cheapest possible gate, before even the cutoff check)
+            # so a premarket call never pays for the real Claude re-analysis below.
+            if not self._is_market_open():
+                entry = self.add_ai_log(ticker, "ON_DECK",
+                    "R/R + uptick confirmed but market isn't open yet — skipping "
+                    "(a buy must be priced off live regular-hours data, not a "
+                    "premarket quote)", "warning")
+                await self.broadcast({"type": "ai_log", "entry": entry})
+                self._record_promotion_attempt(ticker, dip_low, "Market not yet open")
+                return
             # Auto-buy cutoff, now a real Settings value (2026-07-20, moved from a hardcoded
             # 2:00 PM) — read fresh from config each call via _past_auto_buy_cutoff() rather
             # than parsed once at startup, so a change takes effect immediately without a
