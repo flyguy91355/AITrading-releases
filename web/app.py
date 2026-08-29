@@ -9368,6 +9368,19 @@ async def get_ai_cost_today():
     return state.research_engine.cost_tracker.summary(model_for_estimate=model)
 
 
+@app.get("/api/ai-cost-history")
+async def get_ai_cost_history():
+    """Backs the AI-cost header badge's click-through history popup (2026-08-27,
+    owner request right after the widget above shipped: "click AI-cost badge ->
+    day-by-day cost history"). Every already-settled day, most-recent-first, via
+    AICostTracker.history() -- today itself is never included here since it
+    hasn't settled yet (the badge itself already shows today's live running
+    total). No retention window/cap, matching this codebase's own Day/Week P/L
+    history endpoints."""
+    model = state.config.get("research", {}).get("model_quick_scan", "claude-haiku-4-5")
+    return {"days": state.research_engine.cost_tracker.history(model_for_estimate=model)}
+
+
 _INSTALL_ROOT = str(Path(__file__).resolve().parent.parent)
 
 

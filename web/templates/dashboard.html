@@ -775,8 +775,9 @@ tbody tr:hover { background: var(--bg-card-hover); }
          title="Click for details">
     </div>
     <div id="aiCostBadge"
-         style="display:none;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:12px;font-size:12px;color:var(--text-muted);"
-         title="Estimated real Claude API spend today (list-price token math, not Anthropic's actual billing figure)">
+         style="display:none;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:12px;font-size:12px;color:var(--text-muted);cursor:pointer;"
+         onclick="openAiCostHistoryPopup()"
+         title="Estimated real Claude API spend today (list-price token math, not Anthropic's actual billing figure) — click for day-by-day history">
     </div>
     <div class="connection-status">
       <span class="status-dot" id="statusDot"></span>
@@ -3300,6 +3301,54 @@ async function fetchAiCostToday() {
 }
 fetchAiCostToday();
 setInterval(fetchAiCostToday, 60000);
+
+// AI-cost history popup (2026-08-27, owner request right after the widget above
+// shipped: "click AI-cost badge -> day-by-day cost history popup"). Reuses the
+// same shared #deepDiveModal shell + .pos-detail-ladder/.pl-row list styling as
+// the Day P/L history list (renderDailyPnlList) -- no magnitude bar, same as
+// that list, since call-count/$ don't have a natural "% of range" to bar.
+function renderAiCostHistoryList(days) {
+  if (!days || days.length === 0) {
+    return '<div style="color:var(--text-muted);font-size:12px;padding:12px;text-align:center;">No settled days yet — check back after today rolls over.</div>';
+  }
+  const rows = days.map(d => {
+    const calls = d.calls || 0;
+    return `<div class="pl-row">
+      <span class="pl-label">${fmtDayShortLabel(d.date)}</span>
+      <span class="pl-price">${fmtDayFullLabel(d.date)}</span>
+      <span class="pl-pct" style="color:var(--text-primary);">${calls} call${calls === 1 ? '' : 's'}</span>
+      <span class="pl-desc" style="color:var(--text-primary);">~$${(d.estimated_cost_usd || 0).toFixed(2)}</span>
+    </div>`;
+  }).join('');
+  return `<div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;margin:14px 0 6px;">Daily History — Estimated Spend</div>
+    <div class="pos-detail-ladder">${rows}</div>`;
+}
+
+async function openAiCostHistoryPopup() {
+  document.getElementById('ddModalTicker').textContent = 'AI Cost History';
+  document.getElementById('ddModalBizSummary').textContent = '';
+  document.querySelector('#deepDiveModal .trade-modal').style.width = '640px';
+  document.getElementById('ddModalBody').innerHTML =
+    '<div style="padding:12px;color:var(--text-muted);">Loading…</div>';
+  document.getElementById('deepDiveModal').classList.add('active');
+
+  let data;
+  try {
+    const resp = await fetch('/api/ai-cost-history');
+    data = await resp.json();
+  } catch (e) {
+    document.getElementById('ddModalBody').innerHTML =
+      '<div style="padding:12px;color:var(--text-muted);">Could not load — check your connection and try again.</div>';
+    return;
+  }
+
+  document.getElementById('ddModalBody').innerHTML = `
+    <div style="padding:0 12px 12px;">
+      <p style="margin:0;font-size:12px;color:var(--text-muted);">Estimated real Claude API spend — list-price token math, not Anthropic's actual billing figure.</p>
+      ${renderAiCostHistoryList(data.days)}
+    </div>
+  `;
+}
 
 // About panel (2026-08-20, owner request — "i see no update buttons" led to
 // "maybe i need an about button... so i know what version we are running").
