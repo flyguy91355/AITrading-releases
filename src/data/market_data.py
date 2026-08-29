@@ -61,6 +61,11 @@ class TechnicalIndicators:
     support_level: float = 0.0
     resistance_level: float = 0.0
     atr_pct: float = 0.0
+    macd_line: float = 0.0
+    macd_signal: float = 0.0
+    macd_histogram: float = 0.0
+    adx: float = 0.0
+    obv_trend_pct: float = 0.0
 
 
 @dataclass
@@ -173,6 +178,45 @@ def format_long_term_trend_summary(trend: LongTermTrend) -> str:
         f"High ${trend.high:.2f} ({trend.high_date}) | Current ${trend.current_price:.2f} "
         f"is {pct_off_high:+.1f}% vs the {trend.years}yr high and "
         f"{pct_off_low:+.1f}% vs the {trend.years}yr low."
+    )
+
+
+def format_technical_summary(price: float, technicals: "TechnicalIndicators") -> str:
+    """Pure formatter -- the single shared source for the ANALYSIS_PROMPT/batch-scan
+    "TECHNICAL CONTEXT" section (2026-08-29), extracted from what used to be 4x
+    independently-duplicated inline string-building in engine.py so MACD/ADX/OBV
+    framing can't drift between call sites.
+
+    The added MACD/ADX/OBV line and the confluence instruction are deliberately
+    NEUTRAL and METHODOLOGY-ONLY -- they teach Claude HOW to weigh multiple
+    technical signals together (per explicit owner direction: "they must be set
+    up to complment each other"), but never state or imply WHAT the current
+    numbers already mean. This is a direct lesson from this project's own
+    market-context-section incident (2026-08-04 to 2026-08-27): a single
+    injected interpretive phrase ("a rising tide can squeeze a short position")
+    silently biased 162 real above-gate verdicts to a 0% accept rate before it
+    was found and removed. See tests/test_technical_summary_format.py's own
+    regression-lock test, which asserts no bullish/bearish/favorable-flavored
+    word can ever appear in this function's output, for any input."""
+    obv_sign = "+" if technicals.obv_trend_pct >= 0 else ""
+    return (
+        f"Price: ${price:.2f} | SMA50: ${technicals.sma_50:.2f} | "
+        f"SMA200: ${technicals.sma_200:.2f} | RSI: {technicals.rsi:.1f} | "
+        f"Support: ${technicals.support_level:.2f} | "
+        f"Resistance: ${technicals.resistance_level:.2f} | "
+        f"Avg Volume 30d: {technicals.avg_volume_30d:,}\n"
+        f"MACD: line {technicals.macd_line:.2f}, signal {technicals.macd_signal:.2f}, "
+        f"histogram {technicals.macd_histogram:.2f} (histogram = line minus signal) | "
+        f"ADX: {technicals.adx:.1f} (trend strength, 0-100 scale; higher = stronger "
+        f"trend, regardless of direction) | "
+        f"20-Day Volume Trend: {obv_sign}{technicals.obv_trend_pct:.1f}% "
+        f"(positive = net buying volume, negative = net selling volume)\n"
+        f"Read MACD, ADX, and the volume trend together, not independently: weigh a "
+        f"reading more heavily when multiple of these point the same direction, and "
+        f"treat a single indicator moving alone -- or any signal during a weak trend "
+        f"(low ADX) -- with more caution. If they conflict, treat the technical "
+        f"picture as genuinely mixed rather than picking whichever one supports a "
+        f"preferred conclusion."
     )
 
 
@@ -381,6 +425,8 @@ class MarketDataFetcher:
         support_level = float(recent.min())
         resistance_level = float(recent.max())
 
+        macd_line, macd_signal, macd_histogram = self._compute_macd(closes)
+
         return TechnicalIndicators(
             ticker=ticker,
             sma_50=round(sma_50, 2),
@@ -390,6 +436,11 @@ class MarketDataFetcher:
             support_level=round(support_level, 2),
             resistance_level=round(resistance_level, 2),
             atr_pct=round(self._compute_atr_pct(hist), 4),
+            macd_line=round(macd_line, 4),
+            macd_signal=round(macd_signal, 4),
+            macd_histogram=round(macd_histogram, 4),
+            adx=round(self._compute_adx(hist), 2),
+            obv_trend_pct=round(self._compute_obv_trend_pct(closes, volumes), 2),
         )
 
     async def get_long_term_trend(
@@ -501,6 +552,95 @@ class MarketDataFetcher:
         ], axis=1).max(axis=1)
         atr = float(true_range.tail(period).mean())
         last_close = float(close.iloc[-1])
-        if last_close <= 0:
+        # 2026-08-29: `last_close <= 0` alone never catches NaN -- NaN comparisons
+        # are always False in Python, so a NaN latest close (confirmed live: a
+        # real yfinance bar can come back with NaN High/Low/Close for an
+        # incomplete/still-forming day) used to silently produce a NaN atr_pct
+        # instead of failing safe to 0.0.
+        if last_close <= 0 or math.isnan(last_close) or math.isnan(atr):
             return 0.0
         return atr / last_close * 100
+
+    @staticmethod
+    def _compute_macd(closes, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[float, float, float]:
+        """Standard MACD: fast/slow EMA line, its own signal-line EMA, and their
+        difference (histogram) -- 2026-08-29, complements SMA/RSI/ATR with a
+        momentum-divergence signal none of those capture (see this project's
+        CLAUDE.md "MACD/ADX/OBV" entry). Returns (0.0, 0.0, 0.0) rather than
+        raising when there isn't enough history for the signal line's own EMA to
+        have a real seed -- every consumer treats an all-zero triple as "no
+        reading available" and omits the section, matching this file's existing
+        atr_pct/rsi fail-open convention."""
+        if len(closes) < slow + signal:
+            return (0.0, 0.0, 0.0)
+        ema_fast = closes.ewm(span=fast, adjust=False).mean()
+        ema_slow = closes.ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        histogram = macd_line - signal_line
+        return (float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(histogram.iloc[-1]))
+
+    @staticmethod
+    def _compute_adx(hist, period: int = 14) -> float:
+        """Average Directional Index -- trend STRENGTH, not direction, 2026-08-29.
+        Complements a raw SMA crossover: the same golden/death cross is far more
+        reliable in a strong trend (high ADX) than a choppy one (low ADX). Uses a
+        simple rolling-mean smoothing for +DM/-DM/TR and for the final DX average,
+        matching this file's own existing simplification choice for
+        _compute_atr_pct (a plain tail-mean of true range, not full recursive
+        Wilder smoothing) -- consistent style over strict textbook fidelity.
+        Needs roughly 2*period bars (period for the first smoothed +DM/-DM/TR
+        point, period more for ADX's own averaging window); returns 0.0 rather
+        than raising or NaN when there isn't enough history, or when a period has
+        zero directional movement at all (a 0/0 DX, e.g. a completely flat
+        high/low), matching this file's existing fail-open convention."""
+        if len(hist) < period * 2:
+            return 0.0
+        high = hist["High"]
+        low = hist["Low"]
+        close = hist["Close"]
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move
+        minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
+        prev_close = close.shift(1)
+        true_range = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+
+        tr_smooth = true_range.rolling(period).mean()
+        plus_dm_smooth = plus_dm.rolling(period).mean()
+        minus_dm_smooth = minus_dm.rolling(period).mean()
+
+        plus_di = 100 * plus_dm_smooth / tr_smooth
+        minus_di = 100 * minus_dm_smooth / tr_smooth
+        di_sum = plus_di + minus_di
+        dx = (100 * (plus_di - minus_di).abs() / di_sum).where(di_sum != 0, 0.0)
+
+        adx = dx.rolling(period).mean()
+        result = adx.iloc[-1]
+        return float(result) if not pd.isna(result) else 0.0
+
+    @staticmethod
+    def _compute_obv_trend_pct(closes, volumes, lookback: int = 20) -> float:
+        """On-Balance Volume, expressed as net signed volume over the lookback
+        window as a % of total volume traded in that window -- 2026-08-29,
+        confirms whether a price move has real conviction behind it (a
+        breakdown on high volume is far more trustworthy than one on thin
+        volume). Deliberately NOT raw OBV's own % change: OBV's cumulative
+        level is arbitrary and path-dependent (it can sit near zero or cross
+        it), making a plain % change of the level itself unstable/meaningless.
+        This framing is bounded [-100, 100] and comparable across tickers
+        regardless of OBV's own cumulative history. Returns 0.0 (never
+        raises) when there isn't enough history for a full window, or the
+        window's total volume is zero."""
+        if len(closes) < lookback + 1:
+            return 0.0
+        direction = closes.diff().apply(lambda x: 1.0 if x > 0 else (-1.0 if x < 0 else 0.0))
+        signed_volume = (direction * volumes).tail(lookback)
+        total_volume = volumes.tail(lookback).sum()
+        if total_volume == 0:
+            return 0.0
+        return float(signed_volume.sum() / total_volume * 100)

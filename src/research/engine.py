@@ -13,7 +13,9 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 
-from src.data.market_data import MarketDataFetcher, format_long_term_trend_summary
+from src.data.market_data import (
+    MarketDataFetcher, format_long_term_trend_summary, format_technical_summary,
+)
 from src.data.insider_tracker import InsiderTracker
 from src.data.news_feed import NewsFeed
 from src.research.fundamental import FundamentalAnalyzer
@@ -580,7 +582,10 @@ def _build_sma_trend_section(
             f"company's trend is generally more reliable to anticipate this way than a "
             f"small, volatile one's. Set trend_confirms_entry to true only if you genuinely "
             f"believe early entry is justified here — this is a higher bar than the "
-            f"already-crossed case, since the cross itself hasn't actually happened yet.\n"
+            f"already-crossed case, since the cross itself hasn't actually happened yet. "
+            f"The TECHNICAL CONTEXT section above also includes MACD, ADX (trend "
+            f"strength), and the 20-day volume trend for this ticker — weigh those "
+            f"alongside this SMA relationship rather than in isolation.\n"
         )
     relationship = "above" if sma_50 > sma_200 else "below"
     if crossover_date and days_since_crossover is not None:
@@ -606,7 +611,10 @@ def _build_sma_trend_section(
         f"company's trend signals reasonably stay meaningful longer than a small, "
         f"volatile one's). Set trend_confirms_entry to true only if you genuinely "
         f"believe this is a real, current, tradeable uptrend — not merely because "
-        f"the mechanical SMA relationship is technically satisfied.\n"
+        f"the mechanical SMA relationship is technically satisfied. The TECHNICAL "
+        f"CONTEXT section above also includes MACD, ADX (trend strength), and the "
+        f"20-day volume trend for this ticker — weigh those alongside this SMA "
+        f"relationship rather than in isolation.\n"
     )
 
 
@@ -762,13 +770,7 @@ class ResearchEngine:
         except Exception:
             company_name = ticker
 
-        technical_summary = (
-            f"Price: ${quote.price:.2f} | SMA50: ${technicals.sma_50:.2f} | "
-            f"SMA200: ${technicals.sma_200:.2f} | RSI: {technicals.rsi:.1f} | "
-            f"Support: ${technicals.support_level:.2f} | "
-            f"Resistance: ${technicals.resistance_level:.2f} | "
-            f"Avg Volume 30d: {technicals.avg_volume_30d:,}"
-        )
+        technical_summary = format_technical_summary(quote.price, technicals)
         long_term_trend_summary = format_long_term_trend_summary(long_term_trend)
 
         if self.client:
@@ -1765,13 +1767,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         except Exception:
             company_name = ticker
 
-        technical_summary = (
-            f"Price: ${quote.price:.2f} | SMA50: ${technicals.sma_50:.2f} | "
-            f"SMA200: ${technicals.sma_200:.2f} | RSI: {technicals.rsi:.1f} | "
-            f"Support: ${technicals.support_level:.2f} | "
-            f"Resistance: ${technicals.resistance_level:.2f} | "
-            f"Avg Volume 30d: {technicals.avg_volume_30d:,}"
-        )
+        technical_summary = format_technical_summary(quote.price, technicals)
 
         return {
             "ticker": ticker,
