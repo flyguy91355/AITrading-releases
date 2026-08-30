@@ -1145,6 +1145,23 @@ class OrderManager:
                 trade_id=_trade_id,
                 **self._buy_snapshot_fields(signal),
             ))
+            if result.status == OrderStatus.PARTIAL:
+                # Register for reconciliation against this SAME order's real completing
+                # fill (2026-07-29, BEN incident) -- see this dict's own docstring in
+                # __init__ for the full incident writeup. Per Alpaca's docs, PARTIAL is
+                # explicitly not terminal; without this, the order's later terminal "fill"
+                # event (which reports the true cumulative position_qty) has nothing to
+                # reconcile against and gets silently dropped. Registered HERE, before
+                # _place_exit_orders runs (fixed 2026-08-30, GitHub #124) -- that call
+                # does real broker I/O and can take several seconds (this project's own
+                # documented wash-trade/insufficient-qty retry tiers), and the previous
+                # placement of this line AFTER that await left exactly that window open:
+                # the order's real completing fill could arrive on the trade_updates
+                # stream while _place_exit_orders was still in flight, find nothing
+                # registered to reconcile against, and be silently dropped -- reopening
+                # the exact BEN race this dict exists to prevent, via a race in the fix
+                # itself.
+                self._partial_fill_pending[signal.ticker] = result.broker_order_id
             # Locked so sync_exit_orders can't independently discover this brand-new
             # position mid-placement and race to "cover" it a second time — a gap that
             # existed even before today's other races (this ticker was never in
@@ -1155,14 +1172,6 @@ class OrderManager:
                     signal.ticker, actual_shares,
                     signal.stop_loss, signal.take_profit_targets,
                 )
-            if result.status == OrderStatus.PARTIAL:
-                # Register for reconciliation against this SAME order's real completing
-                # fill (2026-07-29, BEN incident) -- see this dict's own docstring in
-                # __init__ for the full incident writeup. Per Alpaca's docs, PARTIAL is
-                # explicitly not terminal; without this, the order's later terminal "fill"
-                # event (which reports the true cumulative position_qty) has nothing to
-                # reconcile against and gets silently dropped.
-                self._partial_fill_pending[signal.ticker] = result.broker_order_id
         elif result.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED):
             self.active_orders[result.broker_order_id] = result
             # After-hours / just-accepted order — store for later fill detection.
@@ -1816,6 +1825,29 @@ class OrderManager:
         qty_ok = covered_qty >= pos.shares - 0.05
         return stop_price_ok and qty_ok
 
+    @staticmethod
+    def _pending_market_sell_qty(ticker: str, open_orders: list[dict]) -> float:
+        """Total resting market-sell quantity for `ticker` in `open_orders` -- shared
+        by check_protection_gaps and sync_exit_orders (fixed 2026-08-30, GitHub #123)
+        so the two can't independently drift on this the way they had:
+        check_protection_gaps used to treat ANY resting market sell as "this ticker
+        is being closed, not a gap" regardless of quantity, while sync_exit_orders
+        already correctly summed it (2026-07-30, BEN incident) and only treats a
+        ticker as fully covered once this reaches pos.shares. The original
+        BEN-class trigger for a genuinely partial resting market sell (the old
+        stop-breach fallback selling only a tranche) was closed by the 2026-08-11
+        redesign, but _execute_take_profit_tranche's own TP-tranche market sell is a
+        second, still-live source of a real partial one -- normally invisible to
+        both callers since it's placed under the same ticker lock they both already
+        skip, but an exception between that sell and the fresh stop placed right
+        after it (e.g. a non-OperationalError raised from _save_position) can exit
+        that locked block early, leaving a real, uncovered remainder that a bare
+        "any market sell exists" check would incorrectly wave off."""
+        return sum(
+            o.get("qty") or 0.0 for o in open_orders
+            if o["ticker"] == ticker and o["side"] == "sell" and o["type"] == "market"
+        )
+
     async def check_protection_gaps(self) -> list[dict]:
         """Read-only verification: does every held position actually have correct
         broker-side protection right now? Runs on the 10s position_update_loop cadence
@@ -1835,15 +1867,14 @@ class OrderManager:
 
         stop_orders = {o["ticker"]: o for o in open_orders
                        if o["side"] == "sell" and o["type"] in ("stop", "stop_limit")}
-        pending_market_sell = {o["ticker"] for o in open_orders
-                                if o["side"] == "sell" and o["type"] == "market"}
 
         gaps: list[dict] = []
         for ticker, pos in list(self.portfolio.positions.items()):
             if self._lock_for(ticker).locked():
                 continue  # mid-operation elsewhere (buy/sell/sync in flight) — not a gap
-            if ticker in pending_market_sell:
-                continue  # active close attempt already in flight — not a gap
+            pending_qty = self._pending_market_sell_qty(ticker, open_orders)
+            if pending_qty >= pos.shares - 0.001:
+                continue  # active close attempt already covers the whole position — not a gap
             if pos.stop_loss <= 0:
                 gaps.append({"ticker": ticker, "reason": f"stop_loss is {pos.stop_loss} — no downside protection configured"})
                 continue
@@ -1984,11 +2015,10 @@ class OrderManager:
                     # several minutes, since every subsequent pass hit this same skip).
                     # Only the genuinely-still-uncovered remainder is placed for below --
                     # _cancel_exit_orders already never touches a market-type order, so the
-                    # resting partial sell is left alone either way.
-                    pending_market_sell_qty = sum(
-                        o.get("qty") or 0.0 for o in open_orders
-                        if o["ticker"] == ticker and o["side"] == "sell" and o["type"] == "market"
-                    )
+                    # resting partial sell is left alone either way. Shared with
+                    # check_protection_gaps via _pending_market_sell_qty (2026-08-30,
+                    # GitHub #123) so the two can't independently drift on this again.
+                    pending_market_sell_qty = self._pending_market_sell_qty(ticker, open_orders)
                     if pending_market_sell_qty >= pos.shares - 0.001:
                         logger.debug(
                             "sync_exit_orders: skipping %s — pending market sell already "
@@ -2222,9 +2252,34 @@ class OrderManager:
             # which includes the tranche about to sell; Alpaca reserves shares against
             # a resting order, so the tranche sell would be rejected for insufficient
             # quantity otherwise (verified against Alpaca's real docs, 2026-08-11).
-            old_stop = self._stop_order_ids.pop(ticker, None)
+            #
+            # Not popped from _stop_order_ids until the cancel is CONFIRMED successful
+            # (fixed 2026-08-30, GitHub #132) -- a cancel can fail because the stop has
+            # already filled at the broker (a real whipsaw: price crosses both the TP
+            # target and the stop level around the same tick, a scenario this project
+            # has hit live more than once -- FTV/AIT/CCEP/AYI/AFG). The previous version
+            # popped the entry AND ignored the cancel's return value, so on a failed
+            # cancel it proceeded to sell a TP tranche on top of a position that may
+            # already be fully closed at the broker, while the popped entry meant the
+            # fast trade_updates-stream stop-fill path (which matches purely by this
+            # order id) could never find this ticker again to correctly record the real
+            # stop-loss closure. Leaving the entry in place on a failed cancel costs
+            # nothing in the ordinary case (a merely-slow/transient cancel failure) --
+            # sync_exit_orders/check_protection_gaps' existing safety net still sees the
+            # position as tracked exactly as before this function ever ran.
+            old_stop = self._stop_order_ids.get(ticker)
             if old_stop:
-                await self.cancel(old_stop)
+                cancelled = await self.cancel(old_stop)
+                if not cancelled:
+                    logger.warning(
+                        "Take-profit T%d for %s: stop cancel failed (already filled?) -- "
+                        "aborting the TP sell so the real closure can be reconciled "
+                        "via the stop's still-tracked order id instead of being "
+                        "overwritten by a sell against a possibly already-closed position",
+                        tranche_number, ticker,
+                    )
+                    return False
+                self._stop_order_ids.pop(ticker, None)
                 await asyncio.sleep(0.75)  # let Alpaca settle the cancellation
 
             sell_qty = round(tranche_shares, 9)
@@ -2550,6 +2605,25 @@ class OrderManager:
                         trade_id=str(uuid.uuid4()),
                         **pending.get("buy_snapshot", {}),
                     ))
+                    # Lock acquired IMMEDIATELY after add_position_async, with no unlocked
+                    # await in between (fixed 2026-08-30, GitHub #125) -- matches both
+                    # sibling call sites (_execute_buy, _handle_trade_update's own
+                    # pending-buy resolution), neither of which ever had a gap here. The
+                    # cash re-sync below used to run BEFORE this lock was acquired, leaving
+                    # a real network round-trip + DB write during which a concurrent
+                    # sync_exit_orders() pass could legitimately discover this newly-visible,
+                    # still-unprotected ticker and place its own stop first -- this
+                    # function's own _place_exit_orders call then got rejected by Alpaca
+                    # (insufficient qty) and logged a false "position remains unprotected"
+                    # alarm for a position that was actually already fully protected, just
+                    # by the other caller. _place_exit_orders itself never reads
+                    # self.portfolio.cash, so moving the cash re-sync after it is safe.
+                    async with self._lock_for(ticker):
+                        await self._place_exit_orders(
+                            ticker, real_shares,
+                            pending["stop_price"],
+                            pending.get("take_profit_targets", []),
+                        )
                     # Alpaca deducts cash at order submission, so _sync_portfolio already
                     # captured the reduced balance. add_position_async deducted it again —
                     # re-fetch the authoritative cash balance to correct any double-deduction.
@@ -2559,15 +2633,6 @@ class OrderManager:
                         await self.portfolio._save_state()
                     except Exception as e:
                         logger.warning("Cash re-sync after pending fill failed for %s: %s", ticker, e)
-                    # Same reasoning as the _execute_buy call site — the ticker was only
-                    # just added to portfolio.positions above, so it needs the lock held
-                    # for the placement to be safe against a concurrent sync_exit_orders.
-                    async with self._lock_for(ticker):
-                        await self._place_exit_orders(
-                            ticker, real_shares,
-                            pending["stop_price"],
-                            pending.get("take_profit_targets", []),
-                        )
 
             # If any share counts were corrected, re-sync cash from Alpaca so portfolio.cash
             # reflects the actual proceeds from untracked TP fills rather than a stale value.
