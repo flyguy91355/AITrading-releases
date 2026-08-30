@@ -1569,6 +1569,21 @@ class DashboardState:
         # attempt's own finally block regardless of how it exits.
         self._promotion_cash_lock = asyncio.Lock()
         self._reserved_cash: float = 0.0
+        # Per-ticker in-flight promotion guard (fixed 2026-08-30, GitHub #100) --
+        # _promotion_cash_lock/_reserved_cash above only serialize the DOLLAR
+        # amount reserved by concurrent promotion attempts, never per-ticker
+        # identity. Track 2 (_run_sma_trend_scan) can be mid-flight on a real
+        # analyze_stock() call for an On Shore ticker while _backfill_on_deck_
+        # from_on_shore (every near_miss_monitor_loop tick) independently admits
+        # that SAME ticker onto near_miss_candidates and fires its own Track 1
+        # promotion for it -- neither of _attempt_near_miss_promotion's two
+        # `ticker in self.portfolio.positions` checks catches this, since both
+        # are only true once a buy has ALREADY completed, not while a second
+        # attempt is merely in flight. Checked and marked as the very first
+        # action inside _attempt_near_miss_promotion's own try block, so every
+        # real caller is protected uniformly without each one having to
+        # individually remember to guard itself.
+        self._promotion_in_flight: set[str] = set()
         # Fresh-install banner (2026-07-21) -- True until a pre-open/universe scan has
         # completed at least once, ever (see _FIRST_SCAN_MARKER, checked in startup()).
         # Never auto-fires a scan on its own; only true to let the dashboard show a
@@ -1630,6 +1645,17 @@ class DashboardState:
         # cooldown stops price lingering near a trigger zone from firing a real Claude
         # call on every single tick.
         self._event_monitor_cooldown: dict[str, datetime] = {}
+        # Per-ticker in-progress guard for _reanalyze_held_position (fixed
+        # 2026-08-30, GitHub #103) -- its three callers (position_monitor_loop's
+        # periodic sweep, and both event triggers in position_update_loop:
+        # profitable-position proximity-to-exit, underwater-position loss-
+        # crossing) are all independent and can legitimately target the same
+        # ticker within the same few seconds. _reanalyze_held_position itself had
+        # no lock of its own, so a concurrent duplicate call for the identical
+        # ticker could fire a second real Claude call for no benefit while the
+        # first was still awaiting its own. Checked and marked as the first
+        # action, before any of the three callers' work actually starts.
+        self._position_reanalysis_in_flight: set[str] = set()
         # Deepest unrealized_pnl_pct that has already fired the underwater-position event
         # trigger (2026-07-29) -- see _loss_retrigger_should_fire's docstring. Cleared for
         # a ticker once it recovers back above -position_monitor_loss_trigger_pct, so a
@@ -3216,6 +3242,18 @@ class DashboardState:
         # immediately with no restart needed.
         if not self.config["research"].get("position_monitor_enabled", False):
             return
+        # 2026-08-30, GitHub #103 -- see _position_reanalysis_in_flight's own
+        # docstring at __init__. This function's 3 callers (the periodic sweep,
+        # and both event triggers) are all independent and can legitimately
+        # target the same ticker within the same few seconds; without this,
+        # a concurrent duplicate call fires a second real Claude call for no
+        # benefit while the first is still awaiting its own. Marked before
+        # entering try/finally (not inside it) so a blocked caller's own early
+        # return never reaches the finally block and can't clear a different,
+        # still-running call's marker.
+        if ticker in self._position_reanalysis_in_flight:
+            return
+        self._position_reanalysis_in_flight.add(ticker)
         try:
             entry = self.add_ai_log(ticker, "MONITOR", f"{trigger_label} re-analysis starting...")
             await self.broadcast({"type": "ai_log", "entry": entry})
@@ -3293,6 +3331,8 @@ class DashboardState:
         except Exception as e:
             entry = self.add_ai_log(ticker, "ERROR", f"Monitor re-analysis failed: {e}", "error")
             await self.broadcast({"type": "ai_log", "entry": entry})
+        finally:
+            self._position_reanalysis_in_flight.discard(ticker)
 
     async def position_monitor_loop(self):
         """Periodic re-analysis of held positions that are underwater or flat (2026-07-27,
@@ -6080,7 +6120,22 @@ class DashboardState:
         bought = False
         reserved_amount = 0.0
         evicted = False
+        marked_in_flight = False
         try:
+            # 2026-08-30, GitHub #100 -- see _promotion_in_flight's own docstring
+            # at __init__ for the full incident: this is the single shared choke
+            # point every real promotion caller (Track 1, Track 2, the Track1/
+            # Track2-merge override) funnels through, so guarding here protects
+            # all of them uniformly against a genuine concurrent double-buy for
+            # the same ticker. Checked and marked as literally the first thing
+            # inside this try block, before anything else can await. marked_
+            # in_flight tracks whether THIS call is the one that set the flag --
+            # a blocked concurrent call's own finally must never clear the OTHER,
+            # still-running call's marker.
+            if ticker in self._promotion_in_flight:
+                return
+            self._promotion_in_flight.add(ticker)
+            marked_in_flight = True
             if not self.config["trading"].get("auto_execute", False) or not self.broker_connected:
                 return
             # Not-yet-open gate (2026-08-28, JNJ/RRC premarket-fill incident) -- the
@@ -6514,6 +6569,8 @@ class DashboardState:
                     f"Rejected by broker: {order.status.value}",
                     f"Buy rejected by broker: {order.status.value}", level="error")
         finally:
+            if marked_in_flight:
+                self._promotion_in_flight.discard(ticker)
             if reserved_amount:
                 self._reserved_cash -= reserved_amount
             if bought and nm_snapshot is not None:
@@ -8212,7 +8269,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 nonlocal screened_out, scanned, already_covered
                 buffer: list[str] = []
                 for ticker in universe_candidates:
-                    if self.paused:
+                    if self.paused or self.stopped:
                         break
                     if (ticker in held_tickers or ticker in self.near_miss_candidates
                             or self._is_on_deck_blocked(ticker)):
@@ -8384,7 +8441,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             await self.broadcast({"type": "ai_log", "entry": entry})
 
             for ticker in self._on_shore_tickers():
-                if self.paused:
+                if self.paused or self.stopped:
                     break
                 cached = self._quick_screen_sma_cache.get(ticker)
                 if cached is None:
@@ -8538,7 +8595,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             buffer: list[str] = []
             _last_progress_log = scanned
             for ticker in universe_candidates:
-                if self.paused:
+                if self.paused or self.stopped:
                     break
                 if (ticker in held_tickers or ticker in self.near_miss_candidates
                         or self._is_on_deck_blocked(ticker)):
