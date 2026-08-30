@@ -1814,6 +1814,19 @@ async function saveSettings() {
     });
     const data = await resp.json();
     if (resp.ok) {
+      // 2026-08-30, GitHub #107 -- a Risk Tier mode switch (Auto<->Manual) is only
+      // actually applied server-side inside THIS save (restoring the real anchor,
+      // or computing the tier value) -- data.risk_tier_values carries the real,
+      // authoritative post-save value for each of the 11 tier-controlled fields.
+      // Without this, the input kept showing whatever stale value was already in
+      // the DOM before the switch, and the NEXT unrelated save would silently
+      // resubmit that stale number and overwrite the just-applied real one.
+      if (data.risk_tier_values) {
+        Object.entries(data.risk_tier_values).forEach(([dotkey, value]) => {
+          const input = document.querySelector(`.setting-input[name="${dotkey}"]`);
+          if (input) input.value = value;
+        });
+      }
       document.querySelectorAll('.setting-input').forEach(el => {
         originals[el.name] = el.type === 'checkbox' ? el.checked : el.value;
         el.classList.remove('changed');

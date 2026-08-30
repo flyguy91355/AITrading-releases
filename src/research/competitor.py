@@ -35,8 +35,13 @@ class CompetitorAnalyzer:
         self.config = config
 
     async def analyze(self, ticker: str) -> CompetitiveAnalysis:
-        stock = yf.Ticker(ticker)
-        info = stock.info or {}
+        # 2026-08-30, GitHub #111 -- .info triggers a real synchronous HTTP request;
+        # calling it unwrapped here blocked the entire asyncio event loop for that
+        # request's duration, stalling every other concurrent scan, WebSocket tick,
+        # and position-monitor loop in this live trading system. _find_peers below
+        # already wraps its own yfinance calls in asyncio.to_thread -- this now
+        # matches that same pattern.
+        info = await asyncio.to_thread(lambda: yf.Ticker(ticker).info or {})
 
         competitors = SECTOR_PEERS.get(ticker, [])
         if not competitors:
@@ -144,8 +149,9 @@ class CompetitorAnalyzer:
         peer_metrics = []
         for peer in peers[:3]:
             try:
-                p = yf.Ticker(peer)
-                pi = p.info or {}
+                # 2026-08-30, GitHub #111 -- same fix as analyze() above; this loop
+                # compounds the block up to 3x sequentially per call when unwrapped.
+                pi = await asyncio.to_thread(lambda p=peer: yf.Ticker(p).info or {})
                 peer_pe = pi.get("trailingPE", 0) or 0
                 peer_metrics.append((peer, peer_pe))
             except Exception:

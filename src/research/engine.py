@@ -1623,6 +1623,22 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         if math.isnan(conviction_score):
             raise ValueError(f"conviction_score parsed as NaN for {ticker} — malformed Claude response")
 
+        # 2026-08-30, GitHub #98 -- same class of gap as conviction_score above, just
+        # never given the same guard. signal_generator.py's two R/R gates both rely on
+        # bare `<= 0`/`<` comparisons (`not fair_value_estimate or fair_value_estimate
+        # <= 0`, then `reward <= 0 or rr < required_rr`) -- every comparison against
+        # NaN or Infinity is False, so both silently pass a malformed value straight
+        # through. Traced further than that: compute_bounded_rr (web/app.py), the
+        # actual live R/R gate behind every real buy-decision call site, has no NaN
+        # guard of its own either (`min(NaN, x)` stays NaN in Python), so this reaches
+        # the real buy pipeline, not just the dead _evaluate_report WS path. isinf
+        # checked too, not just isnan -- Infinity passes the identical bare comparisons
+        # the same way NaN does.
+        fair_value_estimate = (
+            float(data["fair_value_estimate"]) if data.get("fair_value_estimate") is not None else 0.0)
+        if math.isnan(fair_value_estimate) or math.isinf(fair_value_estimate):
+            raise ValueError(f"fair_value_estimate parsed as NaN/Infinity for {ticker} — malformed Claude response")
+
         return ResearchReport(
             ticker=ticker,
             company_name=company_name,
@@ -1650,7 +1666,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             take_profit_targets=[float(t) for t in (data.get("take_profit_targets") or []) if t is not None and float(t) > 0],
             time_horizon=data.get("time_horizon", ""),
             reasoning=data.get("reasoning", ""),
-            fair_value_estimate=float(data["fair_value_estimate"]) if data.get("fair_value_estimate") is not None else 0.0,
+            fair_value_estimate=fair_value_estimate,
             margin_of_safety_pct=float(data["margin_of_safety_pct"]) if data.get("margin_of_safety_pct") is not None else 0.0,
             watch_condition=str(data.get("watch_condition", "") or "").strip(),
             trend_confirms_entry=_parse_json_bool(data.get("trend_confirms_entry"), default=False),

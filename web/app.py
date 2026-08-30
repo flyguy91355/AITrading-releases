@@ -2142,12 +2142,16 @@ class DashboardState:
             "closed_all_time": self._win_rate_cache.get("closed_all_time", 0),
         }
 
-    def get_init_payload(self) -> dict:
+    async def get_init_payload(self) -> dict:
         """Everything websocket_endpoint sends as its first message on a fresh connection —
         factored out (2026-07-23) so /api/dashboard-poll (the HTTP-polling fallback used
         when a client's WebSocket can't stay connected — see GET /api/dashboard-poll's own
         docstring) can serve byte-identical data through a completely different transport,
-        rather than drifting out of sync with a second hand-maintained copy."""
+        rather than drifting out of sync with a second hand-maintained copy.
+
+        async since 2026-08-30 (GitHub #102) -- the watchlist_manager calls below now
+        dispatch their DB work via asyncio.to_thread internally, so this function (and
+        get_scan_status, which it calls) had to become async to await them."""
         return {
             "type": "init",
             "portfolio": self.get_portfolio_snapshot(),
@@ -2160,10 +2164,10 @@ class DashboardState:
                 "broker": self.config["trading"]["broker"],
                 "paper_trading": self.config["trading"]["paper_trading"],
             },
-            "stocks": self.watchlist_manager.get_active(),
-            "watchlist_size": self.watchlist_manager.size(),
+            "stocks": await self.watchlist_manager.get_active(),
+            "watchlist_size": await self.watchlist_manager.size(),
             "watchlist_target": self.watchlist_manager.target_size,
-            "scan_status": self.get_scan_status(),
+            "scan_status": await self.get_scan_status(),
             "max_positions": self.config.get("portfolio", {}).get("max_positions", 10),
             "needs_first_scan": self.needs_first_scan,
             "promotion_attempts": self.promotion_attempts,
@@ -2523,12 +2527,12 @@ class DashboardState:
         pnl = current - base
         return round(pnl, 2), round(pnl / base * 100, 2)
 
-    def get_scan_status(self) -> dict:
+    async def get_scan_status(self) -> dict:
         return {
             "current_ticker": self.current_ticker,
             "cycle": self.cycle_count,
             "index": self.scan_index,
-            "total": self.watchlist_manager.size(),
+            "total": await self.watchlist_manager.size(),
             "next_cycle": self.next_cycle_at,
             "run_status": self.run_status(),
         }
@@ -3572,7 +3576,7 @@ class DashboardState:
 
         if cmd == "execute_buy":
             ticker = data.get("ticker", "").upper().strip()
-            valid_tickers = self.watchlist_manager.get_active_tickers()
+            valid_tickers = await self.watchlist_manager.get_active_tickers()
             if ticker not in valid_tickers:
                 await websocket.send_json({"type": "trade_error", "error": f"Invalid ticker: {ticker}"})
                 return
@@ -3797,8 +3801,27 @@ class DashboardState:
         itself just wasn't gated at all, wasting the one real Claude call whose
         entire purpose is enabling that now-impossible buy."""
         cutoff_str = self.config["research"].get("auto_buy_cutoff_time", "14:00")
-        ch, cm = cutoff_str.split(":")
-        return self._now_et().time() >= dtime(int(ch), int(cm))
+        # 2026-08-30, GitHub #101 -- a blank or malformed cutoff_str (e.g. a Settings
+        # save whose blank-field-skip fix only covers coercions that raise on "" --
+        # a bare str coercion never does) used to raise an uncaught ValueError here,
+        # propagating out of this function's sole real caller
+        # (_attempt_near_miss_promotion, whose own try block has no except, only a
+        # finally) and breaking every remaining promotion attempt in whatever loop
+        # called it. Fails toward the SAFER interpretation on a parse failure: treat
+        # it as past cutoff (blocks new buys) rather than silently disabling the
+        # cutoff entirely -- blocking a buy on a config error costs far less than the
+        # real late-day buy this gate exists to prevent.
+        try:
+            ch, cm = cutoff_str.split(":")
+            cutoff_time = dtime(int(ch), int(cm))
+        except (ValueError, TypeError):
+            logger.warning(
+                "_past_auto_buy_cutoff: malformed auto_buy_cutoff_time %r — "
+                "treating as past cutoff (blocking new buys) until fixed in Settings",
+                cutoff_str,
+            )
+            return True
+        return self._now_et().time() >= cutoff_time
 
     def _drawdown_diagnostic(self) -> str:
         """Total value / peak value / computed drawdown %, for appending to any halt log
@@ -5234,7 +5257,7 @@ class DashboardState:
             try:
                 if self.paused or self.stopped or not self._is_market_open():
                     continue
-                tickers = [s["ticker"] for s in self.watchlist_manager.get_active()]
+                tickers = [s["ticker"] for s in await self.watchlist_manager.get_active()]
                 if not tickers:
                     continue
                 updates: dict[str, float] = {}
@@ -8249,7 +8272,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             await self.broadcast({"type": "ai_log", "entry": entry})
 
             held_tickers = set(self.portfolio.positions.keys())
-            universe_candidates = self.watchlist_manager.available_from_universe(STOCK_UNIVERSE)
+            universe_candidates = await self.watchlist_manager.available_from_universe(STOCK_UNIVERSE)
 
             added = 0
             screened_out = 0
@@ -8562,7 +8585,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         await self.broadcast({"type": "ai_log", "entry": entry})
 
         held_tickers = set(self.portfolio.positions.keys())
-        universe_candidates = self.watchlist_manager.available_from_universe(STOCK_UNIVERSE)
+        universe_candidates = await self.watchlist_manager.available_from_universe(STOCK_UNIVERSE)
 
         added = 0
         screened_out = 0
@@ -8605,7 +8628,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
 
                 # Advance cursor regardless of outcome so next pre-open resumes from here
                 if ticker in STOCK_UNIVERSE:
-                    self.watchlist_manager.set_scan_cursor(
+                    await self.watchlist_manager.set_scan_cursor(
                         (STOCK_UNIVERSE.index(ticker) + 1) % len(STOCK_UNIVERSE))
 
                 # Quick screen first — free, no Claude, filters ~97% of universe now
@@ -9140,12 +9163,32 @@ async def save_settings(payload: dict):
                 asyncio.create_task(
                     asyncio.to_thread(_save_on_deck_cache, dict(state.near_miss_candidates)))
 
-    return {"status": "ok", "saved": list(payload.keys())}
+    # 2026-08-30, GitHub #107 -- switching Risk Tier Mode (Auto<->Manual) only ever
+    # toggled disabled/CSS lock state on the 11 tier-controlled fields; it never
+    # rewrote their displayed .value to the real post-coercion value (the restored
+    # anchor on Auto->Manual, or the tier-computed number on Manual->Auto). This
+    # response previously carried no data the frontend could self-correct from at
+    # all -- saveSettings()'s success handler trusted whatever stale value was
+    # already sitting in each <input>, so an unrelated later save would resubmit
+    # that stale number and silently overwrite the just-applied real one (the same
+    # class of override-drift incident the 2026-08-23 backend-only fix closed for
+    # the config file, but never for the page's own displayed state). Returns the
+    # real, authoritative current value for all 11 fields from state.config
+    # (already updated above) on EVERY save, not just one that happened to touch
+    # them -- the frontend can then always resync regardless of what this specific
+    # payload changed.
+    risk_tier_values = {}
+    for _dotkey in RISK_TIER_DOTKEYS.values():
+        _section, _key = _dotkey.split(".", 1)
+        if _key in state.config.get(_section, {}):
+            risk_tier_values[_dotkey] = state.config[_section][_key]
+
+    return {"status": "ok", "saved": list(payload.keys()), "risk_tier_values": risk_tier_values}
 
 
 @app.get("/api/stocks")
 async def get_stocks():
-    return state.watchlist_manager.get_active()
+    return await state.watchlist_manager.get_active()
 
 
 @app.get("/api/portfolio")
@@ -10024,7 +10067,7 @@ async def get_stock_report(ticker: str):
     if ticker in state.deep_dive_reports:
         dd = state.deep_dive_reports[ticker]
         return {**dd, "source": "deep_dive"}
-    summary = state.watchlist_manager.get_stock_summary(ticker)
+    summary = await state.watchlist_manager.get_stock_summary(ticker)
     if summary:
         return summary
     from fastapi import HTTPException
@@ -10099,7 +10142,7 @@ async def get_dashboard_poll():
     poll loop (dashboard.html, engaged automatically once the WebSocket drops) can keep
     everything live over plain HTTP regardless of what's blocking the WS upgrade on a given
     client — same auth gate as every other /api/ route, nothing new to secure."""
-    return state.get_init_payload()
+    return await state.get_init_payload()
 
 
 async def _reconstruct_missing_tp_fills(buys_by_ticker: dict) -> list[dict]:
@@ -11201,7 +11244,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # research_reports intentionally omitted — fetched lazily via GET /api/research-reports
     # (see that endpoint's docstring for why).
-    await websocket.send_json(state.get_init_payload())
+    await websocket.send_json(await state.get_init_payload())
 
     try:
         while True:
@@ -11329,8 +11372,8 @@ async def startup():
     # Remove any watchlist stocks already held as positions — they don't need a slot
     held = set(state.portfolio.positions.keys())
     for ticker in held:
-        if ticker in state.watchlist_manager.get_active_tickers():
-            state.watchlist_manager.remove(ticker)
+        if ticker in await state.watchlist_manager.get_active_tickers():
+            await state.watchlist_manager.remove(ticker)
             logger.info("Startup cleanup: removed held position %s from watchlist", ticker)
 
     # Manual On Deck removals (2026-07-18) — loaded before near_miss_candidates so a ticker
