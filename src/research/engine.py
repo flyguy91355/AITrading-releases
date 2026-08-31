@@ -1840,14 +1840,35 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         # be silently dropped (see CLAUDE.md) before ever reaching Claude. This throttle
         # keeps concurrent gathering fast without triggering the same cascade.
         _gather_semaphore = asyncio.Semaphore(5)
+        # One retry after a short delay before excluding a ticker outright (2026-08-31,
+        # live incident: a ~64s Finnhub 503 blip during the pre-open batch dropped 41
+        # tickers for the whole day, only recoverable via the next mid-day rescan ~1.5hrs
+        # later). The delay happens OUTSIDE the semaphore hold so a failed ticker waiting
+        # to retry doesn't tie up one of the 5 concurrent slots other tickers need for
+        # their own first attempt.
+        _GATHER_RETRY_DELAY_SECS = 20
+
+        async def _gather_once(ticker: str) -> dict | None:
+            async with _gather_semaphore:
+                return await self.gather_analysis_inputs(ticker)
 
         async def _gather_safe(ticker: str) -> tuple[str, dict | None]:
-            async with _gather_semaphore:
-                try:
-                    return ticker, await self.gather_analysis_inputs(ticker)
-                except Exception as e:
-                    logger.warning("Batch input gathering failed for %s: %s", ticker, e)
-                    return ticker, None
+            try:
+                return ticker, await _gather_once(ticker)
+            except Exception as e:
+                logger.warning(
+                    "Batch input gathering failed for %s: %s -- retrying once in %ss",
+                    ticker, e, _GATHER_RETRY_DELAY_SECS,
+                )
+            await asyncio.sleep(_GATHER_RETRY_DELAY_SECS)
+            try:
+                return ticker, await _gather_once(ticker)
+            except Exception as e:
+                logger.warning(
+                    "Batch input gathering failed for %s on retry too: %s -- excluding "
+                    "from this batch", ticker, e,
+                )
+                return ticker, None
 
         gathered = await asyncio.gather(*(_gather_safe(t) for t in tickers))
         inputs_by_ticker = {t: inp for t, inp in gathered if inp is not None}
