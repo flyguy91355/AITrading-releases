@@ -29,12 +29,8 @@ from src.utils.config import load_config
 from src.data.market_data import MarketDataFetcher
 from src.data.insider_tracker import InsiderTracker
 from src.data.news_feed import NewsFeed
-from src.research.engine import ResearchEngine, _clamp_ai_stop_loss
+from src.research.engine import ResearchEngine, _clamp_ai_stop_loss, extract_response_text
 from src.research.market_cap import market_cap_tier_label as _market_cap_tier_label
-from src.research.fundamental import FundamentalAnalyzer
-from src.research.sentiment import SentimentAnalyzer
-from src.research.insider_analysis import InsiderAnalyzer
-from src.research.competitor import CompetitorAnalyzer
 from src.research.quick_screen import quick_screen
 
 # quick_screen() makes several yfinance calls with no timeout of their own (2026-08-03,
@@ -58,6 +54,26 @@ _QUICK_SCREEN_TIMEOUT_SECS = 15
 # connection to that shared file -- see also _ensure_wal_mode below, the other half of
 # this same fix.
 _SQLITE_TIMEOUT_SECS = 20.0
+
+# How many ai_log inserts to let through before running the row-count prune (GitHub
+# #154). Pruning on every single insert added a full "DELETE ... NOT IN (SELECT ...)"
+# subquery to every log line -- hundreds per pre-open scan -- against the same shared
+# database above. See _persist_log_entry.
+_LOG_PRUNE_EVERY = 50
+
+# How long cash stays committed to an accepted-but-unreconciled buy order before the
+# commitment is dropped (2026-09-01, full-codebase review -- see
+# DashboardState._pending_buy_reservations). Generous enough to cover a slow fill and
+# the 10s reconciliation poll behind it, short enough that an order which never fills
+# can't strand buying power for the rest of the session.
+_PENDING_BUY_RESERVATION_TTL_SECONDS = 600.0
+
+# Bounded wait for a just-submitted buy to report its real fill before the JSONL trade
+# record is written (see DashboardState._log_buy_trade). A market order to a liquid
+# name normally fills well inside this; if it doesn't, the record is still written from
+# the pre-trade estimate exactly as before, so nothing is ever lost.
+_BUY_FILL_CONFIRM_ATTEMPTS = 6
+_BUY_FILL_CONFIRM_INTERVAL_SECONDS = 1.0
 from src.research.rr_curve import dip_summary, price_sparkline, rr_at_price, rr_points, rr_sparkline
 
 
@@ -94,6 +110,7 @@ from src.reporting.trade_logger import TradeLogger
 from src.utils.watchlist_manager import WatchlistManager
 from src.data.stock_universe import get_universe
 from src.analytics.composition_benchmark import weighted_daily_return, is_usable_price
+from src.analytics.trade_log_signal import classify_trade_signal
 from src.update.version import read_local_version, write_local_version, is_newer
 from src.update.release_client import fetch_latest_release, fetch_recent_releases
 from src.update.apply import extract_release_archive, copy_updatable_files, requirements_changed
@@ -336,12 +353,38 @@ _PERFORMANCE_HISTORY_PATH = Path("data/performance_history.json")
 STOCK_UNIVERSE: list[str] = []
 
 
-def _save_dd_cache(reports: dict) -> None:
+def _atomic_write_json(path: Path, obj, label: str, *, default=None) -> None:
+    """Write `obj` to `path` as JSON so a reader can never see a partial file
+    (2026-09-01, full-codebase review). Every one of these caches used to be written
+    with a bare write_text, which truncates the real file and then streams into it --
+    and several are saved fire-and-forget from asyncio.to_thread, so a single monitor
+    tick could have two pool threads writing the same path at once. Measured on this
+    dev box, two threads racing realistic ~135KB on-deck snapshots produced an
+    unparseable file in 76 of 300 attempts; the loaders catch the parse error and
+    return {}, so one bad race at the end of a session silently wipes the entire
+    persisted On Deck list on the next restart. A mid-write process kill did the same
+    with no concurrency needed.
+
+    Writing to a per-writer temp file and os.replace-ing it into place makes each save
+    all-or-nothing (os.replace is atomic on POSIX and on Windows), so concurrent savers
+    simply resolve to last-writer-wins with a complete file, and a crash leaves the
+    previous good file untouched. Callers keep their own fail-soft contract: a failed
+    save warns and moves on, exactly as before."""
     try:
-        _DD_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _DD_CACHE_PATH.write_text(json.dumps(reports, default=str), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(obj, default=default)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
     except Exception as e:
-        logger.warning("Failed to save deep dive cache: %s", e)
+        logger.warning("Failed to save %s: %s", label, e)
+
+
+def _save_dd_cache(reports: dict) -> None:
+    _atomic_write_json(_DD_CACHE_PATH, reports, "deep dive cache", default=str)
 
 
 def _load_dd_cache() -> dict:
@@ -354,11 +397,7 @@ def _load_dd_cache() -> dict:
 
 
 def _save_report_cache(reports: dict) -> None:
-    try:
-        _REPORT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _REPORT_CACHE_PATH.write_text(json.dumps(reports, default=str), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save report cache: %s", e)
+    _atomic_write_json(_REPORT_CACHE_PATH, reports, "report cache", default=str)
 
 
 def _load_report_cache() -> dict:
@@ -371,11 +410,7 @@ def _load_report_cache() -> dict:
 
 
 def _save_price_direction_cache(directions: dict) -> None:
-    try:
-        _PRICE_DIRECTION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _PRICE_DIRECTION_CACHE_PATH.write_text(json.dumps(directions), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save price direction cache: %s", e)
+    _atomic_write_json(_PRICE_DIRECTION_CACHE_PATH, directions, "price direction cache")
 
 
 def _load_price_direction_cache() -> dict:
@@ -488,6 +523,33 @@ def _dip_low_changed_meaningfully(old_low: float | None, new_low: float, refresh
     return (old_low - new_low) / old_low * 100 >= refresh_pct
 
 
+def _stale_low_still_matches(
+        remembered_stale_low: float | None, new_low: float, refresh_pct: float) -> bool:
+    """Whether new_low is still essentially the SAME reference low Claude already
+    judged stale (2026-08-31, full-codebase review) -- True only when it sits
+    within refresh_pct% of the remembered stale low in EITHER direction.
+
+    The old check reused _dip_low_changed_meaningfully directly, which is
+    one-sided by design (a low only counts as "changed" by being DEEPER) -- correct
+    for its own job of deciding when a fresh recommendation is worth paying for,
+    but wrong as a staleness matcher: a genuinely NEW dip formed weeks later at
+    HIGHER prices (the normal case after the stock rose -- e.g. stale low $50,
+    stock recovers to $60, dips to $55) was misclassified as the same dead
+    reference and free-evicted before _compute_ai_dip_entry -- the only code that
+    can clear on_deck_stale_dip_low -- could ever run again, permanently killing
+    the ticker's dip-recovery path until price crashed below the months-old low.
+    That contradicted the feature's own documented intent ("only ever blocks a
+    repeat ask about the SAME dead reference point, never a real new dip down the
+    road" -- see _save_on_deck_stale_dip_low). A deeper-but-within-noise low still
+    matches (same behavior as before); a low meaningfully different in either
+    direction gets a fresh, real judgment. The memory itself is deliberately NOT
+    cleared when a higher new dip stops matching -- if price later falls back to
+    the old dead low, it is still the same dead reference and stays remembered."""
+    if remembered_stale_low is None or remembered_stale_low <= 0 or new_low <= 0:
+        return False
+    return abs(new_low - remembered_stale_low) / remembered_stale_low * 100 < refresh_pct
+
+
 def _ai_entry_initially_armed(price: float, ai_entry_price: float, arm_band_pct: float) -> bool:
     """Whether price counts as "close enough" to ai_entry_price to arm the promotion
     trigger -- shared threshold formula used both for a freshly-computed recommendation's
@@ -557,6 +619,22 @@ def _not_yet_analyzed_today(report: dict | None, today_str: str) -> bool:
     return not report.get("generated_at", "").startswith(today_str)
 
 
+def _on_shore_dated_today(report: dict, today_str: str) -> bool:
+    """True if this research_reports entry belongs on today's On Shore list -- either it
+    was genuinely analyzed today, or an automatic On Deck eviction surfaced it back onto
+    On Shore today (`surfaced_at`, set by _mark_universe_reject).
+
+    The single source of truth for that date test (2026-09-01, full-codebase review):
+    it was independently spelled out at three sites (_on_shore_tickers, the On Shore
+    backfill candidate filter, and the scan-completion count), which is exactly the
+    drift _on_shore_tickers' own docstring already warns about. Deliberately NOT the
+    same question as _not_yet_analyzed_today above -- that one asks "has a real Claude
+    call already been spent on this ticker today" and must keep reading generated_at
+    alone, which is why the two fields exist separately at all."""
+    return (report.get("generated_at", "").startswith(today_str)
+            or report.get("surfaced_at", "").startswith(today_str))
+
+
 def _on_deck_population_floor(min_conviction: float, conviction_band: float) -> float:
     """The conviction floor for ADDING a candidate to On Deck -- deliberately below the
     real buy gate (min_conviction), so a "close but not quite" stock can be watched for
@@ -618,7 +696,9 @@ def _on_deck_rr_above_gate(rr: float, required_rr: float) -> bool:
 
 
 def _on_shore_live_rr(entry_price: float, stop_loss: float, fair_value: float,
-                       live_price: float, default_stop_pct: float) -> float:
+                       live_price: float, default_stop_pct: float,
+                       atr_pct: float = 0.0, stop_atr_min_mult: float = 1.0,
+                       reward_atr_max_mult: float = 6.0) -> float:
     """Same free (no-Claude), live-quote R/R math get_today_scan_rejects already
     computes for the On Shore tab itself (see that endpoint's own docstring) --
     derives this stock's own stop % from Claude's last real entry/stop
@@ -627,7 +707,19 @@ def _on_shore_live_rr(entry_price: float, stop_loss: float, fair_value: float,
     here (2026-08-26) so _backfill_on_deck_from_on_shore's new pre-AI-call gate
     (see _on_shore_backfill_worth_ai_check) can't drift from the On Shore tab's
     own already-proven live R/R formula. Returns 0.0 for any missing/malformed
-    input rather than raising -- callers treat 0.0 as "not (yet) buyable"."""
+    input rather than raising -- callers treat 0.0 as "not (yet) buyable".
+
+    Volatility-bounded like every other R/R gate (fixed 2026-08-31, full-codebase
+    review) -- the 2026-08-28 bounded-R/R migration converted the On Shore
+    endpoint itself to compute_bounded_rr but missed this helper, so the free
+    backfill pre-gate compared an UNBOUNDED live rr against the BOUNDED rr the
+    eviction paths store in _on_deck_backfill_declined_at_rr. Since a bound only
+    ever lowers rr, any candidate whose ATR cap binds trivially cleared
+    _backfill_rr_changed_meaningfully's "genuine new high past the declined
+    level" check with zero real price change -- re-opening the exact evict->
+    re-add repeat-spend thrash the MGY fixes closed. atr_pct=0.0 (a candidate
+    with no volatility data) falls back to the plain unbounded ratio, same as
+    compute_bounded_rr itself."""
     if entry_price <= 0 or stop_loss <= 0 or fair_value <= 0 or live_price <= 0:
         return 0.0
     stop_pct = _derive_stop_pct(entry_price, stop_loss, default_stop_pct)
@@ -635,7 +727,9 @@ def _on_shore_live_rr(entry_price: float, stop_loss: float, fair_value: float,
     risk = live_price - live_stop
     if risk <= 0:
         return 0.0
-    return (fair_value - live_price) / risk
+    return compute_bounded_rr(
+        risk, fair_value - live_price, atr_pct,
+        stop_atr_min_mult, reward_atr_max_mult, live_price)
 
 
 def _backfill_rr_changed_meaningfully(
@@ -729,7 +823,7 @@ def _on_deck_composite_score(
 ) -> float:
     """The valuation/R/R-aware composite score used to rank On Deck and On Shore
     candidates against each other (2026-07-31) -- conviction plus a margin-of-safety
-    and R/R-vs-gate bonus. Extracted so DashboardState._on_deck_candidate_score and
+    and R/R-vs-gate bonus. Extracted so DashboardState's own ranking helper and
     _backfill_on_deck_from_on_shore's local _shore_score share one formula instead of
     each maintaining their own copy that could drift -- the exact failure class the
     XRAY population-floor incident (above) was caused by, just in the composite-score
@@ -1018,6 +1112,7 @@ def _required_rr(conviction: int, min_conviction: int, base_rr: float, step: flo
 def compute_bounded_rr(
     risk: float, reward: float, atr_pct: float,
     stop_atr_min_mult: float, reward_atr_max_mult: float,
+    price: float,
 ) -> float:
     """R/R with both sides bounded to this ticker's own recent volatility (2026-08-28,
     volatility-bounded R/R design -- see docs/superpowers/specs/2026-08-28-volatility-
@@ -1041,14 +1136,41 @@ def compute_bounded_rr(
     convention) -- identical to every inline `reward / risk` this function replaces,
     for any candidate this project doesn't yet have volatility data for.
 
+    `price` (added 2026-08-31, full-codebase review) converts atr_pct into the same
+    DOLLAR units risk/reward are in before bounding. atr_pct is a percent-of-price
+    number (market_data._compute_atr_pct returns `atr / last_close * 100`), but every
+    caller passes risk/reward as dollar deltas (entry - stop, fair_value - entry) --
+    the original implementation compared the two directly, so the bounds were only
+    dimensionally correct for a stock trading near $100/share: a $400 stock with 2%
+    ATR had its reward capped at $12 (2.0 x 6.0) instead of the intended 6xATR = $48,
+    making it structurally unable to clear any ~2.1 gate, while a $10 stock got its
+    risk floored at 40% of price, crushing its ratio ~8x. The engine-side sibling
+    (_volatility_scaled_stop_bounds) always worked percent-vs-percent, confirming the
+    intended semantics. price <= 0 falls back to the unbounded ratio, same
+    fail-toward-prior-behavior convention as atr_pct <= 0.
+
     risk <= 0 returns 0.0, matching the convention every existing inline call site
     already used before this fix."""
     if risk <= 0:
         return 0.0
-    if atr_pct > 0:
-        risk = max(risk, atr_pct * stop_atr_min_mult)
-        reward = min(reward, atr_pct * reward_atr_max_mult)
+    if atr_pct > 0 and price > 0:
+        atr_dollars = price * atr_pct / 100.0
+        risk = max(risk, atr_dollars * stop_atr_min_mult)
+        reward = min(reward, atr_dollars * reward_atr_max_mult)
     return reward / risk
+
+
+def _rr_bound(atr_pct: float, stop_atr_min_mult: float, reward_atr_max_mult: float):
+    """Builds the `(risk, reward, price) -> float` callable `rr_curve` takes as its
+    `bound` argument (2026-09-01, full-codebase review), closing over ONE candidate's
+    volatility figure and the configured multipliers.
+
+    Exists so the chart/sparkline reconstructions produce the same bounded number every
+    live R/R gate already uses, without rr_curve importing web/app.py and without the
+    bound formula being re-implemented anywhere. Call it per candidate -- each call
+    makes its own closure, so there is no shared-loop-variable capture."""
+    return lambda risk, reward, price: compute_bounded_rr(
+        risk, reward, atr_pct, stop_atr_min_mult, reward_atr_max_mult, price)
 
 
 def _sma_golden_cross_qualifies(sma_50: float, sma_200: float) -> bool:
@@ -1242,11 +1364,7 @@ def _save_on_deck_cache(candidates: dict) -> None:
     every pre-open regardless). Resets only
     when a candidate is newly added after being fully removed (see _candidate_entry) — not
     on every restart or every pre-open re-vet."""
-    try:
-        _ON_DECK_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _ON_DECK_CACHE_PATH.write_text(json.dumps(candidates, default=str), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save On Deck cache: %s", e)
+    _atomic_write_json(_ON_DECK_CACHE_PATH, candidates, "On Deck cache", default=str)
 
 
 def _load_on_deck_cache() -> dict:
@@ -1281,11 +1399,7 @@ def _save_on_deck_blocked(blocked: dict) -> None:
     """Manual On Deck removals (2026-07-18) — ticker -> ISO block-until timestamp, or None
     for a permanent block. Separate cache file from on_deck_cache.json since this is a small,
     independently-updated set (one write per manual removal, not per pre-open run)."""
-    try:
-        _ON_DECK_BLOCKED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _ON_DECK_BLOCKED_CACHE_PATH.write_text(json.dumps(blocked), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save On Deck blocklist: %s", e)
+    _atomic_write_json(_ON_DECK_BLOCKED_CACHE_PATH, blocked, "On Deck blocklist")
 
 
 def _load_on_deck_blocked() -> dict:
@@ -1304,11 +1418,7 @@ def _save_on_deck_notes(notes: dict) -> None:
     breakout check), so a ticker's re-analysis carries the context forward regardless of
     when/how it becomes eligible again. Never auto-purged (no un-note UI built yet, same
     precedent as on_deck_blocked's own "no un-block UI yet" gap)."""
-    try:
-        _ON_DECK_NOTES_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _ON_DECK_NOTES_CACHE_PATH.write_text(json.dumps(notes), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save On Deck notes: %s", e)
+    _atomic_write_json(_ON_DECK_NOTES_CACHE_PATH, notes, "On Deck notes")
 
 
 def _load_on_deck_notes() -> dict:
@@ -1335,11 +1445,8 @@ def _save_on_deck_stale_dip_low(stale_lows: dict) -> None:
     un-note UI built yet, same precedent as on_deck_blocked/on_deck_notes) -- superseded
     naturally the moment a genuinely different (deeper) low is detected, via the same
     _dip_low_changed_meaningfully threshold already used for the in-memory guard."""
-    try:
-        _ON_DECK_STALE_DIP_LOW_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _ON_DECK_STALE_DIP_LOW_CACHE_PATH.write_text(json.dumps(stale_lows), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save On Deck stale dip low cache: %s", e)
+    _atomic_write_json(
+        _ON_DECK_STALE_DIP_LOW_CACHE_PATH, stale_lows, "On Deck stale dip low cache")
 
 
 def _load_on_deck_stale_dip_low() -> dict:
@@ -1363,14 +1470,15 @@ def _save_event_monitor_cooldown(cooldown: dict, worst_pct: dict) -> None:
     datetime values are serialized as ISO strings; worst_pct is saved alongside since
     the loss-retrigger logic depends on both surviving together."""
     try:
-        _EVENT_MONITOR_COOLDOWN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "cooldown": {k: v.isoformat() for k, v in cooldown.items()},
             "worst_pct": worst_pct,
         }
-        _EVENT_MONITOR_COOLDOWN_CACHE_PATH.write_text(json.dumps(payload), encoding="utf-8")
     except Exception as e:
         logger.warning("Failed to save event-monitor cooldown cache: %s", e)
+        return
+    _atomic_write_json(
+        _EVENT_MONITOR_COOLDOWN_CACHE_PATH, payload, "event-monitor cooldown cache")
 
 
 def _load_event_monitor_cooldown() -> tuple[dict, dict]:
@@ -1399,11 +1507,7 @@ def _save_midday_scan_fired(fired: dict) -> None:
     very feature: restarting at 3:18 PM ET (past both default 10:30/13:30 slots) fired
     both simultaneously, and a manual verification trigger a minute later added a
     third concurrent scan on top. See docs/CLAUDE_HISTORY.md."""
-    try:
-        _MIDDAY_SCAN_FIRED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _MIDDAY_SCAN_FIRED_CACHE_PATH.write_text(json.dumps(fired), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save mid-day scan fired cache: %s", e)
+    _atomic_write_json(_MIDDAY_SCAN_FIRED_CACHE_PATH, fired, "mid-day scan fired cache")
 
 
 def _load_midday_scan_fired() -> dict:
@@ -1419,11 +1523,7 @@ def _save_buy_reasoning(reasoning: dict) -> None:
     """The AI-entry recommendation that triggered a near-miss promotion buy (2026-07-20) —
     see DashboardState.buy_reasoning's docstring for why this exists. Small, independently-
     updated set (one write per promotion buy), same pattern as on_deck_blocked_cache.json."""
-    try:
-        _BUY_REASONING_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _BUY_REASONING_CACHE_PATH.write_text(json.dumps(reasoning), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save buy reasoning cache: %s", e)
+    _atomic_write_json(_BUY_REASONING_CACHE_PATH, reasoning, "buy reasoning cache")
 
 
 def _load_buy_reasoning() -> dict:
@@ -1436,11 +1536,8 @@ def _load_buy_reasoning() -> dict:
 
 
 def _save_promotion_attempts(attempts: list) -> None:
-    try:
-        _PROMOTION_ATTEMPTS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _PROMOTION_ATTEMPTS_CACHE_PATH.write_text(json.dumps(attempts), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save promotion attempts cache: %s", e)
+    _atomic_write_json(
+        _PROMOTION_ATTEMPTS_CACHE_PATH, attempts, "promotion attempts cache")
 
 
 def _load_promotion_attempts() -> list:
@@ -1453,11 +1550,7 @@ def _load_promotion_attempts() -> list:
 
 
 def _save_active_signals(signals: list) -> None:
-    try:
-        _ACTIVE_SIGNALS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _ACTIVE_SIGNALS_CACHE_PATH.write_text(json.dumps(signals), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save active signals cache: %s", e)
+    _atomic_write_json(_ACTIVE_SIGNALS_CACHE_PATH, signals, "active signals cache")
 
 
 def _load_active_signals() -> list:
@@ -1470,11 +1563,7 @@ def _load_active_signals() -> list:
 
 
 def _save_performance_history(history: list) -> None:
-    try:
-        _PERFORMANCE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _PERFORMANCE_HISTORY_PATH.write_text(json.dumps(history), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save performance history: %s", e)
+    _atomic_write_json(_PERFORMANCE_HISTORY_PATH, history, "performance history")
 
 
 def _load_performance_history() -> list:
@@ -1519,10 +1608,14 @@ class DashboardState:
         self.signal_generator = SignalGenerator(
             self.config, self.research_engine, self.risk_manager, self.portfolio
         )
-        self.fund_analyzer = FundamentalAnalyzer(self.config)
-        self.sent_analyzer = SentimentAnalyzer(self.config)
-        self.ins_analyzer = InsiderAnalyzer(self.config)
-        self.comp_analyzer = CompetitorAnalyzer(self.config)
+        # fund_analyzer/sent_analyzer/ins_analyzer/comp_analyzer REMOVED 2026-09-01
+        # (full-codebase review) -- four analyzer objects constructed here with zero
+        # readers anywhere in the repo. ResearchEngine builds and uses its OWN instances
+        # (engine.py's __init__), so these were a second, parallel set that nothing
+        # consulted: an editor reaching for state.fund_analyzer to tune or stub analyzer
+        # behavior would have been mutating an object the engine never looks at -- a
+        # silent no-op, and exactly the "two instances drift" trap, with no
+        # "confirmed dead" marker to warn them off.
 
         self.ai_log: list[dict] = []
         self.trade_history: list[dict] = []
@@ -1544,7 +1637,7 @@ class DashboardState:
         # both persisted to disk together (an in-memory-only pause silently un-pauses
         # on every restart/Apply Update with no warning -- a real gap this fix closes):
         #   paused=True  -- stops every AI-spend loop (position_monitor_loop,
-        #                    position_deep_dive_loop, auto_scan_loop, watchlist_rr_loop,
+        #                    position_deep_dive_loop, auto_scan_loop,
         #                    near_miss_monitor_loop, the pre-open/midday batch paths).
         #                    Zero Claude calls. position_update_loop keeps running --
         #                    held positions stay fully protected (stop-loss/
@@ -1569,6 +1662,21 @@ class DashboardState:
         # attempt's own finally block regardless of how it exits.
         self._promotion_cash_lock = asyncio.Lock()
         self._reserved_cash: float = 0.0
+        # Cash committed to a buy order that was ACCEPTED but whose fill hasn't been
+        # reconciled yet (2026-09-01, full-codebase review). _reserved_cash alone only
+        # covered the window from the check to execute()'s return, but a notional buy
+        # is submitted as PENDING/SUBMITTED far more often than it resolves
+        # synchronously (order_manager._execute_buy's own docstring) -- and on that
+        # path portfolio.cash isn't debited until the trade_updates stream or the 10s
+        # poll reconciles the fill and calls add_position. So the old finally-block
+        # release handed the money straight back to the next promotion while the buy
+        # was still very much in flight, reopening the exact joint-overspend window
+        # GitHub #44 closed. Entries are keyed by ticker and settle the moment the
+        # position exists (cash now really debited), with a TTL so an order that never
+        # fills can't strand cash forever. Every buy path reads this through
+        # _available_cash(), so the manual confirm path and the promotion finally see
+        # each other's in-flight spend.
+        self._pending_buy_reservations: dict[str, dict] = {}
         # Per-ticker in-flight promotion guard (fixed 2026-08-30, GitHub #100) --
         # _promotion_cash_lock/_reserved_cash above only serialize the DOLLAR
         # amount reserved by concurrent promotion attempts, never per-ticker
@@ -1595,6 +1703,13 @@ class DashboardState:
 
         self.order_manager = OrderManager(self.config, self.portfolio)
         self.trade_logger = TradeLogger(self.config)
+        # OrderManager mirrors its own internally-executed sells (TP tranches,
+        # stop-tranche fills, reconciled/unreconciled untracked fills) into the
+        # JSONL trade log through this reference (2026-08-31, full-codebase
+        # review) -- see OrderManager._log_sell_to_jsonl. Attribute injection, not
+        # a constructor param, to keep OrderManager constructible without a
+        # logger (every test does this) and fail-soft if unset.
+        self.order_manager.trade_logger = self.trade_logger
         self.broker_connected: bool = False
         self.pending_confirmations: dict[str, dict] = {}
         # Per-ticker guard for the confirm_buy critical section (GitHub issue #26) — two
@@ -1790,6 +1905,17 @@ class DashboardState:
         # _run_pre_open_batch itself unchanged rather than adding a try/finally inside that
         # already-long, already-live function.
         self._full_scan_in_progress: bool = False
+        # Set by _run_pre_open_batch itself for its whole duration (2026-08-31,
+        # full-codebase review) -- the SCHEDULED pre-open batch previously set no
+        # in-progress flag at all, so the mid-day rescan's and manual Full Scan's
+        # concurrency guards (both added after a real double-scan incident,
+        # 2026-08-03) simply could not see it: a late-running catch-up batch (or a
+        # degraded sequential-fallback day, live-observed running 1+ hours) could
+        # overlap the 10:30 mid-day slot as two concurrent full universe scans --
+        # the exact NewsAPI-exhaustion/duplicate-Claude-spend incident class the
+        # pairwise guards were built for, via the one unguarded third path.
+        # Covers the manual path too (its wrapper calls _run_pre_open_batch).
+        self._pre_open_batch_in_progress: bool = False
 
         # SMA Trend-Confirmation Track (Track 2, 2026-08-24 design, ported from
         # AIShortTrading) -- own guard so a slow run can't overlap itself;
@@ -1910,6 +2036,10 @@ class DashboardState:
         self.position_monitor_interval = research_cfg.get("position_monitor_interval_minutes", 60)
         self._is_holiday: bool = False
         self._holiday_check_date: str = ""
+        # Date of the last LOGGED holiday-check failure -- keeps the retry loop
+        # (see _update_holiday_flag) quiet without letting a failure count as an
+        # answer, which is what used to freeze a stale flag for a whole session.
+        self._holiday_check_failed_date: str = ""
         pre_open_hours = research_cfg.get("pre_open_batch_hours", 2)
         from datetime import datetime as _dt, timedelta as _td
         _open_dt = _dt.combine(_dt.today(), self.market_open)
@@ -1948,6 +2078,8 @@ class DashboardState:
 
         # AI log persistence — init table and reload last 300 entries
         self._log_db_path = db_path
+        # Counts inserts since the last prune (GitHub #154) -- see _persist_log_entry.
+        self._log_inserts_since_prune = 0
         self._init_log_db()
         self.ai_log = self._load_log_from_db()
 
@@ -2014,11 +2146,24 @@ class DashboardState:
                     (entry["timestamp"], entry["ticker"], entry["phase"],
                      entry["content"], entry["level"], datetime.now().isoformat()),
                 )
-                # Keep table from growing forever — prune to 1000 rows
-                conn.execute(
-                    "DELETE FROM ai_log WHERE id NOT IN "
-                    "(SELECT id FROM ai_log ORDER BY id DESC LIMIT 1000)"
-                )
+                # Keep table from growing forever — prune to 1000 rows, but only every
+                # _LOG_PRUNE_EVERY inserts (GitHub #154), not on every single one. This
+                # runs hundreds of times per pre-open scan and every 60s from
+                # near_miss_monitor_loop; a full "DELETE ... WHERE id NOT IN (SELECT ...
+                # ORDER BY id DESC LIMIT 1000)" per insert is real, avoidable write load
+                # against the same shared aitrading.db already under documented
+                # multi-loop contention (see CLAUDE.md's SQLite Concurrency Hardening).
+                # The table simply floats up to ~1000 + _LOG_PRUNE_EVERY rows between
+                # prunes, which nothing depends on (readers all use their own LIMIT).
+                # The counter is only a cadence hint -- a lost increment from two
+                # concurrent to_thread runs just shifts when the next prune lands.
+                self._log_inserts_since_prune += 1
+                if self._log_inserts_since_prune >= _LOG_PRUNE_EVERY:
+                    self._log_inserts_since_prune = 0
+                    conn.execute(
+                        "DELETE FROM ai_log WHERE id NOT IN "
+                        "(SELECT id FROM ai_log ORDER BY id DESC LIMIT 1000)"
+                    )
                 conn.commit()
         except Exception as e:
             logger.debug("ai_log persist error: %s", e)
@@ -2158,7 +2303,12 @@ class DashboardState:
             "ai_log": self.ai_log[-150:],
             "signals": self.active_signals,
             "ticker_signals": self.ticker_signals,
-            "deep_dive_reports": self.deep_dive_reports,
+            # deep_dive_reports deliberately NOT here (2026-09-01, full-codebase
+            # review) -- it is unbounded (~810KB and growing) and this payload is
+            # re-sent by /api/dashboard-poll every 10s during a WebSocket outage.
+            # Fetched lazily from /api/deep-dive-reports instead, same treatment
+            # research_reports already has; live updates still arrive through the
+            # per-ticker deep_dive_report broadcast.
             "broker_status": {
                 "connected": self.broker_connected,
                 "broker": self.config["trading"]["broker"],
@@ -2244,20 +2394,17 @@ class DashboardState:
         it and silently freezing this cache stale forever, whereas deriving the
         signal directly from the database's own real state can never drift out of
         sync with what's actually there."""
+        have_fingerprint = False
+        latest_sell_id = None
         if self.portfolio._db:
             async with self.portfolio._db.execute(
                 "SELECT MAX(id) FROM trade_history WHERE action = 'SELL'"
             ) as cur:
                 row = await cur.fetchone()
             latest_sell_id = row[0] if row else None
+            have_fingerprint = True
             if self._win_rate_cache and latest_sell_id == self._win_rate_cache_last_sell_id:
                 return
-            # Recorded unconditionally whenever a full recompute is about to run below
-            # (not just inside the skip check above) -- including the very first real
-            # call, when self._win_rate_cache is still empty -- so the NEXT tick's
-            # comparison has a real baseline to compare against instead of staying at
-            # its __init__ default and forcing one extra redundant recompute.
-            self._win_rate_cache_last_sell_id = latest_sell_id
 
         current_arch_trades = await self._closed_trades_since(_CURRENT_ARCHITECTURE_START)
         all_time_trades = await self._closed_trades_since(self.live_account_start)
@@ -2278,6 +2425,17 @@ class DashboardState:
             # row encountered for that id, groups end up ordered by their latest activity.
             "trades": current_arch_trades,
         }
+        # Recorded only AFTER the recompute above actually succeeded (fixed, GitHub
+        # #131) -- it used to be set right after the fingerprint was read, so a
+        # transient failure in either _closed_trades_since call (a SQLite lock/timeout,
+        # a class of contention this codebase has a documented history of) left the
+        # fingerprint already advanced: every subsequent tick then matched the skip
+        # check above and the cache stayed silently frozen at its last good values
+        # until some unrelated real SELL happened to move MAX(id) again. Still recorded
+        # on the very first real call too (when _win_rate_cache was still empty), so
+        # the next tick has a real baseline instead of its __init__ default.
+        if have_fingerprint:
+            self._win_rate_cache_last_sell_id = latest_sell_id
 
     async def _process_sell_analysis_queue(self) -> None:
         """"Recent Sell" post-mortem (2026-08-21, owner request: "an analisys of what
@@ -2682,8 +2840,15 @@ class DashboardState:
 
         return False, 0.0
 
-    async def _auto_execute_signal(self, report, ticker: str, is_buy: bool, is_sell: bool, held: bool):
-        """Auto-sell during scan. Buys are deferred until after deep-dive confirmation."""
+    async def _auto_execute_signal(self, report, ticker: str, is_sell: bool, held: bool):
+        """Auto-sell on a held position whose re-analysis signal dropped to SELL.
+
+        Sell-side only -- the dead `is_buy` parameter and its docstring's claim that
+        "buys are deferred until after deep-dive confirmation" were removed (GitHub
+        #153): the body only ever branched on `is_sell and held`, the sole caller
+        always passed False, and the deep-dive-confirmation auto-buy subsystem that
+        sentence described was deleted under GitHub #72. All real buying happens via
+        _attempt_near_miss_promotion (see CLAUDE.md's On Deck Buy Pipeline)."""
         from src.decision.signal_generator import TradeSignal
         from src.research.engine import Signal as Sig
 
@@ -2816,6 +2981,10 @@ class DashboardState:
                 for _c in self.order_manager.pop_stream_closed_reports():
                     await self._report_alpaca_detected_close(
                         _c["ticker"], _c["shares"], _c["fill_price"], _c["pnl"])
+                # Settle buy-cash commitments against the fills just reconciled above
+                # (2026-09-01) -- this is the same cycle that turns a pending buy into
+                # a real position, so it's where a commitment stops being needed.
+                self._prune_pending_buy_reservations()
 
                 # ── Protection-gap verification, every 10s (2026-07-21) ──
                 # Previously only sync_exit_orders' hourly pass would ever notice a held
@@ -3196,11 +3365,30 @@ class DashboardState:
                     # (see position_monitor_loop's docstring), so its conviction_score here
                     # could be stale by hours or days; letting a stale number drive a real
                     # sell on a winner would defeat the whole point of skipping it above.
+                    # market_open + cooldown gates (fixed 2026-08-31, full-codebase
+                    # review) -- this branch was the only auto-close caller without
+                    # either: the stop-loss and trailing-stop branches above both
+                    # require `market_open and not _on_cooldown` and set
+                    # _auto_close_cooldown before calling, but this one fired a fresh
+                    # market sell on EVERY 10s tick -- including after hours, where
+                    # each order just stacks up PENDING (the exact order-flood failure
+                    # the cooldown comment at the top of this loop describes), since a
+                    # conviction<=4 cached report stays <=4 tick after tick.
                     if (self.config["trading"].get("auto_execute", False)
+                            and market_open and not _on_cooldown
                             and ticker in self.portfolio.positions
                             and not self._is_position_profitable_enough_to_skip(pos)):
                         report = self.research_engine.reports.get(ticker)
-                        if report and report.conviction_score <= 4:
+                        # AI Data Integrity (GitHub #97): analyze_stock() writes its report
+                        # into research_engine.reports unconditionally — including a
+                        # rule-based fallback (conviction_score=0.0) produced whenever Claude
+                        # is unavailable/rate-limited. Without this guard a transient
+                        # Anthropic outage would poison every held position's cached report
+                        # and this block would force-liquidate them all on the next 10s tick.
+                        # Mirrors _reanalyze_held_position's own existing is_fallback guard.
+                        if (report and not getattr(report, "is_fallback", False)
+                                and report.conviction_score <= 4):
+                            self._auto_close_cooldown[ticker] = datetime.now() + timedelta(minutes=5)
                             entry = self.add_ai_log(ticker, "RISK",
                                 f"Conviction dropped to {report.conviction_score}/10 — auto-selling", "sell")
                             await self.broadcast({"type": "ai_log", "entry": entry})
@@ -3330,7 +3518,7 @@ class DashboardState:
             if self.config["trading"].get("auto_execute", False) and self.broker_connected:
                 held = ticker in self.portfolio.positions
                 is_sell = "SELL" in report.signal.value
-                await self._auto_execute_signal(report, ticker, False, is_sell, held)
+                await self._auto_execute_signal(report, ticker, is_sell, held)
 
         except Exception as e:
             entry = self.add_ai_log(ticker, "ERROR", f"Monitor re-analysis failed: {e}", "error")
@@ -3653,14 +3841,29 @@ class DashboardState:
                     await websocket.send_json({"type": "trade_error",
                         "error": "Risk rules no longer pass (market conditions changed since preview)"})
                     return
+                # Net against in-flight buys before committing (2026-09-01,
+                # full-codebase review). check_all_rules' own reserve check reads raw
+                # portfolio.cash -- RiskManager has no visibility into _reserved_cash or
+                # the accepted-but-unsettled buys tracked here -- so a manual confirm
+                # landing while a promotion's order was in flight passed the floor on
+                # money that was already spoken for, and the promotion couldn't see this
+                # buy either. Both paths now read the same _available_cash().
+                if self._cash_reserve_insufficient(
+                        signal.position_size_dollars, self._available_cash()):
+                    await websocket.send_json({"type": "trade_error",
+                        "error": "Insufficient cash reserve — another buy is already in "
+                                 "flight for the cash this order needs"})
+                    return
                 try:
                     order = await self.order_manager.execute(signal)
                     if order and order.status not in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
+                        if signal.ticker not in self.portfolio.positions:
+                            self._register_pending_buy(
+                                signal.ticker, signal.position_size_dollars)
                         # Log the real fill price, not the pre-trade recommendation
-                        # (2026-08-08, GitHub #53).
-                        if order.filled_price is not None:
-                            signal.entry_price = order.filled_price
-                        self.trade_logger.log_trade(signal, is_paper=getattr(self.order_manager.broker, "paper", True))
+                        # (2026-08-08, GitHub #53; real quantity/trade_id too as of
+                        # 2026-09-01 -- see _log_buy_trade).
+                        await self._log_buy_trade(signal, order)
                         entry = self.add_ai_log(signal.ticker, "TRADE",
                             f"BUY {signal.shares} shares @ ${order.filled_price or signal.entry_price:.2f}", "buy")
                         await self.broadcast({"type": "ai_log", "entry": entry})
@@ -3926,17 +4129,43 @@ class DashboardState:
         today_str = self._now_et().strftime("%Y-%m-%d")
         if self._holiday_check_date == today_str:
             return
+        # Only a check that actually ANSWERED the question marks the day as checked
+        # (fixed 2026-09-01, full-codebase review). This used to stamp the date
+        # unconditionally "to prevent log spam every 60s when broker is offline",
+        # which turned any transient failure into a full-day lockout of the previous
+        # value: get_calendar legitimately returns empty every Saturday, so
+        # _is_holiday=True is the standing weekend state and every Monday depends on
+        # this one check succeeding near midnight ET. A broker still reconnecting at
+        # that moment left _is_holiday=True for the entire live session, and the day
+        # guard above blocked all 60s retries -- no scans, no promotions, and (far
+        # worse) _is_market_open() False disables the stop-loss/trailing auto-close
+        # branches AND _in_exit_order_maintenance_window, so the previous session's
+        # expired DAY stops were never renewed and the protection-gap remediation
+        # never ran: positions traded the whole day with no resting stop and no
+        # app-side fallback. Spam is instead handled by logging the failure once per
+        # day; the retry itself is silent and cheap.
+        answered = False
         try:
             broker = self.order_manager.broker
             if hasattr(broker, "api") and broker.api:
                 cal = await asyncio.to_thread(broker.api.get_calendar, today_str, today_str)
                 self._is_holiday = len(cal) == 0
+                answered = True
                 if self._is_holiday:
                     logger.info("Market holiday (%s) — scanning paused for the day", today_str)
         except Exception as e:
-            logger.warning("Could not check Alpaca market calendar: %s", e)
-        # Always advance the check date — prevents log spam every 60s when broker is offline
-        self._holiday_check_date = today_str
+            if self._holiday_check_failed_date != today_str:
+                self._holiday_check_failed_date = today_str
+                logger.warning(
+                    "Could not check Alpaca market calendar: %s — retrying each cycle "
+                    "until it answers (holiday flag left at %s)", e, self._is_holiday)
+        if answered:
+            self._holiday_check_date = today_str
+        elif self._holiday_check_failed_date != today_str:
+            self._holiday_check_failed_date = today_str
+            logger.warning(
+                "Market calendar check skipped (broker not connected) — retrying each "
+                "cycle until it answers (holiday flag left at %s)", self._is_holiday)
 
     def _scan_times_today(self) -> list[dtime]:
         """Build the scheduled scan times across market hours."""
@@ -4001,10 +4230,15 @@ class DashboardState:
                 now_et = self._now_et()
                 today_str = now_et.strftime("%Y-%m-%d")
                 # Fire the pre-open batch once per day when we reach the trigger time (default 7:30 AM ET)
+                # Also refuses to launch on top of any already-running universe scan
+                # (2026-08-31, full-codebase review) -- symmetric with the mid-day
+                # firing check below; the date is deliberately NOT stamped on a skip,
+                # so a later tick retries once the other scan finishes.
                 if (self._pre_open_batch_date != today_str
                         and not self._is_holiday
                         and now_et.weekday() < 5
-                        and now_et.time() >= self.pre_open_batch_time):
+                        and now_et.time() >= self.pre_open_batch_time
+                        and self._scan_conflict() is None):
                     asyncio.create_task(self._run_pre_open_batch())
                     self._pre_open_batch_date = today_str
                 # Fire the daily recap once per weekday shortly after market close
@@ -4062,15 +4296,16 @@ class DashboardState:
             # caused real duplicate Claude spend before this fix. A slot that's skipped
             # this tick because another scan is still running is simply picked up on a
             # later tick, since it isn't marked fired until it actually starts.
-            # Also checks _full_scan_in_progress (2026-08-03, owner request) -- confirmed
-            # live twice in one day: the manual "Full Scan" dashboard button and this
-            # scheduled slot ran concurrently, both hitting the same universe/Claude API
-            # (and, confirmed via real logs, exhausting NewsAPI's free-tier rate limit
-            # between the two). A slot skipped for this reason is simply picked up on a
-            # later tick, same as the existing _midday_rescan_in_progress skip already does.
+            # The "is another universe scan already running" test is _scan_conflict()
+            # (2026-09-01) -- one place, so a future fourth scan path can't be forgotten
+            # at one of the four sites that used to spell this out inline. It covers the
+            # manual Full Scan overlap (2026-08-03, confirmed live twice in one day --
+            # both hit the same universe/Claude API and exhausted NewsAPI's free tier)
+            # and the scheduled pre-open batch (2026-08-31). A slot skipped for this
+            # reason is simply picked up on a later tick, since it isn't marked fired
+            # until it actually starts.
             if (self.config.get("research", {}).get("midday_scan_enabled", True)
-                    and not self._midday_rescan_in_progress
-                    and not self._full_scan_in_progress):
+                    and self._scan_conflict() is None):
                 _now_et_midday = self._now_et()
                 _today_str_midday = _now_et_midday.strftime("%Y-%m-%d")
                 for _slot in self.midday_scan_times:
@@ -4436,10 +4671,34 @@ class DashboardState:
         await self.broadcast({"type": "ai_log", "entry": entry})
 
     async def _rebuy_legacy_positions(self):
-        """Sell round-share (legacy) positions and immediately rebuy notionally to get T1/T2/T3."""
+        """Sell round-share (legacy) positions and immediately rebuy notionally to get T1/T2/T3.
+
+        Run-state and market-hours gated (added 2026-09-01, full-codebase review). This
+        is a real order-placement path -- it market-sells at line ~4740 and buys via
+        order_manager.execute below -- but its only risk gate was the drawdown check,
+        so it ran to completion while the system was Paused or Stopped (contradicting
+        Stopped's documented "everything halted") and could be fired outside market
+        hours, where its 6s post-sell sleep assumes a fill that hasn't happened: the
+        cash re-sync then reads pre-sell cash, the local position is already popped
+        while the shares still exist at the broker, and the notional rebuy is submitted
+        with the sell still queued -- an interleaved sell+buy pair racing at the open.
+        Reachable only by an authenticated POST (no UI control), which is why this is a
+        gate rather than a redesign; per-ticker risk rules are checked in the loop."""
         from src.decision.signal_generator import TradeSignal
         from src.research.engine import Signal as Sig
         from src.execution.broker import Order, OrderSide, OrderType
+
+        if self.paused or self.stopped:
+            entry = self.add_ai_log("SYSTEM", "REBUY",
+                "Legacy rebuy refused — system is paused/stopped", "warning")
+            await self.broadcast({"type": "ai_log", "entry": entry})
+            return
+        if not self._is_market_open():
+            entry = self.add_ai_log("SYSTEM", "REBUY",
+                "Legacy rebuy refused — market is closed (a queued sell+buy pair would "
+                "race each other at the open)", "warning")
+            await self.broadcast({"type": "ai_log", "entry": entry})
+            return
 
         # Routed through the shared AlpacaBroker instance (fixed 2026-08-24, GitHub #83)
         # -- this used to construct its own raw tradeapi.REST client and call every
@@ -4543,17 +4802,36 @@ class DashboardState:
                 stop_loss = report.stop_loss
                 take_profits = list(report.take_profit_targets)
             else:
+                # Fallbacks match config/settings.yaml (aligned 2026-09-01,
+                # full-codebase review) -- these read 7.0/5.0/10.0/17.0 while the yaml
+                # says 5.0/5.0/7.0/9.0 and a sibling reader used 5.0/7.0, so three call
+                # sites disagreed on the same four keys. Only reachable on a config
+                # missing the take_profit block, but a 40%-wider stop and a nearly-2x
+                # further T3 on one path is not a defensible way to find that out.
                 tp_cfg = self.config.get("take_profit", {})
-                sl  = tp_cfg.get("stop_loss_pct", 7.0)  / 100
-                t1p = tp_cfg.get("t1_pct",  5.0)  / 100
-                t2p = tp_cfg.get("t2_pct", 10.0)  / 100
-                t3p = tp_cfg.get("t3_pct", 17.0)  / 100
+                sl  = tp_cfg.get("stop_loss_pct", 5.0) / 100
+                t1p = tp_cfg.get("t1_pct", 5.0) / 100
+                t2p = tp_cfg.get("t2_pct", 7.0) / 100
+                t3p = tp_cfg.get("t3_pct", 9.0) / 100
                 stop_loss = round(current_price * (1 - sl), 2)
                 take_profits = [
                     round(current_price * (1 + t1p), 2),
                     round(current_price * (1 + t2p), 2),
                     round(current_price * (1 + t3p), 2),
                 ]
+
+            # Wash-sale block (added 2026-09-01, full-codebase review) -- CLAUDE.md
+            # makes this an unconditional rule ("no buy within wash_sale_cooldown_days
+            # of a losing sale"), and this path reached order_manager.execute without
+            # it. The sell this function performs moments earlier can itself be the
+            # triggering loss, so the shared helper is checked per ticker here.
+            if self._wash_sale_blocked(ticker):
+                entry = self.add_ai_log(ticker, "REBUY",
+                    "Skipping rebuy — within the wash-sale cooldown of a losing sale",
+                    "warning")
+                await self.broadcast({"type": "ai_log", "entry": entry})
+                skipped.append(ticker)
+                continue
 
             # Rebuy notionally for the same dollar amount
             # Respect drawdown halt — don't rebuy into a halted portfolio
@@ -4996,7 +5274,7 @@ class DashboardState:
         for ticker, r in self.research_reports.items():
             if r.get("source") != "universe_scan":
                 continue
-            if not r.get("generated_at", "").startswith(today_str):
+            if not _on_shore_dated_today(r, today_str):
                 continue
             if ticker in self.near_miss_candidates or ticker in held:
                 continue
@@ -5137,8 +5415,9 @@ class DashboardState:
         relied on the separate _enforce_on_deck_cap() trim step to immediately drop most
         of them back out again on every single restart, re-fetching price_history and
         re-logging the same drops for candidates that were never going to survive anyway.
-        Now scores and ranks candidates with the same composite _on_deck_candidate_score
-        the trim step itself uses, and only actually adds (and fetches price_history for)
+        Now scores and ranks candidates with the same composite score
+        (_on_deck_composite_score) the trim step itself uses, and only actually adds
+        (and fetches price_history for)
         however many slots are genuinely open -- so a normal restart with On Deck already
         at full strength adds nothing and logs nothing, instead of overshooting and
         immediately correcting itself every time."""
@@ -5181,6 +5460,7 @@ class DashboardState:
                 risk, fair_value - entry_price, atr_pct,
                 self.config["research"].get("stop_atr_min_mult", 1.0),
                 self.config["research"].get("reward_atr_max_mult", 6.0),
+                entry_price,
             )
             required_rr = _required_rr(conviction, min_conviction, base_rr, rr_step, rr_floor)
             if _on_deck_rr_floor_not_met(rr, required_rr, floor_margin):
@@ -5244,44 +5524,18 @@ class DashboardState:
             added += 1
         return added
 
-    async def watchlist_rr_loop(self):
-        """Free (yfinance, no Claude) live R/R refresh for watchlist cards. The watchlist R/R
-        badge previously used the cached pre-open entry_price, which can drift far from the
-        real value over the course of a trading day (caught live 2026-07-16: GPN showed R/R
-        3.14 on its stale pre-open price while its actual live-price R/R was ~1.40) — this is
-        purely a display feed to keep that badge honest; it does not affect any buy/promotion
-        decision, since every actual buy path already fetches its own live price at the moment
-        it decides, independent of this loop."""
-        while True:
-            await asyncio.sleep(60)
-            try:
-                if self.paused or self.stopped or not self._is_market_open():
-                    continue
-                tickers = [s["ticker"] for s in await self.watchlist_manager.get_active()]
-                if not tickers:
-                    continue
-                updates: dict[str, float] = {}
-                for ticker in tickers:
-                    dd = self.deep_dive_reports.get(ticker)
-                    if not dd:
-                        continue
-                    fair_value = dd.get("fair_value_estimate", 0.0)
-                    stop_loss = dd.get("stop_loss", 0.0)
-                    if not fair_value or not stop_loss:
-                        continue
-                    try:
-                        quote = await self.market_data.get_quote(ticker)
-                        price = quote.price
-                    except Exception as e:
-                        logger.debug("%s: watchlist R/R live price fetch failed: %s", ticker, e)
-                        continue
-                    if price <= 0 or price <= stop_loss:
-                        continue
-                    updates[ticker] = (fair_value - price) / (price - stop_loss)
-                if updates:
-                    await self.broadcast({"type": "watchlist_rr_update", "rr": updates})
-            except Exception as e:
-                logger.error("watchlist_rr_loop error: %s", e)
+    # watchlist_rr_loop REMOVED 2026-09-01 (full-codebase review). It was a live R/R
+    # display feed for the watchlist cards (added 2026-07-16, GPN stale-price incident),
+    # but the 2026-07-17 redesign deleted the persistent watchlist itself: nothing has
+    # written the `watchlist` table since, the only remaining add() call sites are inside
+    # the documented-dead Watchlist-era functions, and a live SELECT COUNT(*) confirmed 0
+    # rows on this install. So the loop woke every 60s of market hours, ran a DB query,
+    # got an empty list and continued -- forever, unable to emit anything. Unlike its
+    # documented-dead siblings it carried no "confirmed dead" marker, so it kept
+    # appearing in loop audits (the pause/stop design comment still listed it among the
+    # "AI-spend loops" pausing protects against) as a thing that could still fire. Its
+    # asyncio.create_task in startup() and the orphaned `watchlist_rr_update` WebSocket
+    # handler in dashboard.html went with it.
 
     async def _check_price_based_unblocks(self) -> None:
         """Free (one quote per blocked ticker, no Claude) re-eligibility check for manually
@@ -5524,6 +5778,7 @@ class DashboardState:
                             risk, fair_value - price, atr_pct,
                             self.config["research"].get("stop_atr_min_mult", 1.0),
                             self.config["research"].get("reward_atr_max_mult", 6.0),
+                            price,
                         )
                     else:
                         rr = -999.0
@@ -5744,15 +5999,17 @@ class DashboardState:
                         # near_miss_candidates entry, so it can't protect against a
                         # repeat ask once the candidate is restored -- this separate,
                         # never-auto-cleared store is what actually survives that cycle.
-                        # Reuses the same "genuinely deeper low" threshold as low_changed
-                        # above; a low that's still essentially the one Claude already
+                        # A low still within refresh_pct of the one Claude already
                         # declined is treated as still-stale for free, mirroring exactly
-                        # what a real repeat call would have said.
+                        # what a real repeat call would have said. Two-sided match
+                        # (fixed 2026-08-31, full-codebase review) -- see
+                        # _stale_low_still_matches: the old one-sided
+                        # _dip_low_changed_meaningfully reuse treated a genuinely NEW,
+                        # higher dip formed after the stock rose as "still the same
+                        # stale low," permanently locking out the dip-recovery path.
                         remembered_stale_low = self.on_deck_stale_dip_low.get(ticker)
-                        still_known_stale = (
-                            remembered_stale_low is not None
-                            and not _dip_low_changed_meaningfully(
-                                remembered_stale_low, dip["low"], refresh_pct))
+                        still_known_stale = _stale_low_still_matches(
+                            remembered_stale_low, dip["low"], refresh_pct)
                         if still_known_stale:
                             to_evict_stale.append(ticker)
                             continue
@@ -6059,6 +6316,142 @@ class DashboardState:
             self.config["risk_management"]["min_cash_reserve_pct"] / 100)
         return available_cash - position_size < required_reserve
 
+    def _scan_conflict(self) -> str | None:
+        """The single mutual-exclusion check across the three universe-scan paths
+        (2026-09-01, full-codebase review) -- returns a human-readable "X is already
+        running" message, or None when it's safe to start a scan.
+
+        The three-flag test was previously written out inline at four sites (the
+        auto_scan_loop pre-open and midday checks, /api/trigger-batch-scan and
+        /api/trigger-midday-rescan), each with its own near-identical refusals. That is
+        the project's proven drift shape: the scheduled pre-open batch was originally
+        the one unguarded third path (a real double-scan that exhausted NewsAPI's
+        free-tier limit), and the 2026-08-31 fix had to add the third flag at every site
+        separately. A fourth scan type would have meant editing four places again.
+        Adding a flag here now covers every caller at once."""
+        if self._full_scan_in_progress:
+            return "A full scan is already in progress"
+        if self._midday_rescan_in_progress:
+            return "A mid-day re-scan is already in progress"
+        if self._pre_open_batch_in_progress:
+            return "The scheduled pre-open scan is still running"
+        return None
+
+    def _pending_buy_commitment(self) -> float:
+        """Dollars committed to buy orders that the broker has accepted but whose cash
+        hasn't hit portfolio.cash yet -- see _pending_buy_reservations in __init__.
+        Pure read: an entry stops counting once its position exists (add_position has
+        now really debited the cash, so counting it again would double-charge) or once
+        it ages past the TTL (a queued order that never filled must not strand cash
+        indefinitely). The actual dict cleanup is _prune_pending_buy_reservations',
+        run from position_update_loop, so this stays free of side effects."""
+        if not self._pending_buy_reservations:
+            return 0.0
+        now = self._now_et()
+        total = 0.0
+        for tkr, res in self._pending_buy_reservations.items():
+            if tkr in self.portfolio.positions:
+                continue
+            if (now - res["at"]).total_seconds() > _PENDING_BUY_RESERVATION_TTL_SECONDS:
+                continue
+            total += res["amount"]
+        return total
+
+    def _available_cash(self) -> float:
+        """The single answer to "how much cash can a new buy actually use" -- live cash
+        minus both in-flight promotion reservations and accepted-but-unsettled buys.
+        Every buy path's cash gate reads this so no two paths can spend the same
+        dollars (2026-09-01, full-codebase review)."""
+        return self.portfolio.cash - self._reserved_cash - self._pending_buy_commitment()
+
+    def _register_pending_buy(self, ticker: str, amount: float) -> None:
+        """Hold `amount` committed until this ticker's fill is reconciled. Called right
+        after a buy order is accepted, on every path that places one."""
+        if amount and amount > 0:
+            self._pending_buy_reservations[ticker] = {
+                "amount": float(amount), "at": self._now_et()}
+
+    def _prune_pending_buy_reservations(self) -> None:
+        """Drops settled (position now exists) and expired reservations. Called from
+        position_update_loop -- the same 10s cycle that reconciles the fills these
+        entries are waiting on."""
+        if not self._pending_buy_reservations:
+            return
+        now = self._now_et()
+        for tkr in list(self._pending_buy_reservations.keys()):
+            res = self._pending_buy_reservations.get(tkr)
+            if res is None:
+                continue
+            if (tkr in self.portfolio.positions
+                    or (now - res["at"]).total_seconds() > _PENDING_BUY_RESERVATION_TTL_SECONDS):
+                self._pending_buy_reservations.pop(tkr, None)
+
+    async def _log_buy_trade(self, signal, order) -> None:
+        """The single JSONL buy-record writer for every live buy path (2026-09-01,
+        full-codebase review). The JSONL log is the documented tax/benchmark source of
+        truth, but both buy paths used to write it straight from the submit response:
+        on the common PENDING/SUBMITTED resolution that meant the AI's pre-trade
+        RECOMMENDATION price, a share count estimated by dividing the notional by that
+        same recommendation price, and trade_id=None -- and nothing ever corrected the
+        row, because the fill reconcilers create the Position but only sells are
+        mirrored into JSONL. Form 8949 therefore took its cost basis from a price the
+        trade never happened at (this system's own measurements: $0.40-$1.33/share off,
+        e.g. MET recommended $91.50 against a real $92.83 fill), lot quantities didn't
+        sum to the sell quantities, and the null trade_id severed the buy-to-sell lot
+        link that every later tranche stamps.
+
+        So: give an unresolved order a short, bounded window to report its real fill
+        before writing. If it resolves, the record carries the true price, quantity and
+        trade_id; if it doesn't, the estimate is written exactly as before, so a slow
+        fill can never lose the record entirely (a missing buy row is worse for tax
+        than an approximate one -- it leaves the lot with no basis at all)."""
+        is_paper = getattr(self.order_manager.broker, "paper", True)
+        try:
+            if order.filled_price is None:
+                await self._await_buy_fill(signal, order)
+            else:
+                signal.entry_price = order.filled_price
+                if getattr(order, "filled_quantity", None):
+                    signal.shares = order.filled_quantity
+                    signal.position_size_dollars = round(
+                        order.filled_quantity * order.filled_price, 2)
+            if getattr(signal, "trade_id", None) is None:
+                pos = self.portfolio.positions.get(signal.ticker)
+                if pos is not None and getattr(pos, "trade_id", None):
+                    signal.trade_id = pos.trade_id
+        except Exception as e:
+            logger.warning(
+                "%s: could not confirm the real buy fill for the trade log (%s) — "
+                "recording the pre-trade estimate", signal.ticker, e)
+        self.trade_logger.log_trade(signal, is_paper=is_paper)
+
+    async def _await_buy_fill(self, signal, order) -> None:
+        """Poll a just-submitted buy order briefly for its real fill and write the true
+        price/quantity onto `signal` — see _log_buy_trade. Silent no-op if the order
+        never reaches a fill inside the window, or if the broker can't be read."""
+        broker = self.order_manager.broker
+        if broker is None or not getattr(order, "broker_order_id", None):
+            return
+        for _ in range(_BUY_FILL_CONFIRM_ATTEMPTS):
+            await asyncio.sleep(_BUY_FILL_CONFIRM_INTERVAL_SECONDS)
+            try:
+                live = await broker.get_order_status(order.broker_order_id)
+            except Exception:
+                return
+            if live.filled_price is not None and getattr(live, "filled_quantity", None):
+                signal.entry_price = live.filled_price
+                signal.shares = live.filled_quantity
+                signal.position_size_dollars = round(
+                    live.filled_quantity * live.filled_price, 2)
+                logger.info(
+                    "%s: trade log recorded at the real fill ($%.2f x %.4g) rather than "
+                    "the pre-trade estimate", signal.ticker,
+                    live.filled_price, live.filled_quantity)
+                return
+            if live.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED,
+                               OrderStatus.EXPIRED):
+                return
+
     def _no_buying_capacity(self) -> bool:
         """True when there isn't enough cash above the reserve floor to fund even
         one realistically-sized new position (2026-08-27, owner request: "when
@@ -6090,7 +6483,7 @@ class DashboardState:
         design)."""
         max_position_pct = self.config["risk_management"].get("max_position_pct", 7.0) / 100
         assumed_position_size = self.portfolio.total_value * max_position_pct
-        return self._cash_reserve_insufficient(assumed_position_size, self.portfolio.cash)
+        return self._cash_reserve_insufficient(assumed_position_size, self._available_cash())
 
     async def _attempt_near_miss_promotion(
         self, ticker: str, nm_snapshot: dict | None = None, dip_low: float | None = None,
@@ -6259,7 +6652,7 @@ class DashboardState:
             if approx_price and approx_stop and approx_price > 0 and approx_stop > 0:
                 approx_size = self.risk_manager.calculate_position_size(
                     approx_price, approx_stop, self.portfolio.total_value)
-                if self._cash_reserve_insufficient(approx_size, self.portfolio.cash):
+                if self._cash_reserve_insufficient(approx_size, self._available_cash()):
                     entry = self.add_ai_log(ticker, "ON_DECK",
                         "Insufficient cash reserve (pre-check against cached price) — "
                         "skipping before spending on a fresh AI re-analysis", "warning")
@@ -6313,6 +6706,21 @@ class DashboardState:
                     self._record_promotion_attempt(ticker, dip_low, f"Re-analysis failed: {e}")
                     return
 
+            # Pause/Stop re-check after the Claude re-analysis (GitHub #99) -- the calling
+            # loop only checks paused/stopped between iterations, so a Stop clicked while
+            # that multi-second call was in flight would otherwise still let this attempt
+            # run all the way through a real, money-spending buy. Uses the same 4-step
+            # sequence as the "No longer qualifies" branch rather than _fail_gate, which
+            # isn't defined yet here (it closes over rr/min_rr, computed below). NOT an
+            # eviction -- the shared finally block restores the candidate as it does for
+            # any other failed attempt, so a resume simply retries it later.
+            if self.paused or self.stopped:
+                entry = self.add_ai_log(ticker, "ON_DECK",
+                    "System paused/stopped during re-analysis — buy not executed", "warning")
+                await self.broadcast({"type": "ai_log", "entry": entry})
+                self._record_promotion_attempt(ticker, dip_low, "System paused/stopped")
+                return
+
             min_conviction = self.config["research"]["min_conviction_score"]
             base_rr = self.config["research"]["min_risk_reward_ratio"]
 
@@ -6324,7 +6732,7 @@ class DashboardState:
                 # kept looking as strong as it did originally, sorted near the top by the
                 # same stale numbers, and kept attracting re-analysis every time price
                 # ticked up 2%. Writing the real numbers back here means the existing
-                # composite scoring (_on_deck_candidate_score) sorts it to where it actually
+                # composite scoring (_on_deck_composite_score) sorts it to where it actually
                 # belongs on the very next render, same as a real persist-check does.
                 if nm_snapshot is None:
                     return
@@ -6380,6 +6788,7 @@ class DashboardState:
                     risk, fair_value - report.entry_price, getattr(report, "atr_pct", 0.0),
                     self.config["research"].get("stop_atr_min_mult", 1.0),
                     self.config["research"].get("reward_atr_max_mult", 6.0),
+                    report.entry_price,
                 )
             else:
                 rr = 0.0
@@ -6511,7 +6920,7 @@ class DashboardState:
             # be serialized against other concurrent promotion attempts).
             async with self._promotion_cash_lock:
                 insufficient = self._cash_reserve_insufficient(
-                    position_size, self.portfolio.cash - self._reserved_cash)
+                    position_size, self._available_cash())
                 if not insufficient:
                     self._reserved_cash += position_size
                     reserved_amount = position_size
@@ -6548,6 +6957,17 @@ class DashboardState:
                 rr=rr, required_rr=min_rr,
             )
 
+            # Last possible moment before real money moves (GitHub #99) -- several of the
+            # gates above (the above-gate AI retention judgment in particular) can
+            # themselves await a real Claude call, so a Stop can land between the
+            # post-analysis check further up and this point. Same _fail_gate treatment as
+            # every other gate: logged, recorded as a promotion attempt, candidate kept.
+            # Reserved cash is released by the shared finally block on this path too.
+            if self.paused or self.stopped:
+                await _fail_gate("System paused/stopped",
+                                 "System paused/stopped — buy not executed")
+                return
+
             try:
                 order = await self.order_manager.execute(signal)
             except Exception as e:
@@ -6556,18 +6976,29 @@ class DashboardState:
 
             if order and order.status not in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
                 bought = True
+                # Keep the money committed until the fill is actually reconciled
+                # (2026-09-01, full-codebase review) -- the finally block below releases
+                # the in-flight reservation unconditionally, which on the common PENDING
+                # resolution handed cash back that portfolio.cash hasn't been debited
+                # for yet. Settles automatically once the position exists.
+                if ticker not in self.portfolio.positions:
+                    self._register_pending_buy(ticker, position_size)
                 # Log the real fill price, not the AI's pre-trade recommendation
                 # (2026-08-08, GitHub #53) -- this is the primary live buy path (On Deck
                 # promotion), so this specific call site is the highest-value fix of the
-                # 12 in this batch.
-                if order.filled_price is not None:
-                    signal.entry_price = order.filled_price
-                self.trade_logger.log_trade(signal, is_paper=getattr(self.order_manager.broker, "paper", True))
+                # 12 in this batch. Real share count and trade_id too as of 2026-09-01;
+                # see _log_buy_trade.
+                await self._log_buy_trade(signal, order)
+                # Report what _log_buy_trade actually confirmed (2026-09-01) -- it
+                # resolves the real fill onto the signal, so the dashboard and the AI
+                # feed show the true price/quantity instead of the recommendation.
+                shares = signal.shares
                 result = {"ticker": ticker, "status": order.status.value,
-                          "filled_price": order.filled_price, "shares": shares}
+                          "filled_price": order.filled_price or signal.entry_price,
+                          "shares": shares}
                 await self.broadcast({"type": "trade_executed", "trade": result})
                 await self.broadcast({"type": "portfolio", "portfolio": self.get_portfolio_snapshot()})
-                _fp = order.filled_price or report.entry_price
+                _fp = order.filled_price or signal.entry_price or report.entry_price
                 # Distinct phase tag for the actual buy-execution line (2026-07-21, a
                 # backlog item from 2026-07-16 finally done) -- ON_DECK_DEPLOY, separate
                 # from the generic ON_DECK tag every other recommendation/uptick/rejection
@@ -6654,9 +7085,16 @@ class DashboardState:
         failure here can never affect the daily report or anything else on that trigger."""
         try:
             today_str = self._now_et().strftime("%Y-%m-%d")
-            spy = await self.market_data.get_quote("SPY")
-            qqq = await self.market_data.get_quote("QQQ")
-            dia = await self.market_data.get_quote("DIA")
+            # Concurrent, not one await at a time (GitHub #155) -- three independent
+            # network round-trips, same fix already applied to the Day P/L popup's own
+            # ETF fetches (GitHub #94). Deliberately NOT return_exceptions=True: a
+            # raising quote should still propagate to this function's own outer
+            # try/except and skip the whole snapshot, exactly as it did sequentially.
+            spy, qqq, dia = await asyncio.gather(
+                self.market_data.get_quote("SPY"),
+                self.market_data.get_quote("QQQ"),
+                self.market_data.get_quote("DIA"),
+            )
             entry = {
                 "date": today_str,
                 "portfolio_value": round(self.portfolio.total_value, 2),
@@ -6706,9 +7144,12 @@ class DashboardState:
             if not holdings_value:
                 return
 
-            sp500 = set(get_universe(["S&P 500"]))
-            sp400 = set(get_universe(["S&P 400"]))
-            sp600 = set(get_universe(["S&P 600"]))
+            # to_thread (2026-08-31) -- same sync-Wikipedia-fetch-on-the-event-loop
+            # fix as _live_benchmark_classifications; this snapshot job runs in the
+            # evening, but a stale universe cache here still froze the loop.
+            sp500 = set(await asyncio.to_thread(get_universe, ["S&P 500"]))
+            sp400 = set(await asyncio.to_thread(get_universe, ["S&P 400"]))
+            sp600 = set(await asyncio.to_thread(get_universe, ["S&P 600"]))
 
             def get_sector(ticker):
                 pos = self.portfolio.positions.get(ticker)
@@ -6726,9 +7167,24 @@ class DashboardState:
             cap_tier_etfs = {c[1] for c in classifications.values()}
             etf_daily_returns = {}
             today_is_provisional = False
-            for etf in sector_etfs | cap_tier_etfs:
-                quote = await self.market_data.get_quote(etf)
-                history = await self.market_data.get_historical(etf, period="5d", interval="1d")
+
+            # Fetch every ETF's quote+history concurrently (GitHub #155) -- these are
+            # independent network round-trips that were being awaited strictly one at a
+            # time, the same shape already fixed for the Day P/L popup (GitHub #94).
+            # Only the I/O moves; the per-ETF decision logic below is unchanged and
+            # still runs sequentially over the gathered results. No return_exceptions,
+            # so a raising fetch still aborts the whole snapshot via the outer
+            # try/except exactly as it did before.
+            async def _fetch_etf(etf: str):
+                return etf, await asyncio.gather(
+                    self.market_data.get_quote(etf),
+                    self.market_data.get_historical(etf, period="5d", interval="1d"),
+                )
+
+            fetched = await asyncio.gather(
+                *(_fetch_etf(etf) for etf in sector_etfs | cap_tier_etfs))
+
+            for etf, (quote, history) in fetched:
                 real_prev_close = (
                     len(history) >= 2 and has_real_close(etf, history[-2]["date"],
                         {etf: {row["date"]: row["close"] for row in history}})
@@ -6842,8 +7298,18 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     messages=[{"role": "user", "content": prompt}],
                 )
             )
-            text_block = next((b for b in message.content if hasattr(b, "text")), None)
-            summary = text_block.text.strip() if text_block else "Daily report generation failed — no text in response."
+            # Shared extract_response_text, not a 3rd local copy of the ThinkingBlock-skip
+            # (GitHub #158) -- CLAUDE.md's AI Data Integrity section requires that
+            # invariant hold at EVERY Claude-response parse site, and this file had
+            # independently duplicated it. The helper RAISES when no text block exists,
+            # so the ValueError is caught here to preserve this site's own deliberate
+            # tolerance: unlike a real trading decision, this display-only daily report
+            # still logs and pushes an explicit "no text in response" summary rather than
+            # silently sending the owner nothing.
+            try:
+                summary = extract_response_text(message.content, "daily report").strip()
+            except ValueError:
+                summary = "Daily report generation failed — no text in response."
 
             entry = self.add_ai_log("SYSTEM", "DAILY_REPORT", summary, "info")
             await self.broadcast({"type": "ai_log", "entry": entry})
@@ -7136,6 +7602,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 getattr(report, "atr_pct", 0.0),
                 self.config["research"].get("stop_atr_min_mult", 1.0),
                 self.config["research"].get("reward_atr_max_mult", 6.0),
+                report.entry_price,
             )
         else:
             rr = 0
@@ -7258,12 +7725,25 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         want to see it" judgment call with its own block mechanism -- reappearing on On Shore
         immediately would defeat the point; see the on_deck_blocked filter in
         /api/today-scan-rejects instead, which keeps a manually-removed ticker off both lists
-        for as long as its block lasts)."""
+        for as long as its block lasts).
+
+        Stamps `surfaced_at`, NOT `generated_at` (fixed 2026-09-01, full-codebase
+        review). This used to overwrite generated_at with "now" on a report it had not
+        re-analyzed at all, which lied to the one other reader of that field:
+        `_not_yet_analyzed_today` treats a today-stamped report as already covered, so
+        both mid-day universe scans skipped the ticker for the rest of the day. That
+        fires exactly when re-analysis matters most -- on a morning the pre-open
+        persist-check couldn't re-vet (its "AI unavailable -- keeping unchanged" branch
+        leaves yesterday's report in place), an automatic R/R-floor eviction would
+        silently bench the ticker for the session while On Shore displayed day-old
+        conviction/fair-value under a timestamp claiming it was minutes old. The two
+        questions are genuinely different -- "when was this analysis generated" vs "when
+        did this land back on On Shore" -- so they now have their own fields."""
         r = self.research_reports.get(ticker)
         if r is None:
             return
         r["source"] = "universe_scan"
-        r["generated_at"] = self._now_et().isoformat()
+        r["surfaced_at"] = self._now_et().isoformat()
         asyncio.create_task(asyncio.to_thread(_save_report_cache, self.research_reports))
 
     def _evict_on_deck_automatic(self, ticker: str, log_msg: str) -> None:
@@ -7314,16 +7794,31 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         # score. See _on_deck_ranking_key's docstring.
         ranked = sorted(self.near_miss_candidates.items(),
                          key=lambda kv: self._on_deck_ranking_key_for(kv[1]), reverse=True)
-        keep = dict(ranked[:max_size])
-        dropped = [t for t in self.near_miss_candidates if t not in keep]
+        keep_tickers = {t for t, _ in ranked[:max_size]}
+        dropped = [t for t in list(self.near_miss_candidates) if t not in keep_tickers]
+        # Pop each dropped ticker individually, never wholesale-reassign the dict
+        # (fixed 2026-08-31, full-codebase review) -- the old flow snapshotted
+        # `keep = dict(ranked[:max_size])`, awaited one broadcast PER dropped ticker,
+        # and only afterwards did `self.near_miss_candidates = keep`: any concurrent
+        # mutation during those awaits was silently reverted (a promotion attempt's
+        # pop resurrected a just-bought/just-failed candidate -- defeating its
+        # finally-block's own "still on the list?" restore guard and the
+        # promotion_failed_low dedup write -- and a concurrent backfill add was
+        # deleted outright). pop(..., None) also tolerates a ticker a concurrent
+        # path already removed mid-loop. A candidate added concurrently mid-trim
+        # survives untouched; if that leaves the list one over the cap, the next
+        # enforce pass trims it -- a strictly smaller cost than losing real state.
+        dropped_count = 0
         for ticker in dropped:
+            if self.near_miss_candidates.pop(ticker, None) is None:
+                continue  # a concurrent path (promotion/eviction) already removed it
+            dropped_count += 1
             entry = self.add_ai_log(ticker, phase_tag,
                 f"Dropped from On Deck — over the {max_size}-stock cap, ranked below the cutoff",
                 "warning")
             await self.broadcast({"type": "ai_log", "entry": entry})
             self._mark_universe_reject(ticker)
-        self.near_miss_candidates = keep
-        return len(dropped)
+        return dropped_count
 
     async def _backfill_on_deck_from_on_shore(self) -> None:
         """Actively maintains On Deck at its configured setpoint (research.on_deck_max_size)
@@ -7384,6 +7879,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 entry_price - stop_loss, fair_value - entry_price, d.get("atr_pct", 0.0),
                 self.config["research"].get("stop_atr_min_mult", 1.0),
                 self.config["research"].get("reward_atr_max_mult", 6.0),
+                entry_price,
             )
             required_rr = _required_rr(
                 conviction, min_conviction,
@@ -7400,7 +7896,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 and not self._is_on_deck_blocked(ticker)
                 and not self._wash_sale_blocked(ticker)
                 and d.get("source") == "universe_scan"
-                and d.get("generated_at", "").startswith(today_str)
+                and _on_shore_dated_today(d, today_str)
                 and d.get("signal") in ("BUY", "STRONG BUY")
                 and d.get("conviction", 0) >= population_floor
                 and not d.get("is_fallback", False)
@@ -7438,7 +7934,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 live_price = 0.0
             free_rr = _on_shore_live_rr(
                 d.get("entry_price", 0.0) or 0.0, d.get("stop_loss", 0.0) or 0.0,
-                d.get("fair_value_estimate", 0.0) or 0.0, live_price, default_stop_pct)
+                d.get("fair_value_estimate", 0.0) or 0.0, live_price, default_stop_pct,
+                atr_pct=d.get("atr_pct", 0.0) or 0.0,
+                stop_atr_min_mult=self.config["research"].get("stop_atr_min_mult", 1.0),
+                reward_atr_max_mult=self.config["research"].get("reward_atr_max_mult", 6.0))
             free_required_rr = _required_rr(
                 d.get("conviction", 0) or 0, min_conviction,
                 self.config["research"]["min_risk_reward_ratio"],
@@ -7465,11 +7964,36 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 logger.debug("%s: On Deck backfill re-analysis failed: %s", ticker, e)
                 return False
 
+            # Persist only a REAL report, and only after the fallback check below
+            # (fixed 2026-09-01, full-codebase review). This was the one persist site
+            # in the file ordered the other way round -- its sibling
+            # _process_universe_scan_result checks is_fallback first and persists
+            # after, deliberately. Persisting first meant a transient Claude failure
+            # during this 60s backfill overwrote the ticker's real morning analysis
+            # with a rule-based fallback stamped source="universe_scan" and today's
+            # generated_at, so _not_yet_analyzed_today then marked it "already
+            # analyzed" and BOTH midday universe scans skipped it for the rest of the
+            # day -- a qualified candidate silently benched by a one-minute outage,
+            # left showing conviction 0 / HOLD on On Shore. It was also the only
+            # writer of the cached-fallback state that the startup rehydrate could
+            # later launder into a "real" conviction-0 report (see the is_fallback
+            # restore in startup()).
+            if getattr(report, "is_fallback", True):
+                entry = self.add_ai_log(ticker, "ON_DECK",
+                    "On Shore backfill re-analysis came back as fallback data (AI "
+                    "unavailable) — today's real report left untouched", "warning")
+                await self.broadcast({"type": "ai_log", "entry": entry})
+                self._on_deck_backfill_declined_at_rr[ticker] = free_rr
+                return False
+
+            # Real AI report -- only now is it safe to record as today's analysis,
+            # matching _process_universe_scan_result's ordering. A non-BUY report is
+            # still persisted (that is exactly what populates On Shore and what
+            # _not_yet_analyzed_today reads); only fallback data is withheld.
             self._persist_report(report, source="universe_scan")
             asyncio.create_task(asyncio.to_thread(_save_report_cache, self.research_reports))
 
-            if (getattr(report, "is_fallback", True)
-                    or report.signal.value not in ("BUY", "STRONG BUY")
+            if (report.signal.value not in ("BUY", "STRONG BUY")
                     or report.conviction_score < population_floor
                     or report.entry_price <= 0 or report.stop_loss <= 0
                     or not report.fair_value_estimate or report.fair_value_estimate <= 0):
@@ -7751,8 +8275,30 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         def _required_rr_for(r: dict) -> float:
             return _required_rr(r.get("conviction_score", 0), min_conviction, base_rr, rr_step, rr_floor)
 
+        # Signal and is_fallback filters (added 2026-09-01, full-codebase review) --
+        # the same pair every sibling population path applies (_backfill_on_deck_from_
+        # on_shore, _process_universe_scan_result, the startup restore). On Shore
+        # deliberately holds every analyzed non-qualifier regardless of signal, so
+        # without these a conviction-qualified HOLD (or a cached fallback) was pulled
+        # straight onto On Deck by a settings save. Nothing downstream would ever
+        # remove it: no eviction path checks signal, so it sat in a capped slot
+        # indefinitely, outranked real BUY candidates in the tiered ranking, and burned
+        # real Claude spend on auto deep dives, above-gate re-judgments, dip-entry
+        # pricing and promotion attempts that could only ever fail the promotion's own
+        # fresh signal gate. The is_fallback read is fail-closed (default True) exactly
+        # as on the buy paths, and also consults the raw research_reports dict since
+        # the On Shore payload carries no is_fallback field of its own.
+        def _is_real_buy_candidate(t: str, r: dict) -> bool:
+            if r.get("signal", "") not in ("BUY", "STRONG BUY"):
+                return False
+            raw_report = self.research_reports.get(t, {})
+            if r.get("is_fallback", raw_report.get("is_fallback", True)):
+                return False
+            return True
+
         eligible = [(t, r) for t, r in shore.items()
-                    if r.get("conviction_score", 0) >= population_floor
+                    if _is_real_buy_candidate(t, r)
+                    and r.get("conviction_score", 0) >= population_floor
                     and not _on_deck_rr_floor_not_met(r.get("rr", 0.0), _required_rr_for(r), floor_margin)]
         default_stop_pct = self.config["take_profit"]["stop_loss_pct"]
         restored = 0
@@ -7783,7 +8329,12 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 "conviction_score": r.get("conviction_score", 0),
                 "fair_value_estimate": r.get("fair_value_estimate", 0.0),
                 "margin_of_safety_pct": r.get("margin_of_safety_pct", 0.0),
-                "atr_pct": r.get("atr_pct", 0.0),
+                # Falls back to the research_reports raw dict (fixed 2026-08-31,
+                # full-codebase review) -- the shore payload only started carrying
+                # atr_pct the same day; raw always has it for a real report, so a
+                # restored candidate can never silently lose its volatility bound
+                # to a payload-shape drift again.
+                "atr_pct": r.get("atr_pct", raw.get("atr_pct", 0.0)),
                 "last_price": r.get("last_price", 0.0),
                 "rr": r.get("rr", 0.0),
                 "required_rr": r.get("required_rr", 0.0),
@@ -7799,6 +8350,25 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 "added_at": self._now_et().isoformat(),
             }
             entry["price_history"] = await self._fetch_price_history(ticker, entry["last_price"])
+            # Re-check right before writing (added 2026-09-01, full-codebase review) --
+            # the same first-to-land-wins guard _try_add_inner (GitHub #50) and
+            # _process_universe_scan_result both carry, and the third population path
+            # was the one missing it. get_today_scan_rejects' live quote+history gather
+            # and the per-ticker _fetch_price_history above are seconds of awaits, and
+            # the 60s backfill tick draws from this very same ranked On Shore pool: an
+            # unconditional write could clobber a fresher entry that just cost a real
+            # Claude call (discarding its armed AI-entry state for this one's zeroed,
+            # hours-old cached data), or re-list a ticker bought or blocked in the gap.
+            if ticker in self.near_miss_candidates:
+                logger.debug(
+                    "%s: On Shore refill skipped its own write — already added by a "
+                    "concurrent path while this re-check was in flight", ticker)
+                continue
+            if ticker in self.portfolio.positions or self._is_on_deck_blocked(ticker):
+                logger.debug(
+                    "%s: On Shore refill skipped its own write — became held/blocked "
+                    "while this restore was in flight", ticker)
+                continue
             self.near_miss_candidates[ticker] = entry
             restored += 1
             log_entry = self.add_ai_log(ticker, phase_tag,
@@ -7861,6 +8431,43 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         }
         self.research_reports[report.ticker] = report_data
         asyncio.create_task(self.broadcast({"type": "report", "report": report_data}))
+
+        # Signals / Action Items feed (repopulated 2026-08-31, full-codebase
+        # review) -- the ONLY population site for active_signals lived inside
+        # analyze_stock_with_logging(), deleted as zero-caller dead code on
+        # 2026-08-09 (GitHub #73), which silently orphaned the whole feature:
+        # _save_active_signals was left with zero callers and the Signals tab
+        # froze at whatever data/active_signals_cache.json last held. Restored
+        # here at the single choke point every real analysis already flows
+        # through, using the deleted code's own entry shape (updateSignals /
+        # renderActionItems in dashboard.html read exactly these fields, and the
+        # frontend's `case 'signal':` WS handler is still live). Actionable only:
+        # BUY/STRONG BUY always; SELL/STRONG SELL and HOLD only for a held
+        # position (a SELL on a stock this account doesn't own isn't an action
+        # anyone can take). Upserted by ticker and capped, same bounded-in-memory
+        # precedent as self.ai_log's own 500-entry cap.
+        if not getattr(report, "is_fallback", False):
+            _sig = report.signal.value
+            _held = report.ticker in self.portfolio.positions
+            if "BUY" in _sig or (_held and ("SELL" in _sig or _sig == "HOLD")):
+                sig_entry = {
+                    "ticker": report.ticker,
+                    "signal": f"{_sig} (owned)" if (_held and _sig == "HOLD") else _sig,
+                    "conviction": report.conviction_score,
+                    "entry_price": round(report.entry_price, 2),
+                    "stop_loss": round(report.stop_loss, 2),
+                    "time": self._now_et().strftime("%H:%M:%S"),
+                    "reasoning": report.reasoning[:150] if report.reasoning else "",
+                }
+                self.active_signals = [
+                    s for s in self.active_signals if s.get("ticker") != report.ticker]
+                self.active_signals.append(sig_entry)
+                if len(self.active_signals) > 50:
+                    self.active_signals = self.active_signals[-50:]
+                asyncio.create_task(
+                    self.broadcast({"type": "signal", "signals": self.active_signals}))
+                asyncio.create_task(asyncio.to_thread(
+                    _save_active_signals, list(self.active_signals)))
 
         # "Analysis History" feed-forward (2026-08-21) -- appends a permanent row
         # (never overwritten, unlike research_reports above) so the NEXT analysis of
@@ -8033,6 +8640,12 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             nm["conviction_score"] = report.conviction_score
             nm["fair_value_estimate"] = report.fair_value_estimate
             nm["margin_of_safety_pct"] = report.margin_of_safety_pct
+            # atr_pct refreshed alongside its siblings (fixed 2026-08-31,
+            # full-codebase review) -- this block copied 14 fields from the fresh
+            # report but not atr_pct, while _refresh_nm_from_report does copy it,
+            # so a candidate that ever landed with atr_pct=0.0 (the refill-path
+            # dropout fixed the same day) kept it through every persist-check.
+            nm["atr_pct"] = getattr(report, "atr_pct", 0.0)
             nm["last_price"] = report.entry_price
             nm["rr"] = rr_val
             nm["required_rr"] = required_rr
@@ -8078,10 +8691,13 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             # orchestrator also drives elsewhere (which never pre-fetches this). These
             # are exactly the RECURRING candidates the owner's request was about ("I
             # see the same stocks analyzed all the time").
-            analysis_history_summaries = {
-                t: await self.portfolio.get_analysis_history_summary(t)
-                for t in to_persist_check
-            }
+            # asyncio.gather, not an `await`-inside-a-dict-comprehension (GitHub #156)
+            # -- that form resolves one summary at a time, serializing what are
+            # independent DB reads. Same concurrency fix already applied to this
+            # loop's own quote fetches (GitHub #94).
+            _summaries = await asyncio.gather(
+                *(self.portfolio.get_analysis_history_summary(t) for t in to_persist_check))
+            analysis_history_summaries = dict(zip(to_persist_check, _summaries))
             await self._run_batched_chunk_loop(
                 _persist_chunks(), _persist_on_result,
                 analysis_history_summaries=analysis_history_summaries)
@@ -8216,6 +8832,29 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         entry_dict = self._build_on_deck_entry(report, rr_val)
         entry_dict["required_rr"] = required_rr
         entry_dict["price_history"] = await self._fetch_price_history(ticker, entry_dict["last_price"])
+        # Re-check held/blocked/already-present at WRITE time (fixed 2026-08-31,
+        # full-codebase review) -- the chunk-build filters ran minutes-to-hours
+        # before this batch result came back (and there's an await right above),
+        # so by now the owner may have ✕-removed this ticker mid-scan (a block
+        # this unconditional write used to override, the exact "reappears right
+        # after manual removal" behavior remove_on_deck_candidate's docstring
+        # forbids), a manual buy may have made it a held position, or a concurrent
+        # backfill may have added a FRESHER entry (armed ai_entry state, live
+        # price_history) this older batch result would clobber. First-to-land wins,
+        # mirroring _try_add_inner's own GitHub #50 guard -- whose comment already
+        # named this function as the concurrent path, without this side ever
+        # reciprocating.
+        if ticker in self.portfolio.positions or self._is_on_deck_blocked(ticker):
+            entry = self.add_ai_log(ticker, phase_tag,
+                "Not added — became held or was manually blocked while this scan's "
+                "analysis was in flight", "neutral")
+            await self.broadcast({"type": "ai_log", "entry": entry})
+            return False
+        if ticker in self.near_miss_candidates:
+            logger.debug(
+                "%s: universe-scan result skipped its own On Deck write — a concurrent "
+                "path already added a fresher entry while this batch was in flight", ticker)
+            return False
         self.near_miss_candidates[ticker] = entry_dict
         status = "clears R/R now" if rr_ok else f"R/R {rr_val:.2f} < {required_rr:.2f} — watching"
         below_entry = (" (below entry gate " f"{min_conviction} — conviction-watch only)"
@@ -8294,8 +8933,15 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 for ticker in universe_candidates:
                     if self.paused or self.stopped:
                         break
+                    # _wash_sale_blocked here, not only at _process_universe_scan_result's
+                    # own post-analysis gate (fixed, GitHub #117) -- it's a pure in-memory
+                    # check, and a cooled-down ticker can neither reach On Deck (that gate)
+                    # nor appear On Shore (_on_shore_tickers filters it too), so paying for
+                    # a full Claude analysis on it up to 3x/day for a ~31-day cooldown buys
+                    # nothing. Same pre-spend placement every other admission site uses.
                     if (ticker in held_tickers or ticker in self.near_miss_candidates
-                            or self._is_on_deck_blocked(ticker)):
+                            or self._is_on_deck_blocked(ticker)
+                            or self._wash_sale_blocked(ticker)):
                         continue
                     if not _not_yet_analyzed_today(self.research_reports.get(ticker), today_str):
                         already_covered += 1
@@ -8452,6 +9098,22 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         list too (both already excluded by _on_shore_tickers itself)."""
         if self._sma_trend_scan_in_progress:
             return
+        # Market-open gate (2026-09-01, full-codebase review). Every candidate this
+        # function finds goes straight to _attempt_near_miss_promotion, whose FIRST gate
+        # is "is the market open" -- so when called at the end of the pre-open batch
+        # (~7:50-8:30 AM ET) every single one was refused and discarded: nothing is
+        # queued or restored on that path (nm_snapshot is None), so the whole pass was
+        # structurally incapable of producing a buy while still doing its free
+        # get_financials fetches and announcing tickers as "sent for analysis" in the AI
+        # log. Cheap to check here, and it deliberately does NOT disable the pre-open
+        # call outright: a pre-open batch that straggles past 9:30 (documented to happen
+        # -- one real run hadn't reached Track 2 after an hour) finds the market open and
+        # runs for real, as does the mid-day invocation.
+        if not self._is_market_open():
+            logger.debug(
+                "Track 2 (%s): market closed — skipping, every promotion would be "
+                "refused by the market-open gate and discarded", source_label)
+            return
         self._sma_trend_scan_in_progress = True
         try:
             near_threshold_pct = self.config["research"].get("sma_near_crossover_threshold_pct", 2.0)
@@ -8561,6 +9223,17 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             logger.warning("No Anthropic API key — pre-open scan skipped")
             return
 
+        # Visible to every other scan path's concurrency guard for this run's whole
+        # duration (2026-08-31, full-codebase review) -- see this flag's __init__
+        # comment. Set here (not at the launch sites) so BOTH the scheduled path and
+        # the manual Full Scan wrapper are covered by the one flag.
+        self._pre_open_batch_in_progress = True
+        try:
+            await self._run_pre_open_batch_inner(source_label)
+        finally:
+            self._pre_open_batch_in_progress = False
+
+    async def _run_pre_open_batch_inner(self, source_label: str = "PRE-OPEN"):
         min_conviction = self.config["research"]["min_conviction_score"]
         removal_conviction = self.config["research"].get("on_deck_removal_conviction", 3)
         # Population floor sits BELOW the real entry gate (2026-07-19, user's design — a
@@ -8613,6 +9286,12 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         # Stage 2 sequencing and why only the confirmed-cross case is handled here.
         sma_contexts: dict[str, dict] = {}
 
+        # {ticker: index} built once (fixed, GitHub #157) -- the per-ticker cursor
+        # advance below used to do `ticker in STOCK_UNIVERSE` followed by
+        # `STOCK_UNIVERSE.index(ticker)`, two O(n) list scans per ticker across a
+        # ~1,500-ticker universe, i.e. an avoidable O(n^2) pass once a day.
+        universe_index = {t: i for i, t in enumerate(STOCK_UNIVERSE)}
+
         async def _chunks():
             nonlocal screened_out, scanned
             buffer: list[str] = []
@@ -8620,16 +9299,21 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             for ticker in universe_candidates:
                 if self.paused or self.stopped:
                     break
+                # _wash_sale_blocked pre-spend (fixed, GitHub #117) -- see the mid-day
+                # rescan's own _chunks() filter for the full reasoning; same cheap
+                # in-memory check, same downstream-identical outcome.
                 if (ticker in held_tickers or ticker in self.near_miss_candidates
-                        or self._is_on_deck_blocked(ticker)):
+                        or self._is_on_deck_blocked(ticker)
+                        or self._wash_sale_blocked(ticker)):
                     continue
 
                 scanned += 1
 
                 # Advance cursor regardless of outcome so next pre-open resumes from here
-                if ticker in STOCK_UNIVERSE:
+                _uidx = universe_index.get(ticker)
+                if _uidx is not None:
                     await self.watchlist_manager.set_scan_cursor(
-                        (STOCK_UNIVERSE.index(ticker) + 1) % len(STOCK_UNIVERSE))
+                        (_uidx + 1) % len(STOCK_UNIVERSE))
 
                 # Quick screen first — free, no Claude, filters ~97% of universe now
                 result = await _quick_screen_with_timeout(ticker)
@@ -8686,7 +9370,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         on_shore_count = sum(
             1 for _t, _r in self.research_reports.items()
             if _r.get("source") == "universe_scan"
-            and _r.get("generated_at", "").startswith(_today_str)
+            and _on_shore_dated_today(_r, _today_str)
             and _t not in self.near_miss_candidates and _t not in _held
         )
         _complete_verb = "Pre-open complete" if source_label == "PRE-OPEN" else "Full scan complete"
@@ -8849,19 +9533,54 @@ def _coerce_settings_payload(payload: dict, coercions: dict) -> dict:
     still fails to coerce (a real typo/malformed entry, not a missing-key gap) still
     raises and aborts the whole payload exactly as before -- this only widens
     tolerance for genuinely empty input, not for bad input."""
+    # Dotkeys where an empty submitted value is a REAL, intentional value the user is
+    # choosing to save -- not the "this install's settings.yaml never had this key" gap
+    # the blank-skip below exists for. Currently just the R/R floor margin, whose own
+    # coercion deliberately maps "" -> None ("unset = no limit"); blank-skipping it
+    # would make that value unreachable from the Settings page. Add a key here ONLY
+    # when blank genuinely means something for it. Deliberately a function-local, not a
+    # module-level constant: this function is exec'd in an isolated namespace by the
+    # project's AST-extraction test technique (web/app.py can't be imported), so a
+    # module-level global it closed over would be a NameError there.
+    blank_is_a_real_value = frozenset({
+        "research.on_deck_rr_floor_margin",
+    })
     coerced: dict = {}
     for dotkey, raw_val in payload.items():
         if dotkey not in coercions:
             continue
+        # The blank-value skip runs BEFORE the coercion, for every field regardless of
+        # its coercion type (fixed, GitHub #101). It used to live only inside the
+        # except handler below, which meant it never fired for any coercion that
+        # doesn't RAISE on blank input: str("") is just "", and "" == "true" is just
+        # False. So every str-typed key (all 8 research.model_* dials,
+        # research.auto_buy_cutoff_time, research.on_deck_entry_mode, trading.broker)
+        # and every boolean silently wrote a blank/False into state.config AND
+        # config/settings.yaml on any install whose settings.yaml was missing that key
+        # -- a blank research.model_quick_scan would have become the model name used
+        # for every real Claude call. Same intent as the original 2026-08-25 fix
+        # above, just actually applied to the whole dict instead of the raising subset.
+        if raw_val == "" and dotkey not in blank_is_a_real_value:
+            logger.warning(
+                "_coerce_settings_payload: skipping blank field %s "
+                "(config/settings.yaml likely missing this key on this install)",
+                dotkey)
+            continue
         try:
             coerced[dotkey] = coercions[dotkey](raw_val)
         except (ValueError, TypeError) as e:
+            # Retained as a safety net, not as the primary path: a key listed in
+            # blank_is_a_real_value whose coercion nonetheless rejects blank should
+            # degrade to "leave this one field alone" rather than 422 the entire
+            # ~90-field save, which is the incident the 2026-08-25 fix exists for.
             if raw_val == "":
                 logger.warning(
                     "_coerce_settings_payload: skipping blank field %s "
-                    "(config/settings.yaml likely missing this key on this install)",
-                    dotkey)
+                    "(coercion rejected an intentionally-blank value)", dotkey)
                 continue
+            # A non-blank value that fails to coerce is a real typo/malformed entry and
+            # still aborts the WHOLE payload (GitHub #68) -- the caller relies on
+            # nothing having been applied when this raises.
             raise ValueError(f"Invalid value for {dotkey}: {e}")
     return coerced
 
@@ -8872,8 +9591,13 @@ async def save_settings(payload: dict):
     import yaml
 
     config_path = Path("config/settings.yaml")
-    with open(config_path) as f:
-        raw = yaml.safe_load(f)
+    # encoding= explicit (2026-09-01, full-codebase review) -- these were the last two
+    # bare open() calls in this file, the exact variant CLAUDE.md's Windows rule names
+    # as escaping the read_text/write_text AST test. settings.yaml is real UTF-8 (it
+    # already contains "§"), so on the supported Windows dev box the locale cp1252
+    # codec mis-decodes it today, and any character whose UTF-8 bytes include one of
+    # cp1252's undefined bytes (a curly quote is enough) would 500 every settings save.
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
     COERCIONS = {
         "take_profit.stop_loss_pct": float,
@@ -8991,6 +9715,32 @@ async def save_settings(payload: dict):
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail=str(e))
 
+    # The scan-time lists are validated HERE, alongside the coercions and before any
+    # mutation (2026-09-01, full-codebase review) -- they used to be parsed far below
+    # inside `except Exception: pass`, so a malformed non-blank value was silently
+    # dropped while the rest of the payload saved and the endpoint still returned
+    # {"status": "ok"} naming the dropped key as saved. That contradicts this
+    # endpoint's own documented rule (see _coerce_settings_payload: a non-blank value
+    # that fails to coerce "aborts the WHOLE payload"). Shape is checked too: valid
+    # JSON of the wrong type used to be written into settings.yaml unvalidated.
+    _scan_time_updates: dict[str, list] = {}
+    for _st_key, _st_name in (("research.scan_times", "scan_times"),
+                              ("research.midday_scan_times", "midday_scan_times")):
+        if _st_key not in payload or payload[_st_key] in ("", None):
+            continue  # blank = "leave the configured value alone", as everywhere else
+        try:
+            _times_list = json.loads(payload[_st_key])
+            if (not isinstance(_times_list, list)
+                    or not all(isinstance(t, str) for t in _times_list)):
+                raise ValueError("expected a JSON array of HH:MM strings")
+            for _t in _times_list:
+                datetime.strptime(_t, "%H:%M")
+        except Exception as e:
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=422, detail=f"Invalid value for {_st_key}: {e}") from e
+        _scan_time_updates[_st_name] = _times_list
+
     _risk_tier_anchors = state.config.get("risk_tier", {}).get("anchors", {})
     _current_tier_value = state.config.get("risk_tier", {}).get("value")
     _current_tier_mode = state.config.get("risk_tier", {}).get("mode", "auto")
@@ -9045,37 +9795,55 @@ async def save_settings(payload: dict):
         except Exception as e:
             logger.warning("Failed to rebuild universe: %s", e)
 
-    # Handle scan_times list (sent as JSON array from the frontend)
-    if "research.scan_times" in payload:
-        import json as _json
-        try:
-            times_list = _json.loads(payload["research.scan_times"])
-            raw.setdefault("research", {})["scan_times"] = times_list
-            state.config.setdefault("research", {})["scan_times"] = times_list
-        except Exception:
-            pass
+    # Apply the scan-time lists validated up front (see the validation block above).
+    for _st_name, _times_list in _scan_time_updates.items():
+        raw.setdefault("research", {})[_st_name] = _times_list
+        state.config.setdefault("research", {})[_st_name] = _times_list
 
-    if "research.midday_scan_times" in payload:
-        import json as _json_mds
-        try:
-            times_list = _json_mds.loads(payload["research.midday_scan_times"])
-            raw.setdefault("research", {})["midday_scan_times"] = times_list
-            state.config.setdefault("research", {})["midday_scan_times"] = times_list
-        except Exception:
-            pass
+    # Atomic, UTF-8 (2026-09-01) -- the old bare open(config_path, "w") truncated the
+    # live settings file BEFORE yaml.dump ran, so a dump that raised partway (with
+    # allow_unicode=True, any non-cp1252-encodable character does exactly that on
+    # Windows) destroyed the settings.yaml this project documents as unreachable by
+    # Apply Update and previously "destroyed live-tuned settings". Writing a temp file
+    # and replacing means a failure anywhere leaves the existing file untouched.
+    _cfg_tmp = config_path.with_name(f"{config_path.name}.{os.getpid()}.tmp")
+    try:
+        _cfg_tmp.write_text(
+            yaml.dump(raw, default_flow_style=False, allow_unicode=True, sort_keys=False),
+            encoding="utf-8")
+        os.replace(_cfg_tmp, config_path)
+    finally:
+        _cfg_tmp.unlink(missing_ok=True)
 
-    with open(config_path, "w") as f:
-        yaml.dump(raw, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    # Sync cached instance variables that aren't read from config dynamically.
+    # Every numeric read below goes through _resync_num (2026-08-31, full-codebase
+    # review) -- this block reads the RAW payload, and a blank submitted value
+    # (the routine "settings.yaml on this install never had this key, so its form
+    # field renders empty" case) used to hit a bare int("")/float("") and raise
+    # AFTER settings.yaml and state.config were already written above: an HTTP 500
+    # claiming the save failed while it had actually half-applied, with every
+    # cached resync line after the raising one silently skipped -- the exact
+    # partial-application state GitHub #68/#101 were fixed to eliminate,
+    # reintroduced one block later. Blank means "leave the cached value alone,"
+    # mirroring _coerce_settings_payload's own blank-skip rule.
+    def _resync_num(key: str, cast):
+        v = payload.get(key)
+        if v is None or not str(v).strip():
+            return None
+        return cast(str(v).strip())
 
-    # Sync cached instance variables that aren't read from config dynamically
-    if "research.position_monitor_interval_minutes" in payload:
-        state.position_monitor_interval = int(payload["research.position_monitor_interval_minutes"])
-    if "research.watchlist_size" in payload:
-        state.watchlist_manager.target_size = int(payload["research.watchlist_size"])
-    if "research.weak_signal_threshold" in payload:
-        state.watchlist_manager.weak_threshold = int(payload["research.weak_signal_threshold"])
-    if "research.wash_sale_cooldown_days" in payload:
-        state.risk_manager.wash_sale_cooldown_days = int(payload["research.wash_sale_cooldown_days"])
+    _v = _resync_num("research.position_monitor_interval_minutes", int)
+    if _v is not None:
+        state.position_monitor_interval = _v
+    _v = _resync_num("research.watchlist_size", int)
+    if _v is not None:
+        state.watchlist_manager.target_size = _v
+    _v = _resync_num("research.weak_signal_threshold", int)
+    if _v is not None:
+        state.watchlist_manager.weak_threshold = _v
+    _v = _resync_num("research.wash_sale_cooldown_days", int)
+    if _v is not None:
+        state.risk_manager.wash_sale_cooldown_days = _v
     if "research.scan_times" in payload:
         import json as _json2
         try:
@@ -9096,10 +9864,11 @@ async def save_settings(payload: dict):
             ])
         except Exception:
             pass
-    if "research.pre_open_batch_hours" in payload:
+    _v = _resync_num("research.pre_open_batch_hours", float)
+    if _v is not None:
         from datetime import timedelta as _tdd, datetime as _dtm
         _open_dt = _dtm.combine(_dtm.today(), state.market_open)
-        state.pre_open_batch_time = (_open_dt - _tdd(hours=float(payload["research.pre_open_batch_hours"]))).time()
+        state.pre_open_batch_time = (_open_dt - _tdd(hours=_v)).time()
     _rm = state.risk_manager
     _rm_map = {
         "risk_management.drawdown_halt_pct":       ("drawdown_halt_pct",       100),
@@ -9112,21 +9881,28 @@ async def save_settings(payload: dict):
         "risk_management.max_sector_positions":    ("max_sector_positions",      1),
     }
     for key, (attr, divisor) in _rm_map.items():
-        if key in payload:
-            setattr(_rm, attr, float(payload[key]) / divisor)
-    if "portfolio.max_positions" in payload:
-        _rm.max_positions = max(1, int(payload["portfolio.max_positions"]))
-    if "risk_management.sector_concentration_enabled" in payload:
+        _v = _resync_num(key, float)
+        if _v is not None:
+            setattr(_rm, attr, _v / divisor)
+    _v = _resync_num("portfolio.max_positions", int)
+    if _v is not None:
+        _rm.max_positions = max(1, _v)
+    # Explicit true/false only (2026-08-31) -- a blank/malformed value used to
+    # silently set the cached attr False even though coercion skipped the field.
+    if payload.get("risk_management.sector_concentration_enabled") in ("true", "false"):
         _rm.sector_concentration_enabled = (
             payload["risk_management.sector_concentration_enabled"] == "true"
         )
-    if "portfolio.initial_capital" in payload:
-        state.portfolio.initial_capital = float(payload["portfolio.initial_capital"])
-    if "trading.paper_trading" in payload:
+    _v = _resync_num("portfolio.initial_capital", float)
+    if _v is not None:
+        state.portfolio.initial_capital = _v
+    # Explicit true/false only here too (2026-08-31) -- a blank value used to
+    # coerce to paper=False, silently rebuilding the broker client against the
+    # LIVE Alpaca endpoint on a save that never touched this field.
+    if payload.get("trading.paper_trading") in ("true", "false"):
         paper = payload["trading.paper_trading"] == "true"
         broker = state.order_manager.broker
         if broker is not None:
-            broker.paper = paper
             import alpaca_trade_api as _tradeapi
             _api_key  = os.getenv("ALPACA_API_KEY", "")
             _secret   = os.getenv("ALPACA_SECRET_KEY", "")
@@ -9134,6 +9910,20 @@ async def save_settings(payload: dict):
                 "https://paper-api.alpaca.markets" if paper else "https://api.alpaca.markets"
             )
             broker.api = _tradeapi.REST(_api_key, _secret, _base_url, api_version="v2")
+            # broker.paper follows the endpoint actually in use, not the config
+            # flag alone (2026-08-31, full-codebase review) -- ALPACA_BASE_URL
+            # from the env wins the URL choice above, so the flag that stamps
+            # is_paper on every logged trade must be derived from the real URL or
+            # a live account gets stamped paper (and excluded from the tax
+            # report) whenever the two disagree. See AlpacaBroker.connect()'s
+            # matching reconcile.
+            _effective_paper = "paper-api.alpaca.markets" in _base_url
+            if _effective_paper != paper:
+                logger.warning(
+                    "trading.paper_trading=%s contradicts the Alpaca endpoint actually "
+                    "in use (%s) — trusting the endpoint: paper=%s",
+                    paper, _base_url, _effective_paper)
+            broker.paper = _effective_paper
 
     # _enforce_on_deck_cap otherwise only runs at the end of a pre-open scan or once at
     # startup (2026-07-19 gap, caught live: lowering on_deck_max_size via Settings updated
@@ -9241,12 +10031,11 @@ async def trigger_batch_scan():
     _midday_rescan_in_progress (2026-08-03, owner request, after a real live overlap
     hit twice in one day) -- both hit the same universe/Claude API and, confirmed via
     real logs, exhausted NewsAPI's free-tier rate limit between the two."""
-    if state._full_scan_in_progress:
+    # One shared check across all three scan paths (2026-09-01) -- see _scan_conflict.
+    _conflict = state._scan_conflict()
+    if _conflict:
         return {"status": "already_running",
-                "message": "A full scan is already in progress — check AI Research Engine for progress"}
-    if state._midday_rescan_in_progress:
-        return {"status": "already_running",
-                "message": "A mid-day re-scan is already in progress — try again once it completes"}
+                "message": f"{_conflict} — try again once it completes"}
     state._full_scan_in_progress = True
     asyncio.create_task(state._run_full_scan_on_demand())
     return {"status": "started", "message": "Full scan launched — watch AI Research Engine for progress"}
@@ -9262,12 +10051,11 @@ async def trigger_midday_rescan():
     duplicating real Claude spend against an already-running one. Also checks
     _full_scan_in_progress (2026-08-03, owner request, after a real live overlap with
     the manual "Full Scan" button hit twice in one day)."""
-    if state._midday_rescan_in_progress:
+    # One shared check across all three scan paths (2026-09-01) -- see _scan_conflict.
+    _conflict = state._scan_conflict()
+    if _conflict:
         return {"status": "already_running",
-                "message": "A mid-day re-scan is already in progress — try again once it completes"}
-    if state._full_scan_in_progress:
-        return {"status": "already_running",
-                "message": "A full scan is already in progress — try again once it completes"}
+                "message": f"{_conflict} — try again once it completes"}
     state._midday_rescan_in_progress = True
     asyncio.create_task(state._run_midday_rescan("MANUAL"))
     return {"status": "started", "message": "Mid-day re-scan launched — watch AI Research Engine for progress"}
@@ -9286,6 +10074,22 @@ async def get_research_reports():
     it had grown to several MB and was delaying every page load by multiple seconds.
     Frontend fetches this lazily after init instead."""
     return state.research_reports
+
+
+@app.get("/api/deep-dive-reports")
+async def get_deep_dive_reports():
+    """Bulk deep_dive_reports fetch — moved out of the WS init payload (2026-09-01,
+    full-codebase review) for exactly the reason research_reports was in 2026-07-13,
+    and on the same lazy-fetch pattern GitHub #149 later gave that endpoint.
+
+    This dict only ever grows (every auto deep dive on On Deck entry plus every manual
+    one adds an entry; the only two removal paths are narrow), and it was already
+    809,864 bytes on the dev box. get_init_payload is served both on every fresh
+    WebSocket connection AND by /api/dashboard-poll, which the disconnect fallback hits
+    every 10 seconds — so a client riding out an outage paid a ~1MB jsonable_encoder +
+    JSON render on the event loop, six times a minute, for data that changes a few
+    times a day, and the cost grew every week the system ran."""
+    return state.deep_dive_reports
 
 
 @app.get("/api/ticker-tape-config")
@@ -9385,7 +10189,12 @@ async def get_update_status():
     )
     if not cache_is_fresh:
         try:
-            state._update_status_cache = fetch_latest_release(repo)
+            # to_thread (2026-08-31, full-codebase review) -- this is a real
+            # requests.get(timeout=10) to GitHub; run sync on the event loop it
+            # froze every trading loop (stop-loss checks included) for up to 10s
+            # on every cache expiry (live interval: 2 minutes) whenever GitHub
+            # was slow.
+            state._update_status_cache = await asyncio.to_thread(fetch_latest_release, repo)
             state._update_status_cache_time = datetime.now()
         except Exception:
             pass  # keep serving the last known-good cached release, if any
@@ -9401,10 +10210,23 @@ async def get_update_status():
             "market_open": market_open,
         }
 
+    # is_newer guarded the same way the fetch above is (fixed, GitHub #129) -- an
+    # unparseable tag (a '-rc1'/'-hotfix' suffix on the release tag, or on this
+    # install's own VERSION file) used to raise straight out of this endpoint, 500ing
+    # every 60s poll from every open dashboard tab until the tag was fixed by hand.
+    # Degrading to "no update available" keeps the badge quiet instead of breaking it,
+    # matching this endpoint's own stated rule: it must never break the dashboard.
+    try:
+        available = is_newer(current, release["tag_name"])
+    except Exception:
+        logger.warning("Could not compare version %s against release tag %s",
+                       current, release.get("tag_name"))
+        available = False
+
     return {
         "current": current,
         "latest": release["tag_name"],
-        "available": is_newer(current, release["tag_name"]),
+        "available": available,
         "notes": release["notes"],
         "severity": release["severity"],
         "market_open": market_open,
@@ -9441,7 +10263,9 @@ async def get_about():
     releases: list[dict] = []
     if repo:
         try:
-            releases = fetch_recent_releases(repo, limit=15)
+            # to_thread (2026-08-31) -- same sync-GitHub-fetch-on-the-event-loop
+            # fix as /api/update-status above.
+            releases = await asyncio.to_thread(fetch_recent_releases, repo, limit=15)
         except Exception:
             pass
     return {
@@ -9519,23 +10343,33 @@ async def apply_update():
             return {"status": "error", "detail": "update.releases_repo not configured"}
 
         try:
-            release = fetch_latest_release(repo)
+            release = await asyncio.to_thread(fetch_latest_release, repo)
         except Exception as exc:
             return {"status": "error", "detail": f"could not fetch latest release: {exc}"}
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             archive_path = str(Path(tmp_dir) / "release.tar.gz")
             try:
-                response = requests.get(release["download_url"], timeout=60)
+                # Every blocking step below runs via to_thread (2026-08-31,
+                # full-codebase review) -- this endpoint used to run a sync
+                # 60s-timeout download, archive extraction, file copies, and an
+                # unbounded pip install directly on the event loop, freezing
+                # position_update_loop's stop-loss enforcement, fill handling,
+                # and every WebSocket for the whole duration (applying during
+                # market hours is deliberately warn-but-allow, so that freeze
+                # was reachable mid-trading-day).
+                response = await asyncio.to_thread(
+                    requests.get, release["download_url"], timeout=60)
                 response.raise_for_status()
-                Path(archive_path).write_bytes(response.content)
+                await asyncio.to_thread(Path(archive_path).write_bytes, response.content)
             except Exception as exc:
                 return {"status": "error", "detail": f"could not download release archive: {exc}"}
 
             try:
                 extract_dir = str(Path(tmp_dir) / "extracted")
                 Path(extract_dir).mkdir()
-                extracted_root = extract_release_archive(archive_path, extract_dir)
+                extracted_root = await asyncio.to_thread(
+                    extract_release_archive, archive_path, extract_dir)
             except Exception as exc:
                 return {"status": "error", "detail": f"could not extract release archive: {exc}"}
 
@@ -9549,20 +10383,33 @@ async def apply_update():
             )
             needs_pip_install = requirements_changed(old_requirements, new_requirements)
 
-            copy_updatable_files(extracted_root, _INSTALL_ROOT)
-
+            # Dependencies FIRST, against the extracted archive's own requirements.txt,
+            # and only then overwrite the live install (fixed, GitHub #126). The copy
+            # used to run unconditionally and pip afterward, so a failed install left
+            # the new src/web/scripts already on disk against the still-old dependencies
+            # -- harmless to the running process (old code is already in memory) but a
+            # live outage waiting for the next unrelated restart (the weekly
+            # renew_cert.sh cron, a crash, /api/restart). Installing from extracted_root
+            # means an aborted apply never touches the live install root at all, which
+            # is the same guarantee the download/extract failures above already give.
+            # cwd=extracted_root so any relative reference inside that requirements.txt
+            # resolves against the new tree, not the old one.
             if needs_pip_install:
-                pip_result = subprocess.run(
+                pip_result = await asyncio.to_thread(
+                    subprocess.run,
                     [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
-                    cwd=_INSTALL_ROOT,
+                    cwd=extracted_root,
                     capture_output=True,
                     text=True,
                 )
                 if pip_result.returncode != 0:
                     return {
                         "status": "error",
-                        "detail": f"pip install failed, service NOT restarted: {pip_result.stderr}",
+                        "detail": "pip install failed — live install left untouched, "
+                                  f"service NOT restarted: {pip_result.stderr}",
                     }
+
+            await asyncio.to_thread(copy_updatable_files, extracted_root, _INSTALL_ROOT)
 
             write_local_version(_VERSION_FILE_PATH, release["tag_name"])
 
@@ -9669,6 +10516,8 @@ async def get_near_miss():
     min_conviction = state.config["research"]["min_conviction_score"]
     rr_step = state.config["research"].get("on_deck_rr_conviction_step", 0.1)
     rr_floor = state.config["research"].get("on_deck_rr_floor", 1.5)
+    stop_atr_min = state.config["research"].get("stop_atr_min_mult", 1.0)
+    reward_atr_max = state.config["research"].get("reward_atr_max_mult", 6.0)
     result = {}
     for ticker, nm in state.near_miss_candidates.items():
         fair_value = nm.get("fair_value_estimate", 0.0)
@@ -9677,12 +10526,16 @@ async def get_near_miss():
         # reflecting the same stock-specific stop Claude actually recommended (and the real
         # order would actually place), not one flat percentage applied to every stock.
         stop_loss_pct = nm.get("stop_loss_pct", default_stop_pct)
+        # Volatility-bounded, matching every live gate (2026-09-01) -- see _rr_bound.
+        _bound = _rr_bound(nm.get("atr_pct", 0.0) or 0.0, stop_atr_min, reward_atr_max)
         dip = _windowed_dip(nm, retracement_pct, history_days)
-        dip_target_rr = rr_at_price(dip["retracement_target"], fair_value, stop_loss_pct) if dip else None
+        dip_target_rr = rr_at_price(
+            dip["retracement_target"], fair_value, stop_loss_pct, _bound) if dip else None
         ai_entry_target_rr = None
         if (dip is not None and nm.get("ai_entry_price") is not None
                 and nm.get("ai_entry_low_ref") == dip["low"]):
-            ai_entry_target_rr = rr_at_price(nm["ai_entry_price"], fair_value, stop_loss_pct)
+            ai_entry_target_rr = rr_at_price(
+                nm["ai_entry_price"], fair_value, stop_loss_pct, _bound)
         # required_rr (2026-07-18): this candidate's own conviction-scaled threshold, falling
         # back to computing it fresh for any candidate created before the field existed.
         required_rr = nm.get("required_rr")
@@ -9690,7 +10543,8 @@ async def get_near_miss():
             required_rr = _required_rr(nm.get("conviction_score", min_conviction), min_conviction, base_rr, rr_step, rr_floor)
         result[ticker] = {
             **{k: v for k, v in nm.items() if k not in ("price_history", "_debug_price_history")},
-            "rr_sparkline": rr_sparkline(_chart_price_history(nm), fair_value, stop_loss_pct),
+            "rr_sparkline": rr_sparkline(
+                _chart_price_history(nm), fair_value, stop_loss_pct, bound=_bound),
             "price_sparkline": price_sparkline(_chart_price_history(nm)),
             "dip": dip,
             "dip_target_rr": dip_target_rr,
@@ -9778,17 +10632,16 @@ async def get_today_scan_rejects():
         stop_pct = _derive_stop_pct(entry_price, stop_loss, default_stop_pct)
         live_stop = live_price * (1 - stop_pct / 100)
         risk = live_price - live_stop
+        _bound = _rr_bound(
+            r.get("atr_pct", 0.0) or 0.0,
+            state.config["research"].get("stop_atr_min_mult", 1.0),
+            state.config["research"].get("reward_atr_max_mult", 6.0))
         if risk > 0 and fair_value > 0:
-            rr = compute_bounded_rr(
-                risk, fair_value - live_price, r.get("atr_pct", 0.0),
-                state.config["research"].get("stop_atr_min_mult", 1.0),
-                state.config["research"].get("reward_atr_max_mult", 6.0),
-            )
+            rr = _bound(risk, fair_value - live_price, live_price)
         else:
             rr = 0.0
         required_rr = _required_rr(conviction, min_conviction, base_rr, rr_step, rr_floor)
         margin = r.get("margin_of_safety_pct", 0.0) or 0.0
-        score = conviction + margin / 10 + (rr - required_rr) * 2
         result[ticker] = {
             "ticker": ticker,
             "company_name": r.get("company_name", ticker),
@@ -9802,10 +10655,22 @@ async def get_today_scan_rejects():
             "last_price": live_price,
             "fair_value_estimate": fair_value,
             "margin_of_safety_pct": margin,
+            # Carried through so _refill_on_deck_from_shore's restored candidates
+            # keep their volatility bounding (fixed 2026-08-31, full-codebase
+            # review) -- this payload never included atr_pct, so that function's
+            # r.get("atr_pct", 0.0) always stored 0.0 and compute_bounded_rr fell
+            # back to the unbounded ratio for every restored candidate on every
+            # subsequent monitor tick, silently disabling the 2026-08-28
+            # volatility-bounded R/R for exactly the candidates it was built for.
+            "atr_pct": r.get("atr_pct", 0.0),
             "generated_at": r.get("generated_at", ""),
-            "rr_sparkline": rr_sparkline(histories.get(ticker, []), fair_value, stop_pct),
+            "rr_sparkline": rr_sparkline(
+                histories.get(ticker, []), fair_value, stop_pct, bound=_bound),
             "price_sparkline": price_sparkline(histories.get(ticker, [])),
-            "_score": score,
+            # "_score" removed 2026-09-01 (full-codebase review) -- nothing consumed it,
+            # and it carried the PRE-2026-08-12 uncapped formula while this payload's
+            # real ordering comes from _on_deck_ranking_key below, so it was a stale
+            # second answer to a question already answered correctly right here.
         }
     # Sorted by the same tiered (is_buy_eligible, composite_score) key On Deck's own
     # ranking uses (fixed 2026-08-12, COTY incident — conviction 3.2, signal NO ACTION,
@@ -9853,7 +10718,15 @@ async def get_near_miss_history(ticker: str):
         rr_step = state.config["research"].get("on_deck_rr_conviction_step", 0.1)
         rr_floor = state.config["research"].get("on_deck_rr_floor", 1.5)
         min_rr = _required_rr(nm.get("conviction_score", min_conviction), min_conviction, base_rr, rr_step, rr_floor)
-    points = rr_points(_chart_price_history(nm), fair_value, stop_loss_pct)
+    # Volatility-bounded, so the docstring's "matches exactly what has been driving a
+    # promotion decision" is actually true (2026-09-01, full-codebase review) -- every
+    # live gate has used compute_bounded_rr since 2026-08-28 while this reconstruction
+    # kept plotting the raw ratio against the real (bounded) min_rr gate line below.
+    _bound = _rr_bound(
+        nm.get("atr_pct", 0.0) or 0.0,
+        state.config["research"].get("stop_atr_min_mult", 1.0),
+        state.config["research"].get("reward_atr_max_mult", 6.0))
+    points = rr_points(_chart_price_history(nm), fair_value, stop_loss_pct, _bound)
     # Same dip/entry-target fields as /api/near-miss (2026-07-18) so the bigger modal chart
     # can draw the identical dashed target line the card sparkline does — see that
     # endpoint's docstring for why both modes' targets are always included regardless of
@@ -9862,11 +10735,13 @@ async def get_near_miss_history(ticker: str):
     entry_mode = state.config["research"].get("on_deck_entry_mode", "ai")
     history_days = state.config["research"].get("on_deck_history_days", 30)
     dip = _windowed_dip(nm, retracement_pct, history_days)
-    dip_target_rr = rr_at_price(dip["retracement_target"], fair_value, stop_loss_pct) if dip else None
+    dip_target_rr = rr_at_price(
+        dip["retracement_target"], fair_value, stop_loss_pct, _bound) if dip else None
     ai_entry_target_rr = None
     if (dip is not None and nm.get("ai_entry_price") is not None
             and nm.get("ai_entry_low_ref") == dip["low"]):
-        ai_entry_target_rr = rr_at_price(nm["ai_entry_price"], fair_value, stop_loss_pct)
+        ai_entry_target_rr = rr_at_price(
+            nm["ai_entry_price"], fair_value, stop_loss_pct, _bound)
     return {
         "ticker": ticker, "fair_value_estimate": fair_value, "min_rr": min_rr, "points": points,
         "dip": dip, "dip_target_rr": dip_target_rr, "ai_entry_target_rr": ai_entry_target_rr,
@@ -9910,7 +10785,12 @@ async def get_today_scan_reject_history(ticker: str):
     rr_floor = state.config["research"].get("on_deck_rr_floor", 1.5)
     conviction = r.get("conviction", 0) or 0
     min_rr = _required_rr(conviction, min_conviction, base_rr, rr_step, rr_floor)
-    points = rr_points(history, fair_value, stop_loss_pct)
+    # Bounded, same as the On Deck history endpoint above (2026-09-01) -- these points
+    # are drawn against min_rr, the real conviction-scaled gate.
+    points = rr_points(history, fair_value, stop_loss_pct, _rr_bound(
+        r.get("atr_pct", 0.0) or 0.0,
+        state.config["research"].get("stop_atr_min_mult", 1.0),
+        state.config["research"].get("reward_atr_max_mult", 6.0)))
     return {
         "ticker": ticker, "fair_value_estimate": fair_value, "min_rr": min_rr, "points": points,
         "dip": None, "dip_target_rr": None, "ai_entry_target_rr": None,
@@ -10293,8 +11173,13 @@ async def get_performance_history(range: str = "all"):
 
     db_path = state.config.get("database", {}).get("path", "data/aitrading.db")
     store = BenchmarkStore(db_path)
-    store.initialize()
-    settled = store.get_settled_days()
+    # to_thread, same reasoning as _live_benchmark_classifications below (2026-09-01,
+    # full-codebase review) -- initialize() runs CREATE TABLE IF NOT EXISTS + PRAGMA
+    # table_info and get_settled_days a full-table read, both sync sqlite (timeout=20s)
+    # against the shared db, on an endpoint polled every 60s per tab (every 10s in
+    # WebSocket-fallback mode). Blocking here stalls every trading loop in the process.
+    await asyncio.to_thread(store.initialize)
+    settled = await asyncio.to_thread(store.get_settled_days)
 
     base = history[0]
     base_benchmark = settled.get(base["date"])
@@ -10384,10 +11269,19 @@ async def _live_benchmark_classifications(holdings_value: dict) -> dict:
     from src.analytics.benchmark_store import BenchmarkStore, classify_ticker
     db_path = state.config.get("database", {}).get("path", "data/aitrading.db")
     store = BenchmarkStore(db_path)
-    store.initialize()
-    sp500 = set(get_universe(["S&P 500"]))
-    sp400 = set(get_universe(["S&P 400"]))
-    sp600 = set(get_universe(["S&P 600"]))
+    # to_thread on everything below (2026-08-31, full-codebase review) -- this
+    # function backs /api/performance-history (x2) and /api/performance-today,
+    # polled every 60s by every open dashboard tab. get_universe() is sync
+    # sqlite/disk work in the cached case, and on an expired 24h cache entry a
+    # BLOCKING Wikipedia requests.get(timeout=15) + pd.read_html -- run directly
+    # on the event loop it froze position_update_loop's 10s stop-loss checks and
+    # every WebSocket for up to ~45s the moment the cache lapsed during market
+    # hours. The settings-save handler already wraps the identical call in
+    # to_thread; this site just never did.
+    await asyncio.to_thread(store.initialize)
+    sp500 = set(await asyncio.to_thread(get_universe, ["S&P 500"]))
+    sp400 = set(await asyncio.to_thread(get_universe, ["S&P 400"]))
+    sp600 = set(await asyncio.to_thread(get_universe, ["S&P 600"]))
 
     def get_sector(ticker):
         pos = state.portfolio.positions.get(ticker)
@@ -10396,7 +11290,19 @@ async def _live_benchmark_classifications(holdings_value: dict) -> dict:
     def get_cap_tier_membership():
         return (sp500, sp400, sp600)
 
-    return {t: classify_ticker(t, store, get_sector, get_cap_tier_membership) for t in holdings_value}
+    # classify_ticker is sync sqlite too (2026-09-01, full-codebase review) -- the
+    # 2026-08-31 pass above wrapped store.initialize/get_universe but left this
+    # dict comprehension running per-holding on the event loop. Each call opens its
+    # own sqlite3 connection (timeout=20s) against the shared multi-writer
+    # aitrading.db for a SELECT, and on a cache miss an INSERT+commit -- so the first
+    # poll after buying a position during market hours can block behind another
+    # writer, freezing the 10s stop-loss tick and every WebSocket for up to the full
+    # busy timeout. One to_thread hop covers the whole batch.
+    def _classify_all() -> dict:
+        return {t: classify_ticker(t, store, get_sector, get_cap_tier_membership)
+                for t in holdings_value}
+
+    return await asyncio.to_thread(_classify_all)
 
 
 async def _fetch_today_etf_bars(classifications: dict) -> dict:
@@ -10534,8 +11440,13 @@ async def get_performance_today():
         equity_history = await state.order_manager.broker.get_portfolio_history()
     except Exception:
         equity_history = []
+    # tz=state.market_tz, not a bare fromtimestamp() (fixed, GitHub #116) -- a naive
+    # fromtimestamp() converts using the SERVER's local timezone (UTC on Hetzner), so
+    # an equity point recorded between 8pm ET and midnight ET renders to the next
+    # calendar date and silently drops out of "today," truncating the Day P/L chart.
+    # today_str is already explicitly ET (state._now_et()), so both sides must be.
     today_equity = [p for p in equity_history if
-                    datetime.fromtimestamp(p["t"]).strftime("%Y-%m-%d") == today_str]
+                    datetime.fromtimestamp(p["t"], tz=state.market_tz).strftime("%Y-%m-%d") == today_str]
     if not today_equity:
         return {"points": []}
 
@@ -10628,12 +11539,22 @@ async def get_portfolio_summary():
     buy_value = 0.0
     sell_count = 0
     sell_value = 0.0
+    # classify_trade_signal, not `== "BUY"` (fixed 2026-09-01, full-codebase review) --
+    # the JSONL log genuinely contains "STRONG BUY" rows (log_trade writes
+    # signal.signal.value, and the promotion path sets Signal.STRONG_BUY), so exact
+    # equality silently dropped every high-conviction buy from these counts while the
+    # sibling /api/trade-history endpoint counted them via `in ("BUY", "STRONG BUY")` --
+    # two endpoints disagreeing about how many trades exist, from the same file. This
+    # is the shared helper extracted (GitHub #143) to end exactly that per-reader drift.
     for t in trades:
         value = float(t.get("position_size", 0) or 0)
-        if t.get("signal") == "BUY":
+        is_buy = classify_trade_signal(
+            t.get("signal", ""), source="/api/portfolio-summary",
+            ticker=t.get("ticker"), file_name="trade_history JSONL")
+        if is_buy is True:
             buy_count += 1
             buy_value += value
-        elif t.get("signal") == "SELL":
+        elif is_buy is False:
             sell_count += 1
             sell_value += value
 
@@ -10976,11 +11897,13 @@ async def manual_buy(payload: dict):
     if not price or price <= 0:
         raise HTTPException(status_code=400, detail=f"Invalid price for {ticker}")
 
+    # Fallbacks match config/settings.yaml (aligned 2026-09-01, full-codebase review) --
+    # t2/t3 previously read 10.0/17.0 here against the yaml's 7.0/9.0.
     tp_cfg = state.config.get("take_profit", {})
     stop_loss_pct = tp_cfg.get("stop_loss_pct", 5.0)
     t1_pct = tp_cfg.get("t1_pct", 5.0)
-    t2_pct = tp_cfg.get("t2_pct", 10.0)
-    t3_pct = tp_cfg.get("t3_pct", 17.0)
+    t2_pct = tp_cfg.get("t2_pct", 7.0)
+    t3_pct = tp_cfg.get("t3_pct", 9.0)
 
     if stop_loss_pct <= 0:
         raise HTTPException(status_code=400, detail="stop_loss_pct must be > 0 — check Settings")
@@ -11134,7 +12057,15 @@ async def save_keys(payload: dict):
     # Hot-swap live clients so the server doesn't need a restart
     if "ANTHROPIC_API_KEY" in changed:
         import anthropic as _anthropic
-        state.research_engine.client = _anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        from src.research.ai_cost_tracker import CostTrackingClient as _CTC
+        # Re-wrapped in CostTrackingClient (fixed 2026-08-31, full-codebase
+        # review) -- ResearchEngine.__init__ is the canonical construction and
+        # always wraps, but this hot-swap installed a bare client, so every
+        # sequential-path Claude call after a key edit silently vanished from the
+        # AI-cost badge/history until the next restart.
+        state.research_engine.client = _CTC(
+            _anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]),
+            state.research_engine.cost_tracker)
         state.has_claude = True
         state.stock_delay = 15
 
@@ -11148,6 +12079,22 @@ async def save_keys(payload: dict):
                 "https://paper-api.alpaca.markets" if broker.paper else "https://api.alpaca.markets"
             )
             broker.api = tradeapi.REST(api_key, secret, base_url, api_version="v2")
+            # broker.paper follows the endpoint actually in use (2026-08-31,
+            # full-codebase review) -- editing ALPACA_BASE_URL here changes which
+            # account gets traded, but broker.paper (the flag that stamps
+            # is_paper on every logged trade, backing the tax report's
+            # paper-exclusion guarantee) previously never moved with it: pointing
+            # this at the live endpoint without also flipping
+            # trading.paper_trading stamped every real-money trade as paper and
+            # excluded it from Form 8949. See AlpacaBroker.connect()'s matching
+            # reconcile.
+            _effective_paper = "paper-api.alpaca.markets" in base_url
+            if _effective_paper != broker.paper:
+                logger.warning(
+                    "API-keys hot-swap: broker.paper=%s contradicts the Alpaca endpoint "
+                    "now in use (%s) — trusting the endpoint: paper=%s",
+                    broker.paper, base_url, _effective_paper)
+                broker.paper = _effective_paper
 
     if "FINNHUB_API_KEY" in changed:
         state.market_data.finnhub_key = os.environ["FINNHUB_API_KEY"]
@@ -11360,7 +12307,22 @@ async def startup():
                     sector=_d.get("sector", ""),
                     fair_value_estimate=_d.get("fair_value_estimate", 0.0),
                     margin_of_safety_pct=_d.get("margin_of_safety_pct", 0.0),
-                    is_fallback=False,
+                    atr_pct=_d.get("atr_pct", 0.0),
+                    # Read the persisted flag, never a hardcoded False (fixed
+                    # 2026-09-01, full-codebase review). _persist_report deliberately
+                    # stores is_fallback (GitHub #81) precisely so a cached rule-based
+                    # report stays identifiable, but this rebuild threw it away and
+                    # stamped every restored object as a genuine AI report. A cached
+                    # fallback (capped HOLD, conviction 0) therefore came back as a
+                    # "real" conviction-0 report, and the conviction-drop auto-close
+                    # branch -- whose ONLY protection against acting on fallback data
+                    # is `not getattr(report, "is_fallback", False)` (GitHub #97) --
+                    # would then force-liquidate a perfectly healthy held position on
+                    # the first tick after a restart. atr_pct was dropped the same way,
+                    # silently disabling the volatility bound for any consumer of a
+                    # restored report (CLAUDE.md: it "must be carried onto every
+                    # candidate/report dict copy ... or the bound silently turns off").
+                    is_fallback=_d.get("is_fallback", False),
                 )
             except Exception as _e:
                 logger.warning("Could not restore ResearchReport for %s: %s", _ticker, _e)
@@ -11493,7 +12455,6 @@ async def startup():
 
     asyncio.create_task(state.auto_scan_loop())
     asyncio.create_task(state.near_miss_monitor_loop())
-    asyncio.create_task(state.watchlist_rr_loop())
     asyncio.create_task(state.position_update_loop())
     asyncio.create_task(state.position_monitor_loop())
     asyncio.create_task(state.position_deep_dive_loop())

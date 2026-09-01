@@ -10,6 +10,9 @@ from zoneinfo import ZoneInfo
 from src.execution.broker import Broker, Order, OrderSide, OrderType, OrderStatus
 from src.execution.alpaca_broker import AlpacaBroker
 from src.decision.portfolio import Portfolio, Position
+# The project's single shared "is this price a real, finite number" guard
+# (GitHub #85). Pure/stdlib-only module, no circular-import risk from execution.
+from src.analytics.composition_benchmark import is_usable_price
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +260,38 @@ class OrderManager:
         # only the FIRST sighting of a given target while the window is active, not every
         # tick it stays open.
         self._tp_pending_confirm: dict[str, float] = {}
+        # Injected by web/app.py's DashboardState right after construction
+        # (2026-08-31, full-codebase review) -- lets _log_sell_to_jsonl mirror
+        # every OrderManager-executed sell into the JSONL trade log the tax
+        # package and composition benchmark reconstruct from. None (e.g. in
+        # tests) means the mirror is skipped, fail-soft.
+        self.trade_logger = None
+
+    def _log_sell_to_jsonl(self, ticker: str, shares: float, price: float,
+                           reason: str, trade_id: str | None) -> None:
+        """Mirror one OrderManager-side SQL trade_history SELL row into the JSONL
+        trade log (2026-08-31, full-codebase review). Every sell path that only
+        this class executes -- _execute_take_profit_tranche's tranches and
+        TP-driven full closes, a stop-tranche fill's own recording, and
+        _reconcile_untracked_fill/_log_unreconciled_fill's rows -- previously
+        wrote only the SQL table, but src/tax/read_tax_events and
+        src/analytics/parse_trade_events read ONLY the JSONL files: Form 8949's
+        FIFO lot matching silently omitted those realized gains/losses, and the
+        composition benchmark's daily-holdings replay overstated shares held
+        after every tranche. Deliberately NOT called from _execute_sell's own
+        paths -- its web/app.py callers already log the resulting sell via
+        trade_logger.log_trade (a second write here would double-record).
+        is_paper comes from the broker's real live flag at the moment of the
+        fill, same rule as every log_trade call site. Never raises -- a mirror
+        failure must not break the fill handling it's recording."""
+        if self.trade_logger is None:
+            return
+        try:
+            self.trade_logger.log_sell_fill(
+                ticker, shares, price, reason, trade_id,
+                is_paper=getattr(self.broker, "paper", True))
+        except Exception as e:
+            logger.warning("%s: JSONL sell mirror failed (%s)", ticker, e)
 
     def _now_et(self) -> datetime:
         """A real, overridable method (not an inline datetime.now() call) specifically
@@ -391,23 +426,52 @@ class OrderManager:
             for ticker, pending in list(self._pending_stops.items()):
                 if pending.get("order_id") != order_id:
                     continue
-                self._pending_stops.pop(ticker, None)
+                # All the fallible work happens BEFORE the pop (fixed 2026-08-31,
+                # full-codebase review) -- this branch used to pop the pending
+                # entry first, then do float(tu.position_qty) / Position
+                # construction / add_position_async: any exception there (a fill
+                # event carrying position_qty=None -- a case this same handler
+                # explicitly guards 80 lines below -- would raise TypeError) was
+                # swallowed by the handler's broad except with the ticker now in
+                # NEITHER portfolio.positions NOR _pending_stops, so the polling
+                # fallback structurally could not recover it: real filled shares
+                # sat untracked and completely unprotected at Alpaca until a
+                # restart's _sync_portfolio. Now a failure before the pop simply
+                # leaves the entry in place for update_positions' own
+                # get_order_status resolution to handle on its next 10s cycle.
+                if tu.position_qty is None:
+                    logger.warning(
+                        "%s pending-buy fill event carried no position_qty — leaving the "
+                        "pending entry for the polling fallback to resolve", ticker)
+                    return
                 real_shares = float(tu.position_qty)
-                real_price = _order_avg_fill_price(_order, float(tu.price))
-                await self.portfolio.add_position_async(Position(
-                    ticker=ticker,
-                    shares=real_shares,
-                    entry_price=real_price,
-                    current_price=real_price,
-                    stop_loss=pending["stop_price"],
-                    take_profit_targets=pending["take_profit_targets"],
-                    sector=pending.get("sector", ""),
-                    opened_at=datetime.now(),
-                    t1_target_price=pending["take_profit_targets"][0] if len(pending["take_profit_targets"]) > 0 else None,
-                    t2_target_price=pending["take_profit_targets"][1] if len(pending["take_profit_targets"]) > 1 else None,
-                    trade_id=str(uuid.uuid4()),
-                    **pending.get("buy_snapshot", {}),
-                ))
+                real_price = _order_avg_fill_price(
+                    _order, float(tu.price) if tu.price is not None else 0.0)
+                try:
+                    new_pos = Position(
+                        ticker=ticker,
+                        shares=real_shares,
+                        entry_price=real_price,
+                        current_price=real_price,
+                        stop_loss=pending["stop_price"],
+                        take_profit_targets=pending["take_profit_targets"],
+                        sector=pending.get("sector", ""),
+                        opened_at=datetime.now(),
+                        t1_target_price=pending["take_profit_targets"][0] if len(pending["take_profit_targets"]) > 0 else None,
+                        t2_target_price=pending["take_profit_targets"][1] if len(pending["take_profit_targets"]) > 1 else None,
+                        trade_id=str(uuid.uuid4()),
+                        **pending.get("buy_snapshot", {}),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "%s pending-buy resolution could not build the Position (%s) — "
+                        "leaving the pending entry for the polling fallback", ticker, e)
+                    return
+                # Pop only now, with the Position built -- the in-memory add below is
+                # synchronous inside add_position_async, and _save_position fails soft,
+                # so nothing after this point can orphan the buy.
+                self._pending_stops.pop(ticker, None)
+                await self.portfolio.add_position_async(new_pos)
                 logger.info(
                     "%s pending buy resolved via trade_updates stream: %.4g shares @ $%.2f",
                     ticker, real_shares, real_price,
@@ -471,10 +535,40 @@ class OrderManager:
                 if ticker not in self.portfolio.positions:
                     return
                 async with self._lock_for(ticker):
-                    self._stop_order_ids.pop(ticker, None)
                     pos = self.portfolio.positions[ticker]
-                    fill_price = _order_avg_fill_price(_order, float(tu.price))
-                    real_remaining = float(tu.position_qty) if tu.position_qty is not None else 0.0
+                    # Ambiguous events defer to the polling fallback instead of being
+                    # guessed at, and every fallible read happens BEFORE the pop --
+                    # same rule as the pending-buy branch above (fixed 2026-09-01,
+                    # full-codebase review). A fill event carrying position_qty=None
+                    # used to default to 0.0 and take the full-close branch below: for
+                    # a stop covering only its own tranche (a legacy partial stop, or
+                    # the transient window where a partial-buy correction has raised
+                    # pos.shares above the resting stop's qty) that recorded the ENTIRE
+                    # locally-tracked share count as sold at the stop price and popped
+                    # the position, while the real remainder stayed at Alpaca matching
+                    # neither portfolio.positions nor _pending_stops -- invisible to
+                    # update_positions and completely unprotected until a restart's
+                    # _sync_portfolio (NDAQ sat 6 days that way). float(tu.price) was
+                    # likewise evaluated eagerly as _order_avg_fill_price's fallback
+                    # argument, so a None price raised TypeError AFTER the pop had
+                    # already discarded the stop id. Leaving the id tracked lets
+                    # update_positions' Alpaca-detected-close path resolve the real
+                    # outcome on its next 10s cycle (it re-reads the stop order for the
+                    # true fill price) and the share-drop delta path handle a partial.
+                    if tu.position_qty is None:
+                        logger.warning(
+                            "%s stop fill event carried no position_qty — leaving the stop "
+                            "id tracked for the polling fallback to resolve", ticker)
+                        return
+                    fill_price = _order_avg_fill_price(
+                        _order, float(tu.price) if tu.price is not None else 0.0)
+                    if not is_usable_price(fill_price) or fill_price <= 0:
+                        logger.warning(
+                            "%s stop fill event carried no usable fill price — leaving the "
+                            "stop id tracked for the polling fallback to resolve", ticker)
+                        return
+                    real_remaining = float(tu.position_qty)
+                    self._stop_order_ids.pop(ticker, None)
                     if real_remaining > 0.001:
                         # Only the stop tranche filled -- correct the share count and
                         # leave the position open. Fixed 2026-08-02 (GitHub #39): this
@@ -498,11 +592,57 @@ class OrderManager:
                         # order happens to still cover it until a later cycle notices.
                         old_shares = pos.shares
                         pos.shares = real_remaining
+                        # Record the stop tranche's own sale (fixed 2026-08-31,
+                        # full-codebase review) -- this branch used to correct the
+                        # share count and liquidate the remainder without EVER
+                        # recording the shares the stop order itself just sold: no
+                        # trade_history row, no realized_pnl/cash update, no
+                        # recent_losses (wash-sale) marking -- and because
+                        # pos.shares was pre-matched to Alpaca here, the poll's
+                        # delta-based _apply_untracked_share_drop reconciliation
+                        # never saw it either, so a real (possibly losing) exit
+                        # permanently vanished from P&L, win/loss stats, the
+                        # wash-sale block, and Form 8949's source data. Mirrors
+                        # _execute_take_profit_tranche's own per-fill accounting;
+                        # fill_price is the order's real weighted-average
+                        # (_order_avg_fill_price above).
+                        tranche_shares = round(old_shares - real_remaining, 9)
+                        if tranche_shares > 0.001:
+                            tranche_pnl = (fill_price - pos.entry_price) * tranche_shares
+                            pos.realized_pnl += tranche_pnl
+                            pos.shares_sold += tranche_shares
+                            self.portfolio.cash += tranche_shares * fill_price
+                            if tranche_pnl < 0:
+                                self.portfolio.recent_losses[ticker] = datetime.now()
+                            tranche_reason = _classify_stop_exit_reason(
+                                fill_price, pos.entry_price, pos.profit_target_hit
+                            ) + " (stop tranche)"
+                            if self.portfolio._db:
+                                try:
+                                    await self.portfolio._db.execute(
+                                        "INSERT INTO trade_history "
+                                        "(ticker, action, shares, price, pnl, timestamp, reason, trade_id) "
+                                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                        (ticker, "SELL", tranche_shares, fill_price,
+                                         tranche_pnl, datetime.now().isoformat(),
+                                         tranche_reason, pos.trade_id),
+                                    )
+                                    await self.portfolio._db.commit()
+                                except Exception as e:
+                                    logger.warning(
+                                        "Failed to log stop-tranche trade_history for %s: %s",
+                                        ticker, e,
+                                    )
+                            self._log_sell_to_jsonl(
+                                ticker, tranche_shares, fill_price, tranche_reason, pos.trade_id)
+                            await self.portfolio._save_state()
                         await self.portfolio._save_position(pos)
                         logger.info(
                             "%s stop order filled for the stop tranche (%.4g -> %.4g "
-                            "shares remaining) -- closing the rest immediately",
+                            "shares remaining, %.4g shares recorded @ $%.2f) -- closing "
+                            "the rest immediately",
                             ticker, old_shares, real_remaining,
+                            max(tranche_shares, 0.0), fill_price,
                         )
                         await self._liquidate_remainder_after_stop_fire(ticker, real_remaining)
                         return
@@ -604,6 +744,12 @@ class OrderManager:
                  "UNRECONCILED FILL (real order not found — needs manual review)", _trade_id),
             )
             await self.portfolio._db.commit()
+            # JSONL mirror (2026-08-31) -- see _log_sell_to_jsonl; the tax reader
+            # needs even an unreconciled sell to exist as a SELL event, or the lot
+            # never closes at all in FIFO matching.
+            self._log_sell_to_jsonl(
+                ticker, shares_sold, price,
+                "UNRECONCILED FILL (real order not found — needs manual review)", _trade_id)
             logger.warning(
                 "%s: could not match a %.4g-share fill to any real Alpaca order — logged "
                 "as UNRECONCILED at current quote $%.2f (NOT a real fill price, NOT "
@@ -800,8 +946,35 @@ class OrderManager:
                 )
             except Exception as e:
                 logger.warning("Failed to log reconciled trade_history for %s: %s", ticker, e)
+                # Roll back the rows already inserted in this loop before taking
+                # the fallback path (fixed 2026-08-31, full-codebase review) --
+                # the connection is deferred-transaction mode (no isolation_level
+                # arg), so without this the abandoned tranche rows sat uncommitted
+                # on the shared connection and got flushed by the NEXT commit
+                # anywhere in portfolio.py -- including _log_unreconciled_fill's
+                # own commit inside the fallback, which then ALSO records the full
+                # share count: the same shares written twice (a real T1 row plus a
+                # full-quantity UNRECONCILED row), double-counting P&L and
+                # corrupting win-rate/Form-8949 source data.
+                try:
+                    await self.portfolio._db.rollback()
+                except Exception as rb_err:
+                    logger.warning(
+                        "%s: rollback after failed reconcile insert also failed: %s",
+                        ticker, rb_err,
+                    )
                 return await _fallback_estimate()
         await self.portfolio._db.commit()
+        # JSONL mirror per reconciled row (2026-08-31) -- see _log_sell_to_jsonl.
+        for i, o in enumerate(matched):
+            if is_stop_driven:
+                _mirror_reason = (
+                    "Stop Loss (gap-through market sell, full close)" if stop_is_full_close
+                    else "Stop Loss (gap-through market sell)")
+            else:
+                _mirror_reason = _tranche_reason(starting_tranche + i)
+            self._log_sell_to_jsonl(
+                ticker, o["filled_qty"], o["filled_avg_price"], _mirror_reason, _trade_id)
         logger.info(
             "%s: reconciled %d untracked fill(s) against real order history (%s, %d target(s) fired) — %s",
             ticker, len(matched), "stop-driven" if is_stop_driven else "take-profit", n_fired,
@@ -869,6 +1042,97 @@ class OrderManager:
         earliest = min(matched, key=lambda o: o["filled_at"])
         return datetime.fromisoformat(earliest["filled_at"]).replace(tzinfo=None)
 
+    async def _apply_untracked_share_drop(
+        self, ticker: str, pos: Position, old_shares: float, new_shares: float,
+        context: str,
+    ) -> bool:
+        """The single shared "Alpaca reports fewer shares than our DB does" handler
+        (extracted 2026-08-31, GitHub #160). Was duplicated near-verbatim between
+        _sync_portfolio (a drop that happened while the process was DOWN) and
+        update_positions (one that happened between two 10s polls) -- identical logic,
+        differing only in log wording and in what each caller does afterward. Same
+        drift risk, and the same fix, as this file's own _build_and_submit_sell /
+        _resolve_retry_quantity extractions (GitHub #88/#89): a future fix applied to
+        only one of two copies silently leaves the other path re-vulnerable.
+
+        Every hard-won behavior of both copies is preserved exactly:
+
+        - pos.take_profit_targets is NOT pre-shrunk before _reconcile_untracked_fill
+          (2026-07-28, RRC incident) -- a stop-loss can cover several tranches' worth
+          of shares in one gap-through market sell, and guessing "shares_dropped /
+          tranche_size" targets as fired mislabels a real loss as banked profits. Only
+          that function's own real-order-history lookup decides how many (if any) to
+          pop -- always 0 for a stop-driven closure.
+        - pos.shares is NOT committed until after that call returns (2026-08-11, SBRA
+          incident) -- if the real order behind the delta is still partially_filled it
+          raises FillStillSettlingError, and the whole correction (share count
+          included) must be skipped for this pass. Committing it anyway would make the
+          gap permanently unrecoverable: the next poll would see the counts already
+          matching and never reconcile that fill again.
+        - The breakeven trailing-stop arm fires only for a confirmed TP fill
+          (n_fired > 0), never for a stop-driven closure -- forcing the trail up to
+          breakeven right after a loss makes no sense for shares that were never part
+          of any profit-taking.
+        - A confirmed stop-driven closure liquidates the whole remainder (2026-08-11,
+          FTV incident), only if genuinely still open after this pass's own correction.
+
+        `context` is a caller label used purely in log lines. Returns True if
+        pos.shares was committed, False if the fill is still settling and the caller
+        must leave every bit of this position's state untouched for this pass.
+        Deliberately does NOT persist the position or re-sync cash -- both callers
+        already own those steps, with genuinely different surrounding behavior
+        (_sync_portfolio saves unconditionally after its own separate invariant check;
+        update_positions saves only on a real correction and flags shares_corrected to
+        drive a batch cash re-sync)."""
+        _est = None
+        shares_dropped = 0.0
+        if (old_shares > 0.001
+                and new_shares < old_shares - 0.01
+                and pos.take_profit_targets):
+            shares_dropped = old_shares - new_shares
+            try:
+                _est = await self._reconcile_untracked_fill(
+                    ticker, shares_dropped, old_shares,
+                    pos.take_profit_targets, pos.entry_price,
+                )
+            except FillStillSettlingError:
+                logger.info(
+                    "%s: %s — real order still settling, "
+                    "deferring share-count correction to next poll",
+                    context, ticker,
+                )
+                return False
+
+        pos.shares = new_shares
+        if _est is not None:
+            _avg_price, _pnl, _n_fired = _est
+            pos.realized_pnl += _pnl
+            pos.shares_sold += shares_dropped
+            if _n_fired > 0:
+                logger.warning(
+                    "%s: %s shares %.4g→%.4g — %d TP fill(s) confirmed, "
+                    "trimming targets from %s",
+                    context, ticker, old_shares, pos.shares,
+                    _n_fired, pos.take_profit_targets,
+                )
+                pos.take_profit_targets = pos.take_profit_targets[_n_fired:]
+                if pos.trailing_stop is None:
+                    pos.trailing_stop = pos.entry_price
+                    logger.info(
+                        "%s trailing stop initialized to breakeven $%.2f "
+                        "on untracked TP fill",
+                        ticker, pos.entry_price,
+                    )
+            else:
+                logger.warning(
+                    "%s: %s shares %.4g→%.4g — confirmed stop-loss (not a TP fill), "
+                    "targets unchanged: %s",
+                    context, ticker, old_shares, pos.shares, pos.take_profit_targets,
+                )
+                if pos.shares > 0.001:
+                    await self._liquidate_remainder_after_stop_fire(ticker, pos.shares)
+        return True
+
     async def _sync_portfolio(self):
         try:
             account = await self.broker.get_account()
@@ -908,85 +1172,22 @@ class OrderManager:
                     # Detect a share-count drop while the system was down or between polls:
                     # if Alpaca reports significantly fewer shares than our DB, either a real
                     # take-profit fired untracked, or a stop-loss (possibly a gap-through
-                    # market-sell covering multiple tranches' worth at once) did.
-                    # _reconcile_untracked_fill determines which against Alpaca's own real
-                    # order history and returns how many targets to pop -- 0 for a stop-driven
-                    # closure, since a stop-loss never represents a take-profit tranche firing
-                    # no matter how many tranches' worth of shares it happened to cover
-                    # (2026-07-28, RRC incident: a single gap-through stop sold exactly 2
-                    # tranches' worth and the OLD pre-guess-then-pop logic here assumed that
-                    # meant "2 TPs fired," mislabeling a real loss as two banked profits and
-                    # showing T1/T2 checkmarks for a position where neither target had
-                    # actually been hit). Must NOT pre-shrink pos.take_profit_targets before
-                    # this call -- the whole point is deciding how much (if any) to shrink
-                    # only after knowing what the fill actually was.
+                    # market-sell covering multiple tranches' worth at once) did. All of that
+                    # handling now lives in the shared _apply_untracked_share_drop (extracted
+                    # 2026-08-31, GitHub #160 -- see its docstring for every incident-driven
+                    # behavior it preserves); update_positions() runs the identical logic for
+                    # a drop between two live polls, and the two used to be duplicated
+                    # near-verbatim here.
                     #
-                    # pos.shares is deliberately NOT committed until AFTER this call returns
-                    # (2026-08-11, SBRA incident) -- see the matching comment in
-                    # update_positions(). A restart landing mid-fill of a real order leaves
-                    # pos.shares at its old (stale) value for this one pass; the routine 10s
-                    # update_positions() loop retries and self-heals once the order settles.
-                    _est = None
-                    _settling = False
-                    if (old_shares > 0.001
-                            and new_shares < old_shares - 0.01
-                            and pos.take_profit_targets):
-                        shares_dropped = old_shares - new_shares
-                        try:
-                            _est = await self._reconcile_untracked_fill(
-                                p["ticker"], shares_dropped, old_shares,
-                                pos.take_profit_targets, pos.entry_price,
-                            )
-                        except FillStillSettlingError:
-                            _settling = True
-                    if _settling:
-                        logger.info(
-                            "_sync_portfolio: %s — real order still settling, "
-                            "deferring share-count correction to next poll",
-                            p["ticker"],
-                        )
-                    else:
-                        pos.shares = new_shares
-                        if _est is not None:
-                            _avg_price, _pnl, _n_fired = _est
-                            pos.realized_pnl += _pnl
-                            pos.shares_sold += shares_dropped
-                            if _n_fired > 0:
-                                logger.warning(
-                                    "%s shares dropped %.4g→%.4g during downtime — "
-                                    "%d TP fill(s) confirmed, updating targets from %s",
-                                    p["ticker"], old_shares, pos.shares,
-                                    _n_fired, pos.take_profit_targets,
-                                )
-                                pos.take_profit_targets = pos.take_profit_targets[_n_fired:]
-                                # Same breakeven-protection rule as the live
-                                # check_take_profits() path — a TP fill detected after the
-                                # fact still means remaining shares should never be protected
-                                # at less than breakeven. Deliberately NOT applied when
-                                # _n_fired == 0 (a stop-driven closure) -- forcing the
-                                # trailing stop up to breakeven right after a loss makes no
-                                # sense for shares that weren't part of any profit-taking.
-                                if pos.trailing_stop is None:
-                                    pos.trailing_stop = pos.entry_price
-                                    logger.info(
-                                        "%s trailing stop initialized to breakeven $%.2f "
-                                        "on downtime-detected TP fill",
-                                        p["ticker"], pos.entry_price,
-                                    )
-                            else:
-                                logger.warning(
-                                    "%s shares dropped %.4g→%.4g during downtime — "
-                                    "confirmed stop-loss (not a TP fill), targets unchanged: %s",
-                                    p["ticker"], old_shares, pos.shares,
-                                    pos.take_profit_targets,
-                                )
-                                # A stop firing closes the WHOLE position immediately,
-                                # not just its own tranche (2026-08-11, FTV incident —
-                                # see _liquidate_remainder_after_stop_fire's docstring).
-                                if pos.shares > 0.001:
-                                    await self._liquidate_remainder_after_stop_fire(
-                                        p["ticker"], pos.shares,
-                                    )
+                    # A False return means the real order behind the delta is still settling
+                    # (SBRA incident) -- pos.shares stays at its old value for this one pass
+                    # and the routine 10s update_positions() loop self-heals once it settles.
+                    # The _save_position below still runs either way, as it always has here
+                    # (it also persists the live current_price and the invariant check's own
+                    # trailing-stop correction, neither of which depends on this outcome).
+                    await self._apply_untracked_share_drop(
+                        p["ticker"], pos, old_shares, new_shares, "_sync_portfolio",
+                    )
 
                     # Self-healing invariant check, independent of the delta-detection above:
                     # any position holding fewer than 3 targets has necessarily had at least
@@ -2193,11 +2394,35 @@ class OrderManager:
         inherit a stale confirmation."""
         if not self.broker:
             return
+        # Regular-hours only (2026-09-01, full-codebase review). This ran 24/7 from
+        # update_positions' 10s tick, judging targets against pos.current_price from
+        # the broker's positions snapshot -- which outside the session is a stale or
+        # thin extended-hours print, the same untrustworthy pricing the stop-breach
+        # market-sell fallback is already gated on (_is_regular_trading_hours' own
+        # docstring, AYI/AFG incident). Worse, the resulting market DAY order cannot
+        # fill outside the session: it queues until the next open while the tranche
+        # was already booked as sold below. Same weekday+time test as that fallback;
+        # a target crossed after hours is simply executed on the next in-session tick.
+        if not _is_regular_trading_hours(self._now_et()):
+            return
+        _due: list[str] = []
         for ticker, pos in list(self.portfolio.positions.items()):
             if len(pos.take_profit_targets) < 2:
                 self._tp_pending_confirm.pop(ticker, None)
                 continue
-            if pos.current_price is None or pos.current_price < pos.take_profit_targets[0]:
+            # is_usable_price, not a bare `is None` check (fixed 2026-08-31, GitHub
+            # #133) -- NaN fails BOTH halves of the old
+            # `current_price is None or current_price < target` guard (`NaN < x` is
+            # False in Python, and NaN is not None), so a NaN price fell straight
+            # through to firing a REAL take-profit tranche sale that was never
+            # actually validated against a target crossing. pos.current_price is
+            # sourced from Alpaca's get_positions() snapshot, which carries no NaN
+            # guard of its own. Exactly the class of silent-NaN-poisoning this
+            # codebase has already been bitten by on the yfinance-sourced side
+            # (2026-07-29 composition-benchmark incident) -- reuses that incident's
+            # own shared guard rather than adding a 4th independent variant.
+            if (not is_usable_price(pos.current_price)
+                    or pos.current_price < pos.take_profit_targets[0]):
                 self._tp_pending_confirm.pop(ticker, None)
                 continue
             target_price = pos.take_profit_targets[0]
@@ -2212,7 +2437,44 @@ class OrderManager:
                 )
                 continue
             self._tp_pending_confirm.pop(ticker, None)
-            await self._execute_take_profit_tranche(ticker)
+            _due.append(ticker)
+
+        if not _due:
+            return
+        if len(_due) == 1:
+            # Deliberately the plain, unchanged await for the overwhelmingly common
+            # single-ticker case -- no gather wrapper, and an exception still
+            # propagates to update_positions' own catch-all exactly as it always
+            # has. There are no other tickers to protect from it here, and keeping
+            # this path byte-for-byte identical to the pre-#162 behavior means the
+            # existing behavioral suite still exercises the real thing.
+            await self._execute_take_profit_tranche(_due[0])
+            return
+        # Concurrent across tickers (2026-08-31, GitHub #162) -- every mutation
+        # _execute_take_profit_tranche performs is already serialized by that
+        # function's own per-ticker lock (`async with self._lock_for(ticker)`, which
+        # it also re-checks its state under), so independent tickers were never
+        # relying on this loop's sequencing for correctness. The cost of serializing
+        # them was real and safety-relevant: each tranche cancels the resting 100%
+        # stop, sleeps 0.75s for Alpaca to settle the cancel, sells, then places a
+        # fresh stop -- so on a broad rally tick where several positions cross their
+        # target at once, every position after the first spent that whole queue
+        # waiting with its stop already cancelled or about to be. Running them
+        # together collapses that to roughly one tranche's duration.
+        #
+        # return_exceptions=True so one ticker's failure can't cancel the others
+        # mid-flight (that would be the exact "stop cancelled, sell never placed"
+        # window this project guards against everywhere else); each exception is
+        # logged individually here instead of propagating up into
+        # update_positions' broad catch-all, which previously abandoned every
+        # remaining ticker in this loop on the first failure.
+        _results = await asyncio.gather(
+            *(self._execute_take_profit_tranche(t) for t in _due),
+            return_exceptions=True,
+        )
+        for _t, _r in zip(_due, _results):
+            if isinstance(_r, BaseException):
+                logger.error("Take-profit execution failed for %s: %s", _t, _r)
 
     async def _execute_take_profit_tranche(self, ticker: str) -> bool:
         """Executes exactly one take-profit tranche as its own fully independent
@@ -2319,6 +2581,61 @@ class OrderManager:
                     return False
             tranche_shares = sell_qty
 
+            # Book only what the broker actually sold (2026-09-01, full-codebase
+            # review). This used to record the tranche unconditionally, never reading
+            # result.status or filled_quantity: a sell that came back PENDING/SUBMITTED
+            # (or REJECTED/CANCELLED) was still credited to cash, decremented from
+            # pos.shares, popped off take_profit_targets, and written into both
+            # trade_history and the tax-authoritative JSONL as a completed sale at an
+            # estimated price. Nothing could correct it afterwards: pre-decrementing
+            # pos.shares matches the local count to what Alpaca will report once the
+            # queued order fills, so the poll's delta-based reconciliation sees no
+            # discrepancy (the same hiding mechanism the stop-tranche fix above
+            # describes) -- and if the DAY order instead expired unfilled, the poll's
+            # increase path silently restored pos.shares while the phantom SELL rows,
+            # inflated realized_pnl, popped target and breakeven-armed trailing stop
+            # all stayed. Deferring instead is strictly safer and self-healing: the
+            # order is real and still in flight, so when it fills, the share-count
+            # delta path (_apply_untracked_share_drop -> _reconcile_untracked_fill)
+            # records it against the broker's own order history at the real price.
+            # Never book a tranche the broker actively refused (2026-09-01,
+            # full-codebase review). This function used to record the sale
+            # unconditionally -- crediting cash, decrementing pos.shares, popping the
+            # target, and writing both trade_history and the tax-authoritative JSONL --
+            # without ever reading result.status. A REJECTED/CANCELLED/EXPIRED order
+            # never sold anything, so those rows were pure fabrication, and because
+            # pos.shares had already been decremented to match, the poll's delta-based
+            # reconciliation could never notice. Returning False here leaves the
+            # position and its targets untouched, so the next 10s cycle simply tries
+            # again -- the same self-healing shape the submit-exception path above uses.
+            # PENDING/SUBMITTED is deliberately still booked: check_take_profits is now
+            # gated to regular trading hours, so a market sell accepted here fills in
+            # seconds (Alpaca answers the submit with "accepted", which maps to
+            # SUBMITTED, long before the fill event lands), and deferring it would leave
+            # the target un-popped and re-fire another real sell on the next tick.
+            if result.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED,
+                                 OrderStatus.EXPIRED):
+                logger.warning(
+                    "Take-profit T%d for %s came back %s — nothing was sold, so nothing "
+                    "is recorded; restoring a fresh 100%% stop and leaving the tranche "
+                    "for the next cycle",
+                    tranche_number, ticker, result.status.value,
+                )
+                await self._place_stop_only(
+                    ticker, pos.shares, max(pos.stop_loss, pos.trailing_stop or 0))
+                return False
+            if result.status == OrderStatus.PARTIAL and result.filled_quantity:
+                # Record only what actually changed hands; the rest of this order is
+                # still open at Alpaca and reconciles through the share-drop path.
+                _filled = float(result.filled_quantity)
+                if is_usable_price(_filled) and 0 < _filled < tranche_shares:
+                    logger.warning(
+                        "Take-profit T%d for %s filled partially (%.4g of %.4g shares) — "
+                        "recording only the filled portion",
+                        tranche_number, ticker, _filled, tranche_shares,
+                    )
+                    tranche_shares = round(_filled, 9)
+
             # Same fallback convention as _execute_sell's own market-sell handling —
             # a market order to a liquid position usually fills fast enough that
             # Alpaca's synchronous response already carries filled_price; when it
@@ -2358,6 +2675,13 @@ class OrderManager:
                         "Failed to log TP%d trade_history for %s: %s",
                         tranche_number, ticker, e,
                     )
+            # JSONL mirror (2026-08-31) -- see _log_sell_to_jsonl; TP tranches
+            # (and the TP-driven full close below, which pops the position
+            # directly without ever reaching _report_alpaca_detected_close) were
+            # the largest class of sell invisible to the tax/benchmark readers.
+            self._log_sell_to_jsonl(
+                ticker, tranche_shares, fill_price,
+                f"Take-Profit T{tranche_number}", pos.trade_id)
 
             logger.info(
                 "Take-profit T%d executed for %s: %.4g shares @ $%.2f (target was "
@@ -2371,6 +2695,13 @@ class OrderManager:
                 # written above with the correct T{n} reason: a second call would
                 # double-record (and close_position_async's own docstring/comment
                 # confirms cash was already credited per-fill, matching this design).
+                # Capture the buy-side rationale before the position is discarded
+                # (2026-09-01, full-codebase review). Popping directly skips
+                # close_position_async, which was the only writer of the sell_analysis
+                # row -- so a trade that exited entirely through take-profits never got
+                # a "Recent Sell" post-mortem and fed nothing forward into a later
+                # analysis of the same ticker. Idempotent, so the paths can't duplicate.
+                await self.portfolio.snapshot_sell_analysis(pos, ticker)
                 self.portfolio.positions.pop(ticker, None)
                 self.portfolio.update_peak()
                 await self.portfolio._remove_position_db(ticker)
@@ -2418,91 +2749,54 @@ class OrderManager:
                     # lock is free.
                     if (abs(p["shares"] - pos.shares) > 0.01
                             and not self._lock_for(ticker).locked()):
-                        old_shares = pos.shares
-                        new_shares = p["shares"]
-                        # Determine what actually happened (real TP fill vs stop-driven
-                        # closure) via Alpaca's own order history BEFORE deciding how many
-                        # targets to pop -- same fix as _sync_portfolio above, and for the
-                        # same reason (2026-07-28, RRC incident): a stop-loss can cover
-                        # multiple tranches' worth of shares in one gap-through market sell,
-                        # and pre-guessing "shares_dropped / tranche_size" targets as fired
-                        # mislabels a loss as profit-taking. Must NOT pre-shrink
-                        # pos.take_profit_targets before calling _reconcile_untracked_fill.
-                        #
-                        # pos.shares itself is deliberately NOT committed until AFTER this
-                        # call returns (2026-08-11, SBRA incident) -- if the real order
-                        # behind this delta is still partially_filled,
-                        # _reconcile_untracked_fill raises FillStillSettlingError instead of
-                        # guessing, and this whole correction (share count included) must be
-                        # skipped for this tick so the next poll retries once the order
-                        # actually settles. Committing pos.shares here regardless (the old
-                        # behavior) would have made the gap permanently unrecoverable: the
-                        # next poll would see p["shares"] already matching pos.shares and
-                        # never call this again for the same fill.
-                        _est = None
-                        _settling = False
-                        if (old_shares > 0.001
-                                and pos.take_profit_targets
-                                and new_shares < old_shares - 0.01):
-                            _shares_dropped_upd = old_shares - new_shares
-                            try:
-                                _est = await self._reconcile_untracked_fill(
-                                    ticker, _shares_dropped_upd, old_shares,
-                                    pos.take_profit_targets, pos.entry_price,
-                                )
-                            except FillStillSettlingError:
-                                _settling = True
-                        if _settling:
-                            logger.info(
-                                "update_positions: %s — real order still settling, "
-                                "deferring share-count correction to next poll",
-                                ticker,
-                            )
-                        else:
-                            pos.shares = new_shares
-                            if _est is not None:
-                                _avg_price, _pnl, n_fired = _est
-                                pos.realized_pnl += _pnl
-                                pos.shares_sold += _shares_dropped_upd
-                                if n_fired > 0:
-                                    logger.warning(
-                                        "update_positions: %s shares %.4g→%.4g — "
-                                        "%d TP fill(s) confirmed, trimming targets from %s",
-                                        ticker, old_shares, pos.shares,
-                                        n_fired, pos.take_profit_targets,
-                                    )
-                                    pos.take_profit_targets = pos.take_profit_targets[n_fired:]
-                                else:
-                                    logger.warning(
-                                        "update_positions: %s shares %.4g→%.4g — confirmed "
-                                        "stop-loss (not a TP fill), targets unchanged: %s",
-                                        ticker, old_shares, pos.shares,
-                                        pos.take_profit_targets,
-                                    )
-                                    # A stop firing closes the WHOLE position immediately,
-                                    # not just its own tranche (2026-08-11, FTV incident —
-                                    # see _liquidate_remainder_after_stop_fire's docstring).
-                                    # Only fires if genuinely still open after this poll's
-                                    # own correction -- nothing to liquidate on an already-
-                                    # full close.
-                                    if pos.shares > 0.001:
-                                        await self._liquidate_remainder_after_stop_fire(
-                                            ticker, pos.shares,
-                                        )
-                                # Same breakeven-protection rule as the live check_take_profits()
-                                # path — a TP fill detected after the fact still means remaining
-                                # shares should never be protected at less than breakeven.
-                                # Deliberately NOT applied when n_fired == 0 (a stop-driven
-                                # closure) -- see _sync_portfolio's matching comment above.
-                                if n_fired > 0 and pos.trailing_stop is None:
-                                    pos.trailing_stop = pos.entry_price
-                                    logger.info(
-                                        "%s trailing stop initialized to breakeven $%.2f "
-                                        "on untracked TP fill",
-                                        ticker, pos.entry_price,
-                                    )
-                            await self.portfolio._save_position(pos)
-                            shares_corrected = True
+                        # HOLD the lock for the whole correction, don't just check it
+                        # once (fixed 2026-08-31, full-codebase review) -- the
+                        # .locked() probe above is the safe skip-if-busy gate, but
+                        # _apply_untracked_share_drop then awaits a broker fetch, an
+                        # unconditional 2.5s retry sleep, and DB writes with nothing
+                        # held, before writing pos.shares from THIS pre-await
+                        # snapshot. A lock-holding mutation starting during those
+                        # awaits (_execute_sell from a WS command task, or the
+                        # stream's stop-fill branch) was silently clobbered: a full
+                        # close mid-window got its popped position resurrected via
+                        # _save_position's INSERT OR REPLACE (a phantom position the
+                        # next restart reloads and re-closes with a duplicate SELL
+                        # row). Acquisition is instant (we just saw it unlocked, and
+                        # asyncio is cooperative between here and the acquire); the
+                        # re-fetch inside guards the position having been popped by
+                        # whoever held it LAST tick. Nothing in
+                        # _apply_untracked_share_drop's call tree takes this lock
+                        # (verified: _reconcile_untracked_fill,
+                        # _liquidate_remainder_after_stop_fire, _cancel_exit_orders
+                        # are all lock-free), so this cannot deadlock.
+                        async with self._lock_for(ticker):
+                            pos = self.portfolio.positions.get(ticker)
+                            if pos is None:
+                                continue
+                            old_shares = pos.shares
+                            new_shares = p["shares"]
+                            if abs(new_shares - old_shares) <= 0.01:
+                                continue  # already corrected by a prior lock holder
+                            # Determine what actually happened (real TP fill vs stop-driven
+                            # closure) via Alpaca's own order history BEFORE deciding how many
+                            # targets to pop, and don't commit pos.shares until that's known --
+                            # all of it now in the shared _apply_untracked_share_drop (extracted
+                            # 2026-08-31, GitHub #160; see its docstring for the RRC/SBRA/FTV
+                            # incidents whose fixes it carries). _sync_portfolio runs the exact
+                            # same handling for a drop that happened while the process was down,
+                            # and used to duplicate this whole block near-verbatim.
+                            #
+                            # A False return means the real order is still partially_filled --
+                            # this whole correction (share count included) is skipped for this
+                            # tick, deliberately WITHOUT persisting, so the next poll retries
+                            # once the order settles. Committing pos.shares anyway (the pre-SBRA
+                            # behavior) made the gap permanently unrecoverable: the next poll
+                            # would see p["shares"] already matching and never reconcile again.
+                            if await self._apply_untracked_share_drop(
+                                ticker, pos, old_shares, new_shares, "update_positions",
+                            ):
+                                await self.portfolio._save_position(pos)
+                                shares_corrected = True
                 elif ticker in self._pending_stops:
                     # After-hours buy just filled — place exit orders now
                     #
@@ -2688,6 +2982,54 @@ class OrderManager:
                         _pending_ticker, _order_id, _order_status.status.value,
                     )
                     self._pending_stops.pop(_pending_ticker, None)
+
+            # Clean up orphaned _partial_fill_pending entries (fixed 2026-08-31,
+            # GitHub #161) -- the exact same state-hygiene gap the _pending_stops loop
+            # directly above closes (GitHub #58), for its sibling dict. An entry is
+            # registered when _execute_buy's synchronous submit_order response comes
+            # back PARTIAL (BEN incident), and is ONLY ever cleared inside
+            # _handle_trade_update's own fill branch -- which reacts exclusively to
+            # tu.event == "fill". If the remainder of that same order instead ends
+            # CANCELLED/REJECTED/EXPIRED (an Alpaca day order expiring on its unfilled
+            # remainder), no terminal "fill" event ever arrives and the entry lingers
+            # in memory forever, until a later buy for the same ticker happens to
+            # overwrite it. Low impact -- no real shares are left unprotected, since
+            # the position was already created from what genuinely filled -- but a
+            # real, unaddressed gap of a class this file has already fixed once.
+            #
+            # Deliberately NOT skipped for tickers in alpaca_tickers, unlike the
+            # _pending_stops loop above: an entry here exists precisely BECAUSE a real
+            # position was already created from the partial fill, so its ticker is in
+            # that set by construction and skipping them would make this loop a
+            # permanent no-op. There's no double-handling risk either -- the main
+            # positions loop above never reads or writes _partial_fill_pending at all.
+            #
+            # Only a terminal NON-fill status clears the entry. A FILLED status is
+            # deliberately left alone for _handle_trade_update to own, exactly as
+            # today -- popping it here could beat the stream's own terminal event to
+            # the entry and silently drop the share-count correction that branch
+            # exists to apply.
+            for _pf_ticker in list(self._partial_fill_pending.keys()):
+                # .get(), not [] -- same race class as the loop above (GitHub #47):
+                # this loop awaits get_order_status per ticker, so the concurrent
+                # trade_updates stream handler can pop a LATER ticker's entry while an
+                # EARLIER ticker's await is in flight.
+                _pf_order_id = self._partial_fill_pending.get(_pf_ticker)
+                if not _pf_order_id:
+                    continue
+                try:
+                    _pf_status = await self.broker.get_order_status(_pf_order_id)
+                except Exception:
+                    continue  # transient lookup failure -- leave it, retry next cycle
+                if _pf_status.status in (
+                        OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                    logger.info(
+                        "%s: partial-fill buy order %s ended %s -- no further fill event "
+                        "will arrive, clearing stale _partial_fill_pending entry "
+                        "(share count self-heals via the positions sync above)",
+                        _pf_ticker, _pf_order_id, _pf_status.status.value,
+                    )
+                    self._partial_fill_pending.pop(_pf_ticker, None)
 
             # Detect positions closed by Alpaca (stop/TP filled).
             # Guard: empty list — likely transient API error, not simultaneous close of all positions.

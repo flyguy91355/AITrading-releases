@@ -32,6 +32,23 @@ class NewsItem:
     category: str = ""
 
 
+def _is_ticker_like(query: str) -> bool:
+    """True when `query` looks like a real US stock symbol rather than a free-text
+    search phrase (2026-08-31, GitHub #136).
+
+    The previous `query.isalpha()` check was False for a real dot-class ticker
+    (BRK.B, BF.B) because `.` isn't alphabetic, so every NewsAPI-fallback item for
+    those symbols was mislabeled `ticker="MARKET"` — silently misattributing that
+    company's news to the generic market bucket. `.` and `-` are both real US
+    ticker-class characters (BRK.B, BRK-B), so both are allowed; at least one
+    letter is still required, and the original 5-character ceiling is unchanged."""
+    if not query or len(query) > 5:
+        return False
+    if not any(c.isalpha() for c in query):
+        return False
+    return all(c.isalpha() or c in ".-" for c in query)
+
+
 class NewsFeed:
     def __init__(self, config: dict):
         self.config = config
@@ -71,8 +88,23 @@ class NewsFeed:
             logger.warning("Finnhub news failed for %s: %s", ticker, e)
             return []
 
+        # A 200 response whose body isn't the documented JSON array (a plan-restricted
+        # or error-shaped dict, which resp.raise_for_status() can't catch since the HTTP
+        # status itself is fine) used to raise an uncaught exception out of `data[:30]`
+        # below -- KeyError on Python 3.12 (slice objects are hashable there, so the
+        # dict lookup simply misses), TypeError on a str/None body -- violating this
+        # function's "never raise, return []" contract (2026-08-31, GitHub #135).
+        if not isinstance(data, list):
+            logger.warning(
+                "Finnhub news for %s returned unexpected payload type %s — ignoring",
+                ticker, type(data).__name__,
+            )
+            return []
+
         items = []
         for article in data[:30]:
+            if not isinstance(article, dict):
+                continue
             try:
                 published = datetime.fromtimestamp(article.get("datetime", 0))
             except (ValueError, TypeError, OSError):
@@ -129,20 +161,52 @@ class NewsFeed:
             logger.warning("NewsAPI search failed for '%s': %s", query, e)
             return []
 
+        # Mirror image of the Finnhub guard above (2026-08-31, GitHub #166). That one
+        # breaks when a 200 body is a dict where a list is expected; this one has the
+        # opposite exposure -- a list/str/None body raises AttributeError on `.get`,
+        # out of a function whose contract is likewise "never raise, return []".
+        # resp.raise_for_status() can't catch it, since the HTTP status itself is fine.
+        if not isinstance(data, dict):
+            logger.warning(
+                "NewsAPI search for '%s' returned unexpected payload type %s — ignoring",
+                query, type(data).__name__,
+            )
+            return []
+
+        articles = data.get("articles", [])
+        if not isinstance(articles, list):
+            logger.warning(
+                "NewsAPI search for '%s' returned non-list 'articles' (%s) — ignoring",
+                query, type(articles).__name__,
+            )
+            return []
+
         items = []
-        for article in data.get("articles", []):
+        for article in articles:
+            # A non-dict element would escape the try below -- it only wraps the
+            # publishedAt parse, while the .get() calls that build the NewsItem sit
+            # outside it -- so skip it here, same as the Finnhub loop does.
+            if not isinstance(article, dict):
+                continue
+
             try:
                 published = datetime.fromisoformat(article["publishedAt"].replace("Z", "+00:00")).replace(tzinfo=None)
             except (ValueError, TypeError, KeyError):
                 published = datetime.now()
 
-            ticker = query.upper() if len(query) <= 5 and query.isalpha() else "MARKET"
+            ticker = query.upper() if _is_ticker_like(query) else "MARKET"
+
+            # NewsAPI documents "source" as an object, but a malformed payload can carry
+            # a bare string there -- .get("name") on it would raise AttributeError out of
+            # this same "never raise" contract, so resolve it defensively.
+            source = article.get("source")
+            source_name = source.get("name", "") if isinstance(source, dict) else ""
 
             items.append(NewsItem(
                 ticker=ticker,
                 headline=article.get("title", ""),
                 summary=article.get("description", "") or "",
-                source=article.get("source", {}).get("name", ""),
+                source=source_name,
                 url=article.get("url", ""),
                 published=published,
             ))

@@ -50,27 +50,46 @@ def dip_summary(price_history: list[tuple[float, float]], retracement_pct: float
     }
 
 
-def rr_at_price(price: float, fair_value: float, stop_loss_pct: float) -> float | None:
+def rr_at_price(price: float, fair_value: float, stop_loss_pct: float,
+                bound=None) -> float | None:
     """The same stop-trailing R/R formula near_miss_monitor_loop uses live, applied to a
     single price rather than a whole history — shared by rr_points (below) and by the
     "where would the buy-target price land on the R/R axis" calculation used to plot the
     entry-target line directly on the R/R chart. None if the ratio can't be computed
     (invalid price/fair_value), same as rr_points' per-point behavior.
+
+    `bound` (2026-09-01, full-codebase review) is an optional
+    `(risk, reward, price) -> float` callable — in practice web/app.py's
+    compute_bounded_rr with this candidate's own atr_pct and multipliers already
+    applied. Injected rather than imported so this module stays dependency-free and,
+    more importantly, so the volatility bound is NEVER re-implemented here: every live
+    gate has used the bounded value since 2026-08-28, but these chart/sparkline
+    reconstructions kept returning the raw ratio, so for a volatile candidate the chart
+    drew the R/R curve crossing the gate line while the real bounded value the promotion
+    uses sat below it — and /api/near-miss/{ticker}/history's docstring claim that the
+    chart "matches exactly what has been driving a promotion decision" was false.
+    Omitting `bound` keeps the raw ratio, for callers that genuinely have no ATR data.
     """
     stop_pct = stop_loss_pct / 100
     stop = price * (1 - stop_pct)
     risk = price - stop
-    return (fair_value - price) / risk if risk > 0 and fair_value > 0 else None
+    if risk <= 0 or fair_value <= 0:
+        return None
+    reward = fair_value - price
+    return bound(risk, reward, price) if bound is not None else reward / risk
 
 
-def rr_points(price_history: list[tuple[float, float]], fair_value: float, stop_loss_pct: float) -> list[dict]:
+def rr_points(price_history: list[tuple[float, float]], fair_value: float,
+              stop_loss_pct: float, bound=None) -> list[dict]:
     """Reconstructs R/R at each recorded (timestamp, price) sample using rr_at_price.
     Points where the ratio can't be computed (invalid price/fair_value) get rr=None rather
     than being silently dropped, so callers can decide how to handle gaps.
+
+    `bound` is passed straight through to rr_at_price — see its docstring.
     """
     points = []
     for ts, price in price_history:
-        rr = rr_at_price(price, fair_value, stop_loss_pct)
+        rr = rr_at_price(price, fair_value, stop_loss_pct, bound)
         points.append({
             "t": ts,
             "price": round(price, 2),
@@ -84,6 +103,7 @@ def rr_sparkline(
     fair_value: float,
     stop_loss_pct: float,
     max_points: int = 40,
+    bound=None,
 ) -> list[dict]:
     """Compact R/R series for a card-level sparkline — {"t": ts, "rr": rr} per point. Capped
     at max_points so a full multi-week history of 60-second live samples plus daily backfill
@@ -102,7 +122,8 @@ def rr_sparkline(
     absent from the result (never fabricated), so the true output length can be less than
     max_points for a sparse/gappy history — that's honest, not a bug.
     """
-    points = [p for p in rr_points(price_history, fair_value, stop_loss_pct) if p["rr"] is not None]
+    points = [p for p in rr_points(price_history, fair_value, stop_loss_pct, bound)
+              if p["rr"] is not None]
     if len(points) <= max_points:
         return [{"t": p["t"], "rr": p["rr"]} for p in points]
     t_min, t_max = points[0]["t"], points[-1]["t"]

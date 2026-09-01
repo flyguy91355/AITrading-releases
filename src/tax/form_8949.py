@@ -88,7 +88,13 @@ _COLUMNS = ["Description", "Date Acquired", "Date Sold", "Proceeds",
 
 
 def write_csv(result: dict, output_path: Path) -> None:
-    with open(output_path, "w", newline="") as f:
+    # encoding= explicit (2026-09-01, full-codebase review) -- without it the tax
+    # deliverable's encoding silently depends on the machine that generated it (cp1252
+    # on the Windows dev box, UTF-8 on the Linux production box). Reason/Note strings in
+    # this codebase genuinely carry non-cp1252 characters ("⚠", "→", em-dashes in
+    # "Stop Loss (gap-through market sell) — ..."), so a real run could raise
+    # UnicodeEncodeError partway and leave a truncated Form 8949.
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["Part I -- Short-Term"])
         writer.writerow(_COLUMNS)

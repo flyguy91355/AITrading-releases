@@ -586,50 +586,45 @@ class Portfolio:
             col_types = {row[1]: row[2].upper() for row in cols}
             if col_types.get("shares", "") == "INTEGER":
                 await self._db.execute(f"ALTER TABLE {table} RENAME TO _{table}_old")
-                # Re-run the CREATE TABLE so the new schema is applied
-                if table == "positions":
-                    await self._db.execute("""
-                        CREATE TABLE positions (
-                            ticker TEXT PRIMARY KEY, shares REAL,
-                            entry_price REAL, current_price REAL, stop_loss REAL,
-                            take_profit_targets TEXT, sector TEXT, opened_at TEXT, trailing_stop REAL,
-                            day_open_price REAL, final_tranche_start_price REAL,
-                            realized_pnl REAL, shares_sold REAL,
-                            t1_target_price REAL, t2_target_price REAL,
-                            profit_target_hit INTEGER
-                        )
-                    """)
-                    # _positions_old already has day_open_price, final_tranche_start_price,
-                    # realized_pnl, shares_sold, t1_target_price, and t2_target_price by this
-                    # point (all six ALTER TABLE migrations above always run first) --
-                    # selected explicitly rather than via SELECT *, so the CAST(shares) still
-                    # lines up positionally.
-                    await self._db.execute(
-                        "INSERT INTO positions SELECT ticker, CAST(shares AS REAL), "
-                        "entry_price, current_price, stop_loss, take_profit_targets, "
-                        "sector, opened_at, trailing_stop, day_open_price, "
-                        "final_tranche_start_price, realized_pnl, shares_sold, "
-                        "t1_target_price, t2_target_price, profit_target_hit FROM _positions_old"
-                    )
-                else:
-                    await self._db.execute("""
-                        CREATE TABLE trade_history (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, action TEXT,
-                            shares REAL, price REAL, pnl REAL, timestamp TEXT, reason TEXT
-                        )
-                    """)
-                    # _trade_history_old may or may not have a reason column depending on
-                    # whether this rare INTEGER->REAL migration fires before or after the
-                    # reason-column migration above ever ran on this DB — check rather than
-                    # assume, so real reason data already recorded isn't silently dropped.
-                    async with self._db.execute("PRAGMA table_info(_trade_history_old)") as cur:
-                        _old_cols = {row[1] for row in await cur.fetchall()}
-                    _reason_select = "reason" if "reason" in _old_cols else "NULL"
-                    await self._db.execute(
-                        "INSERT INTO trade_history (id, ticker, action, shares, price, pnl, timestamp, reason) "
-                        f"SELECT id, ticker, action, CAST(shares AS REAL), price, pnl, timestamp, {_reason_select} "
-                        "FROM _trade_history_old"
-                    )
+                # Rebuilt from the OLD table's own real column list (fixed 2026-09-01,
+                # full-codebase review) rather than a hardcoded CREATE. The hardcoded
+                # version was frozen at its mid-2026-07 shape and never updated as later
+                # ALTERs accumulated, so it omitted trade_id and the seven buy_* columns
+                # that the ALTER migrations directly above this loop had just guaranteed
+                # exist. On a legacy DB that meant the copy silently DESTROYED the tax /
+                # win-loss trade_id lineage and every buy-rationale snapshot, and then
+                # every later _save_position and trade_history INSERT (both name those
+                # columns) raised "no such column" -- which those callers' fail-soft
+                # handlers misreport as "database locked", so nothing persisted at all
+                # until the next restart re-added the columns as NULL. Deriving the
+                # schema from what is actually present cannot drift again: whatever a
+                # future ALTER adds is carried through automatically.
+                async with self._db.execute(f"PRAGMA table_info(_{table}_old)") as cur:
+                    _old_info = await cur.fetchall()
+                _old_names = [row[1] for row in _old_info]
+                _defs = []
+                for _row in _old_info:
+                    _name, _type, _is_pk = _row[1], (_row[2] or "TEXT"), _row[5]
+                    if _name == "shares":
+                        _type = "REAL"  # the entire point of this migration
+                    _decl = f"{_name} {_type}"
+                    if _is_pk:
+                        # Preserve the original key shape: trade_history's synthetic
+                        # INTEGER id keeps AUTOINCREMENT, positions' ticker stays the
+                        # natural primary key.
+                        _decl += " PRIMARY KEY"
+                        if _name == "id" and _type.upper() == "INTEGER":
+                            _decl += " AUTOINCREMENT"
+                    _defs.append(_decl)
+                await self._db.execute(f"CREATE TABLE {table} ({', '.join(_defs)})")
+                # Columns named explicitly on BOTH sides -- never positional -- so the
+                # CAST can't silently line up against a different column.
+                _select_cols = ", ".join(
+                    f"CAST({n} AS REAL)" if n == "shares" else n for n in _old_names)
+                await self._db.execute(
+                    f"INSERT INTO {table} ({', '.join(_old_names)}) "
+                    f"SELECT {_select_cols} FROM _{table}_old"
+                )
                 await self._db.execute(f"DROP TABLE _{table}_old")
                 await self._db.commit()
                 logger.info("Migrated %s.shares from INTEGER to REAL", table)
@@ -956,22 +951,46 @@ class Portfolio:
             # available before it's lost for good. Skipped for a ticker with no real
             # buy-time rationale (pre-feature position, or a non-AI-driven signal source
             # like the admin rebuy utility) -- nothing worth a post-mortem without it.
-            if pos and pos.trade_id and pos.buy_thesis:
-                await self._db.execute(
-                    "INSERT OR IGNORE INTO sell_analysis "
-                    "(trade_id, ticker, buy_thesis, buy_reasoning, buy_conviction, buy_signal, "
-                    "buy_rr, buy_required_rr, buy_fair_value, entry_price, opened_at, closed_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        pos.trade_id, ticker, pos.buy_thesis, pos.buy_reasoning,
-                        pos.buy_conviction, pos.buy_signal, pos.buy_rr, pos.buy_required_rr,
-                        pos.buy_fair_value, pos.entry_price,
-                        pos.opened_at.isoformat() if pos.opened_at else None,
-                        datetime.now().isoformat(),
-                    ),
-                )
-                await self._db.commit()
+            await self.snapshot_sell_analysis(pos, ticker)
         return pnl
+
+    async def snapshot_sell_analysis(self, pos, ticker: str) -> None:
+        """Capture a closing position's buy-side rationale into sell_analysis, the row
+        the "Recent Sell" post-mortem queue later drains.
+
+        Extracted from close_position_async (2026-09-01, full-codebase review) because
+        it was NOT the only full-close path: _execute_take_profit_tranche pops the
+        position directly when a final tranche takes it to zero (deliberately, to avoid
+        double-recording trade_history), so a trade that exited entirely through
+        take-profits -- the cleanest wins, the ones most worth learning from -- never
+        got a post-mortem or fed anything forward into a later analysis of the same
+        ticker. Idempotent (INSERT OR IGNORE on trade_id), so calling it from both
+        paths can never duplicate a row.
+
+        Skipped for a ticker with no real buy-time rationale (pre-feature position, or
+        a non-AI-driven signal source like the admin rebuy utility) -- nothing worth a
+        post-mortem without it."""
+        if not self._db or not pos or not pos.trade_id or not pos.buy_thesis:
+            return
+        try:
+            await self._db.execute(
+                "INSERT OR IGNORE INTO sell_analysis "
+                "(trade_id, ticker, buy_thesis, buy_reasoning, buy_conviction, buy_signal, "
+                "buy_rr, buy_required_rr, buy_fair_value, entry_price, opened_at, closed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pos.trade_id, ticker, pos.buy_thesis, pos.buy_reasoning,
+                    pos.buy_conviction, pos.buy_signal, pos.buy_rr, pos.buy_required_rr,
+                    pos.buy_fair_value, pos.entry_price,
+                    pos.opened_at.isoformat() if pos.opened_at else None,
+                    datetime.now().isoformat(),
+                ),
+            )
+            await self._db.commit()
+        except Exception as e:
+            # Hot-path write, fail soft (same precedent as the other position writes) --
+            # a missing post-mortem must never break a real close.
+            logger.warning("Failed to snapshot sell_analysis for %s: %s", ticker, e)
 
     _SELL_ANALYSIS_COLUMNS = (
         "trade_id", "ticker", "buy_thesis", "buy_reasoning", "buy_conviction", "buy_signal",
@@ -1056,9 +1075,16 @@ class Portfolio:
         if not self._db:
             return []
         cols = ", ".join(self._SELL_ANALYSIS_COLUMNS)
+        # rowid DESC tiebreaker (2026-08-31, full-codebase review) -- two closes
+        # landing in the same datetime.now() tick (routine on Windows' coarser
+        # clock; the exact intermittent failure tests/test_sell_analysis.py's
+        # newest-first test showed) produce identical closed_at strings, and bare
+        # ORDER BY closed_at DESC then degrades to insertion order -- OLDEST
+        # first. A later insert is by construction the later close, so rowid is
+        # the correct deterministic tiebreak.
         async with self._db.execute(
             f"SELECT {cols} FROM sell_analysis WHERE ticker = ? AND post_mortem_thesis IS NOT NULL "
-            "ORDER BY closed_at DESC LIMIT ?",
+            "ORDER BY closed_at DESC, rowid DESC LIMIT ?",
             (ticker, limit),
         ) as cur:
             rows = await cur.fetchall()

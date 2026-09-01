@@ -61,13 +61,23 @@ class AdjustedLot:
 
 
 def _qualifying_buys(ticker: str, sold_date: str, events: list[TaxTradeEvent]) -> list[TaxTradeEvent]:
-    sold = datetime.fromisoformat(sold_date)
+    # Calendar dates, not raw datetimes (fixed 2026-09-01, full-codebase review) --
+    # the same correction holding_period.py already carries (second GitHub #52 pass,
+    # see its comment): the IRS 61-day window is calendar-date-to-calendar-date, but
+    # real trade timestamps always carry a genuine intraday fill time. Comparing full
+    # datetimes made a boundary-day replacement buy count or not purely on time of
+    # day -- a buy filled 30 calendar days before a 10:00 loss sale but at 09:30 fell
+    # outside the window, so the loss was NOT disallowed and Form 8949 understated the
+    # taxable gain. One-sided in exactly that direction (intraday math can only shrink
+    # the two edge days), and this system's own ~30-day wash-sale rebuy cooldown makes
+    # edge-of-window rebuys the likely case rather than a curiosity.
+    sold = datetime.fromisoformat(sold_date).date()
     window_start = sold - timedelta(days=_WASH_SALE_WINDOW_DAYS)
     window_end = sold + timedelta(days=_WASH_SALE_WINDOW_DAYS)
     return sorted(
         (e for e in events
          if e.is_buy and e.ticker == ticker
-         and window_start <= datetime.fromisoformat(e.timestamp) <= window_end),
+         and window_start <= datetime.fromisoformat(e.timestamp).date() <= window_end),
         key=lambda e: e.timestamp,
     )
 
@@ -81,10 +91,24 @@ def apply_wash_sale_adjustments(
     # Total shares per (ticker, acquired_date), computed once -- lets a basis increase
     # be distributed proportionally across every split tranche of the same replacement
     # buy instead of being applied in full to each one independently.
+    #
+    # Sourced from the BUY EVENTS (the replacement lot's full purchased quantity), not
+    # from whichever of its tranches happen to have closed by the time the report is
+    # run (fixed 2026-08-31, GitHub #115). A ClosedLot's acquired_date IS its originating
+    # buy event's timestamp (see lot_matching._OpenLot), so the two key spaces line up
+    # exactly. Using only the closed tranches made the split depend on RUN DATE: with 1
+    # of 3 tranches sold, that tranche absorbed 100% of the disallowed loss; re-running
+    # the SAME already-filed tax year later, after the other 2 closed, silently
+    # recomputed that same row's Cost Basis and Gain/Loss to different numbers. Off the
+    # total purchased shares, each tranche's share is fixed forever, and the portion
+    # belonging to still-open shares correctly stays with those shares (to be reported
+    # in whatever year they actually sell) rather than being crammed into an earlier year.
     shares_by_key: dict[tuple[str, str], float] = {}
-    for lot in closed_lots:
-        key = (lot.ticker, lot.acquired_date)
-        shares_by_key[key] = shares_by_key.get(key, 0.0) + lot.shares
+    for event in all_events:
+        if not event.is_buy:
+            continue
+        key = (event.ticker, event.timestamp)
+        shares_by_key[key] = shares_by_key.get(key, 0.0) + event.shares
 
     basis_increases: dict[tuple[str, str], float] = {}
     results: list[AdjustedLot] = []
@@ -95,6 +119,11 @@ def apply_wash_sale_adjustments(
 
         for lot in closed_lots:
             key = (lot.ticker, lot.acquired_date)
+            # Falls back to this lot's own shares only if no buy event matches its
+            # acquired_date at all -- impossible from a real full-history replay (the
+            # acquired_date came from a buy event), so this only ever fires for a
+            # hand-constructed lot list, where "this lot is the whole purchase" is the
+            # sanest assumption available.
             total_shares = shares_by_key.get(key) or lot.shares
             # Defensive (2026-08-08, caught by adversarial testing, not a live incident):
             # a genuinely malformed 0-share ClosedLot -- shouldn't occur from real trade

@@ -11,6 +11,8 @@ specifically to avoid a circular import -- `engine.py` already imports
 function back from `engine.py` directly would be circular.
 """
 
+import math
+
 
 def market_cap_tier_label(market_cap: float) -> str:
     """Human-readable size tier for a market cap in dollars (2026-08-04, "billion dollar
@@ -23,8 +25,16 @@ def market_cap_tier_label(market_cap: float) -> str:
     (src/research/competitor.py) derives its own richer descriptive phrase from, so the
     two can no longer independently drift the way they did before this extraction.
     Returns "" for a non-positive/unknown market cap so the caller can omit the context
-    line entirely rather than asserting a tier it has no real data for."""
-    if market_cap <= 0:
+    line entirely rather than asserting a tier it has no real data for -- including a
+    NaN/Infinity market cap (2026-08-31, GitHub #113): every comparison below is False
+    for NaN, so an unknown cap used to fall all the way through to "small-cap" and tell
+    Claude a transiently-unpriced mega-cap was a small-cap, tightening the dip-entry
+    staleness tolerance in exactly the wrong direction."""
+    try:
+        market_cap = float(market_cap)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(market_cap) or market_cap <= 0:
         return ""
     if market_cap >= 200_000_000_000:
         return "mega-cap"

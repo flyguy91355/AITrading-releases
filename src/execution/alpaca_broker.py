@@ -10,6 +10,7 @@ from datetime import datetime
 import alpaca_trade_api as tradeapi
 
 from src.execution.broker import Broker, Order, OrderSide, OrderType, OrderStatus, AccountInfo
+from src.analytics.composition_benchmark import is_usable_price
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,34 @@ ALPACA_STATUS_MAP = {
 # Exponential backoff delays (seconds) for the rate-limit retry below, plus a small random
 # jitter added at call time -- overridable in tests via monkeypatch to avoid real sleeps.
 _RATE_LIMIT_RETRY_DELAYS = [0.5, 1.0, 2.0]
+
+
+def format_qty(quantity: float) -> str:
+    """Format a share quantity as the literal string Alpaca's REST API receives as `qty`.
+
+    Fixed-point formatting, never str(float) (fixed 2026-08-31, GitHub #114) -- Python's
+    str() switches a float to exponential notation once its magnitude drops below 1e-4
+    (str(round(0.000036, 9)) -> '3.6e-05'), and that literal string was being sent to
+    Alpaca as the order quantity. Not hypothetical: OrderManager._resolve_retry_quantity
+    (GitHub #89/#93) parses Alpaca's own "available: N" residual out of an insufficient-qty
+    rejection and feeds it straight back into a retry submission -- a mechanism that exists
+    specifically for tiny float-drift/settlement-lag residuals, exactly the magnitudes where
+    str() flips to exponential. A malformed qty is rejected again, defeating the retry the
+    code was built for and potentially leaving a real residual position unprotected.
+
+    Whole numbers keep the plain str(int(...)) form ("12", not "12.0") -- Alpaca uses a
+    non-fractional qty to decide GTC eligibility, and this codebase's own callers pair that
+    with their own `quantity % 1` time_in_force checks.
+
+    Shared by submit_order and replace_order (they carried byte-identical copies of this
+    logic before this fix), per this project's standing "one helper so it can't drift"
+    pattern -- see GitHub #88/#89.
+    """
+    if quantity % 1:
+        qty_str = f"{quantity:.9f}".rstrip("0").rstrip(".")
+    else:
+        qty_str = str(int(quantity))
+    return qty_str or "0"
 
 
 class AlpacaBroker(Broker):
@@ -85,6 +114,26 @@ class AlpacaBroker(Broker):
 
         if not base_url:
             base_url = "https://paper-api.alpaca.markets" if self.paper else "https://api.alpaca.markets"
+
+        # self.paper follows the endpoint ACTUALLY in use, not the config flag
+        # alone (fixed 2026-08-31, full-codebase review) -- ALPACA_BASE_URL from
+        # the env wins the URL choice above, so a live URL in .env with
+        # trading.paper_trading still true traded the LIVE account while this
+        # flag stayed True: every real-money trade got stamped is_paper=True at
+        # all 13 log_trade sites and was unconditionally EXCLUDED from the Form
+        # 8949 tax report (inverting the tax feature's load-bearing
+        # paper-exclusion guarantee), with the dashboard still showing the PAPER
+        # badge. The endpoint is the ground truth for which account gets traded,
+        # so it is the ground truth for this flag too.
+        effective_paper = "paper-api.alpaca.markets" in base_url
+        if effective_paper != self.paper:
+            logger.warning(
+                "trading.paper_trading=%s contradicts ALPACA_BASE_URL (%s) — trusting "
+                "the endpoint actually in use: paper=%s. Fix whichever of the two is "
+                "wrong; is_paper trade stamping follows the endpoint.",
+                self.paper, base_url, effective_paper,
+            )
+            self.paper = effective_paper
 
         self.api = tradeapi.REST(api_key, secret_key, base_url, api_version="v2")
 
@@ -136,8 +185,21 @@ class AlpacaBroker(Broker):
     async def submit_order(self, order: Order) -> Order:
         side = "buy" if order.side == OrderSide.BUY else "sell"
 
-        # Use notional (dollar amount) for fractional market buys; qty for everything else
-        if order.notional_value and order.side == OrderSide.BUY and order.order_type == OrderType.MARKET:
+        # Use notional (dollar amount) for fractional market buys; qty for everything else.
+        # Computed once and reused below (fixed 2026-08-31, GitHub #138) -- the second and
+        # third checks used to test bare `order.notional_value` truthiness with no
+        # side/type condition, so an Order carrying a truthy notional_value alongside a
+        # non-market or non-buy order_type would build qty kwargs here but then have the
+        # whole type/stop_price/limit_price elif chain swallowed below, submitting as a
+        # bare market order. Unreachable via today's one live call site (_execute_buy
+        # always builds BUY/MARKET), but a real landmine for any future caller.
+        use_notional = (
+            bool(order.notional_value)
+            and order.side == OrderSide.BUY
+            and order.order_type == OrderType.MARKET
+        )
+
+        if use_notional:
             kwargs = {
                 "symbol": order.ticker,
                 "notional": str(round(order.notional_value, 2)),
@@ -146,16 +208,13 @@ class AlpacaBroker(Broker):
                 "time_in_force": "day",
             }
         else:
-            qty_str = str(round(order.quantity, 9)).rstrip("0").rstrip(".") if order.quantity % 1 else str(int(order.quantity))
-            if not qty_str or qty_str == ".":
-                qty_str = "0"
             kwargs = {
                 "symbol": order.ticker,
-                "qty": qty_str,
+                "qty": format_qty(order.quantity),
                 "side": side,
             }
 
-        if order.notional_value:
+        if use_notional:
             pass  # kwargs already complete (notional market buy built above)
 
         elif order.order_type == OrderType.MARKET:
@@ -210,7 +269,7 @@ class AlpacaBroker(Broker):
             except (ValueError, TypeError):
                 pass
 
-        if order.notional_value:
+        if use_notional:
             logger.info("Alpaca order submitted: %s %s $%.2f notional — ID: %s, Status: %s",
                         order.side.value, order.ticker, order.notional_value,
                         order.broker_order_id, order.status.value)
@@ -252,8 +311,7 @@ class AlpacaBroker(Broker):
         "fall back to cancel+place", not a fatal error; this method never raises."""
         kwargs: dict = {}
         if qty is not None:
-            qty_str = str(round(qty, 9)).rstrip("0").rstrip(".") if qty % 1 else str(int(qty))
-            kwargs["qty"] = qty_str or "0"
+            kwargs["qty"] = format_qty(qty)
         if stop_price is not None:
             kwargs["stop_price"] = str(round(stop_price, 2))
         if limit_price is not None:
@@ -435,12 +493,43 @@ class AlpacaBroker(Broker):
             return []
 
     async def get_quote(self, ticker: str) -> float | None:
-        """Not currently called anywhere live (2026-08-08 audit confirmed) -- every real
-        quote fetch in this codebase goes through MarketDataFetcher.get_quote() (yfinance)
-        instead. Kept for interface completeness/future use, and hardened to match every
-        other AlpacaBroker method's rate-limit retry for the same reason -- an unused
-        method that silently skips this codebase's own established resilience pattern is
-        exactly the kind of inconsistency a future caller would unknowingly inherit."""
+        """Latest Alpaca quote price (ask, falling back to bid), or None if neither is
+        available -- callers must handle None; see Broker.get_quote's own note.
+
+        REAL, LOAD-BEARING CALL SITES (docstring corrected 2026-08-31, GitHub #140 -- it
+        previously claimed, wrongly, that nothing called this live; that claim was written
+        during the 2026-08-08 audit and both call sites below either postdate it or were
+        missed by it). Most routine quote fetching in this codebase does go through
+        MarketDataFetcher.get_quote() (yfinance), but not these two:
+
+          - OrderManager._log_unreconciled_fill (src/execution/order_manager.py) -- the
+            2026-08-20 BEN-incident path. Supplies the honest "roughly where this traded"
+            price recorded to trade_history for a real share-count delta whose actual
+            Alpaca order couldn't be matched. That is a real-money reconciliation record.
+          - web/app.py's _rebuy_legacy_positions -- sources the current price used to
+            compute the rebought position's stop-loss and take-profit levels.
+
+        Treat this as live code: it keeps the same rate-limit retry every other real
+        AlpacaBroker call uses, and a behavior change here reaches both paths above."""
         quote = await self._call_with_rate_limit_retry(self.api.get_latest_quote, ticker)
-        price = quote.ap if quote.ap is not None else quote.bp
-        return float(price) if price is not None else None
+        # A non-positive or non-finite ask is NOT a usable quote (fixed 2026-09-01,
+        # full-codebase review) -- this used to None-check only, so Alpaca's documented
+        # ask=$0 reading near a session boundary (the BEN incident, quoted in
+        # web/app.py's _exit_order_maintenance_window_open) was returned as a real price
+        # of 0.0. _rebuy_legacy_positions checks only `is None`, so 0.0 flowed through
+        # into `stop_loss = round(price * (1 - sl), 2)` = 0.0; the notional buy has no
+        # division by price so it executed fine, and the resulting position then failed
+        # sync_exit_orders' `pos.stop_loss <= 0` guard forever -- a live position that
+        # could never get a stop placed, against this project's mandatory-stop rule.
+        # Falling through ask -> bid -> None lets every caller's existing None handling
+        # do the right thing instead.
+        for candidate in (quote.ap, quote.bp):
+            if candidate is None:
+                continue
+            try:
+                value = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if is_usable_price(value) and value > 0:
+                return value
+        return None

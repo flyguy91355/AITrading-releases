@@ -33,15 +33,18 @@ from src.decision.portfolio import Portfolio
 
 
 def load_config() -> dict:
-    with open(Path(__file__).resolve().parent.parent / "config" / "settings.yaml") as f:
-        return yaml.safe_load(f)
+    # encoding= explicit (2026-09-01) -- CLAUDE.md's Windows rule names scripts/**, and
+    # bare open() escapes the read_text/write_text AST test that enforces it.
+    return yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "config" / "settings.yaml")
+        .read_text(encoding="utf-8"))
 
 
 def load_reports_cache() -> dict:
     path = Path(__file__).resolve().parent.parent / "data" / "reports_cache.json"
     try:
-        return json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
 
 

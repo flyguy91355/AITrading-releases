@@ -1322,6 +1322,11 @@ function connect() {
 // entries; seenLogKeys guards against that specifically for this path.
 let fallbackPollTimer = null;
 const seenLogKeys = new Set();
+// Throttle for the one expensive endpoint the fallback poll touches -- see the comment at
+// its call site in fallbackPollTick (2026-08-31, GitHub #149). Reset by
+// startFallbackPolling so a fresh outage always refetches once immediately.
+const FALLBACK_REPORTS_INTERVAL_MS = 5 * 60 * 1000;
+let _lastFallbackReportsFetch = 0;
 
 function logKey(entry) {
   return `${entry.timestamp}|${entry.ticker}|${entry.phase}|${entry.content}`;
@@ -1352,7 +1357,20 @@ async function fallbackPollTick() {
     // stay stuck disabled through an entire disconnect-fallback-polling session.
     setFullScanButtonState(!!data.full_scan_in_progress);
     fetchTradeHistory();
-    fetchResearchReports();
+    // /api/research-reports is the one genuinely expensive fetch here (documented above
+    // in fetchResearchReports as having grown to several MB -- it's why it was moved off
+    // the WS init payload in the first place). Re-downloading it on every 10s tick for
+    // the whole duration of an outage hammers client and server alike, for data that
+    // changes at most a few times an hour. Fetched once when the fallback first engages,
+    // then on its own much slower cadence (2026-08-31, GitHub #149). Every other endpoint
+    // above keeps the full 10s freshness -- they're all cheap.
+    if (Date.now() - _lastFallbackReportsFetch >= FALLBACK_REPORTS_INTERVAL_MS) {
+      _lastFallbackReportsFetch = Date.now();
+      fetchResearchReports();
+      // Deep dives are the same shape of cost (2026-09-01) -- large, slow-changing --
+      // so they share the reports cadence rather than the 10s tick.
+      fetchDeepDiveReports();
+    }
     fetchPerformanceSparklines();
   } catch (e) {
     console.warn('Fallback poll failed:', e);
@@ -1361,6 +1379,7 @@ async function fallbackPollTick() {
 
 function startFallbackPolling() {
   if (fallbackPollTimer !== null) return;  // already running
+  _lastFallbackReportsFetch = 0;  // a new outage always gets one immediate reports refresh
   fallbackPollTick();  // fire immediately rather than waiting a full interval
   fallbackPollTimer = setInterval(fallbackPollTick, 10000);
 }
@@ -1374,7 +1393,11 @@ function handleMessage(msg) {
   switch (msg.type) {
     case 'init':
       heldTickers = new Set((msg.portfolio.positions || []).map(p => p.ticker));
+      // Lazily fetched (2026-09-01) rather than carried in this payload — see
+      // fetchDeepDiveReports. Kept tolerant of the old shape so a stale cached page
+      // against a new server still populates the history dropdown.
       if (msg.deep_dive_reports) { deepDiveReports = msg.deep_dive_reports; updateDDHistory(); }
+      else fetchDeepDiveReports();
       updatePortfolio(msg.portfolio);
       msg.ai_log.forEach(entry => appendAiLog(entry));
       updateSignals(msg.signals);
@@ -1405,12 +1428,6 @@ function handleMessage(msg) {
 
     case 'first_scan_done':
       document.getElementById('firstScanBanner').style.display = 'none';
-      break;
-
-    case 'watchlist_rr_update':
-      // Dead as of 2026-07-17 (On Deck replaced the Watchlist as the sole buy path) —
-      // watchlist_rr_loop no-ops on an empty watchlist and never actually sends this, but
-      // the handler is left harmless in case that loop is ever revived.
       break;
 
     case 'portfolio':
@@ -1541,29 +1558,54 @@ function stockBtn(ticker) { return document.getElementById(btnId(ticker)); }
 // cards (renderNearMissGrid) carry id="btn-{ticker}" again specifically so this live push has a
 // target. (Was previously described as coming from analyze_stock_with_logging, a ~200-line
 // older/parallel analysis path with zero real callers — deleted 2026-08-09, GitHub #73.)
+// Single source of truth for an On Deck/On Shore card's signal badge (2026-08-31,
+// GitHub #120) -- shared by BOTH the full grid re-render (renderNearMissGrid /
+// renderTodayScanGrid) and the live WebSocket push (updateTickerSignal below), which
+// each used to carry their own independent copy of this decision. The live-push copy was
+// missing the `rr >= requiredRR` gate entirely, so a ticker_signal message could flip a
+// card straight to "Buy"/"Strong Buy" -- or to a Hold/Sell/No Action badge these cards
+// deliberately stopped showing on 2026-08-12 -- for a candidate that hasn't actually
+// cleared its own conviction-scaled R/R gate, reading as "this should already be bought"
+// for exactly the case On Deck exists to say it ISN'T. It self-corrected on the next 60s
+// re-render, so the misleading badge was visible for up to a minute after every push.
+//
+// Returns [cssClass, label]. Only BUY/STRONG BUY ever produce a visible badge, and only
+// once R/R has genuinely reached this candidate's own gate; everything else resolves to
+// sig-none (transparent, same DOM slot -- hides the badge without shifting layout).
+function signalBadgeFor(signal, rr, requiredRR) {
+  const gate = requiredRR != null ? requiredRR : _MIN_RR_GATE;
+  if ((rr || 0) < gate) return ['sig-none', ''];
+  const sig = (signal || '').trim().toUpperCase();
+  if (sig === 'STRONG BUY') return ['sig-sbuy', 'Strong Buy'];
+  if (sig === 'BUY') return ['sig-buy', 'Buy'];
+  return ['sig-none', ''];
+}
+
 function updateTickerSignal(badge) {
   const btn = stockBtn(badge.ticker);
   if (!btn) return;
 
-  const sig = (badge.signal || '').trim().toUpperCase();
   const sigEl = btn.querySelector('.btn-sig-code');
   if (!sigEl) return;
 
-  // Map signal string → display label + CSS class
-  let shortCode, cssClass, btnClass;
-  if (sig === 'STRONG BUY')       { shortCode = 'Strong Buy';  cssClass = 'sig-sbuy';  btnClass = 'has-sbuy'; }
-  else if (sig === 'BUY')         { shortCode = 'Buy';         cssClass = 'sig-buy';   btnClass = 'has-buy'; }
-  else if (sig === 'HOLD')        { shortCode = 'Hold';        cssClass = 'sig-hold';  btnClass = 'has-hold'; }
-  else if (sig === 'SELL')        { shortCode = 'Sell';        cssClass = 'sig-sell';  btnClass = 'has-sell'; }
-  else if (sig === 'STRONG SELL') { shortCode = 'Strong Sell'; cssClass = 'sig-ssell'; btnClass = 'has-ssell'; }
-  else if (sig === 'NO ACTION')   { shortCode = 'No Action';   cssClass = 'sig-na';    btnClass = ''; }
-  else                            { shortCode = '';            cssClass = 'sig-none';  btnClass = ''; }
+  // rr/required_rr come from the card's own already-fetched data object -- the
+  // ticker_signal payload carries only the signal string, and the gate is per-candidate.
+  // No matching data object (a card whose data was dropped between renders) resolves to
+  // rr 0, i.e. no badge -- deliberately the conservative direction for this check.
+  const which = _onDeckOrShore(badge.ticker);
+  const nm = which ? which.obj : null;
+  const [cssClass, shortCode] = signalBadgeFor(
+    badge.signal,
+    nm ? nm.rr : 0,
+    nm && nm.required_rr != null ? nm.required_rr : null,
+  );
 
   sigEl.textContent = shortCode;
   sigEl.className = 'btn-sig-code ' + cssClass;
 
   btn.classList.remove('has-sbuy','has-buy','has-hold','has-sell','has-ssell','has-new','scanning');
-  if (btnClass) btn.classList.add(btnClass);
+  if (cssClass === 'sig-sbuy') btn.classList.add('has-sbuy');
+  else if (cssClass === 'sig-buy') btn.classList.add('has-buy');
 }
 
 // ── Scan progress ──────────────────────────────────────────────────────────
@@ -1807,6 +1849,34 @@ const PERF_BENCHMARK_COLOR = '#d95926';  // categorical slot 6 (orange)
 // family at a time -- see docs/superpowers/specs/2026-07-27-tradingview-charts-design.md.
 function _lwcColor(varName) {
   return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+}
+
+// Shared LightweightCharts disposal (2026-08-31, GitHub #118/#119) ─────────────
+// Every chart mounter in this file stashes its instance on the container element as
+// `_lwcChart` and disposes a previous one before re-mounting -- but that guard can only
+// ever fire when the SAME container element is reused. It is structurally useless
+// wherever a container's parent gets its innerHTML replaced (the 60s On Deck/On Shore
+// card-grid rebuild, every modal body rewrite), because the replacement container is a
+// brand-new DOM node that never carries the property -- the old node, and the live
+// LightweightCharts instance still attached to it, are simply abandoned.
+//
+// disposeChartsIn(root) walks a subtree (root included) and disposes every chart it
+// finds, so the "before you throw this DOM away, dispose what's mounted in it" step is
+// one shared function rather than the N ad-hoc re-implementations this codebase has
+// repeatedly drifted apart on. Call it immediately before replacing a subtree's markup,
+// and on every modal-close path.
+function disposeChartsIn(root) {
+  if (!root) return;
+  const dispose = (el) => {
+    if (el && el._lwcChart) {
+      // A chart whose container was already detached can throw from .remove() in some
+      // Lightweight Charts versions -- swallow it; the instance is going away regardless.
+      try { el._lwcChart.remove(); } catch (e) { /* already disposed */ }
+      el._lwcChart = null;
+    }
+  };
+  dispose(root);
+  if (root.querySelectorAll) root.querySelectorAll('*').forEach(dispose);
 }
 
 function renderLightweightChart(container, seriesConfigs, opts) {
@@ -3213,11 +3283,24 @@ function setStockView(view) {
     // ticker (concurrent, capped), which took ~7s for 72 stocks in testing. With no
     // indicator at all, that delay reads as "the button did nothing" rather than "still
     // working" -- confirmed live, this is exactly what was reported as looking hung up.
-    document.getElementById('stockGrid').innerHTML =
+    setStockGridHtml(
       '<div style="color:var(--text-muted);padding:20px;text-align:center;font-size:12px;">' +
-      '<span class="flash-red">Loading</span> — fetching live prices for today’s scan rejects...</div>';
+      '<span class="flash-red">Loading</span> — fetching live prices for today’s scan rejects...</div>');
     fetchTodayScan();  // re-fetch on each switch -- only changes 1-2x/day, no need to poll
   }
+}
+
+// Single choke point for replacing the card grid's markup (2026-08-31, GitHub #118).
+// renderNearMissGrid re-runs on every 60s fetchNearMiss poll and every view switch, and
+// each card's chart box (#rrspark-TICKER) is a brand-new node afterwards -- so without
+// disposing first, one LightweightCharts instance per visible ticker was orphaned every
+// single minute for as long as the tab stayed open. Every stockGrid.innerHTML write goes
+// through here so a future one can't independently forget the disposal step.
+function setStockGridHtml(html) {
+  const grid = document.getElementById('stockGrid');
+  if (!grid) return;
+  disposeChartsIn(grid);
+  grid.innerHTML = html;
 }
 
 // Mirrors the configured min_risk_reward_ratio (2.1 as of this writing) — update here if
@@ -3433,15 +3516,22 @@ function dateRangeCaption(points) {
   return `${fmt(start)} → ${fmt(end)}`;
 }
 
-// Composite score also used by On Shore and the backend's _on_deck_candidate_score
-// (cap-trim/refill decisions) -- kept as the WITHIN-TIER tiebreaker below, not the sole sort
+// Mirror of the backend's _on_deck_composite_score (web/app.py), which drives the real
+// cap-trim/swap decisions -- kept as the WITHIN-TIER tiebreaker below, not the sole sort
 // key. A blended score alone isn't accurate to real buying priority: a stock stuck below the
 // conviction gate can post a huge R/R bonus and still outrank a fully-eligible stock that's
 // just waiting on the live uptick confirmation -- eligibility has to come first.
+//
+// The (rr - required_rr) term is capped at 0 once rr clears the gate, matching the backend
+// (fixed there 2026-08-12, OKE/BMY incident; mirrored here 2026-09-01, full-codebase review).
+// Without the cap this list ordered above-gate candidates by how far past the gate they'd
+// run, so the card the user saw at the top was not the one the backend ranked first -- and
+// they'd watch their apparent #1 get swapped out. (The old comment here also named a
+// backend function that had since been removed outright.)
 function _onDeckScore(nm) {
   const requiredRr = nm.required_rr || 0;
-  return (nm.conviction_score || 0) + (nm.margin_of_safety_pct || 0) / 10
-    + ((nm.rr || 0) - requiredRr) * 2;
+  const rrVsGate = Math.min((nm.rr || 0) - requiredRr, 0);
+  return (nm.conviction_score || 0) + (nm.margin_of_safety_pct || 0) / 10 + rrVsGate * 2;
 }
 
 // Mirrors research.min_conviction_score -- fetched live from /api/conviction-gate-config on
@@ -3545,8 +3635,10 @@ async function openAiCostHistoryPopup() {
   document.getElementById('ddModalTicker').textContent = 'AI Cost History';
   document.getElementById('ddModalBizSummary').textContent = '';
   document.querySelector('#deepDiveModal .trade-modal').style.width = '640px';
-  document.getElementById('ddModalBody').innerHTML =
-    '<div style="padding:12px;color:var(--text-muted);">Loading…</div>';
+  // spinnerHtml(), same as every other popup here (2026-08-31, GitHub #165). This one
+  // was added after the #148 sweep and reintroduced the plain-div pattern; /api/ai-cost-history
+  // reads a real on-disk history file, so it's a genuine fetch delay like the others.
+  document.getElementById('ddModalBody').innerHTML = spinnerHtml();
   document.getElementById('deepDiveModal').classList.add('active');
 
   let data;
@@ -3577,8 +3669,10 @@ async function openAboutPanel() {
   document.getElementById('ddModalTicker').textContent = 'About';
   document.getElementById('ddModalBizSummary').textContent = '';
   document.querySelector('#deepDiveModal .trade-modal').style.width = '640px';
-  document.getElementById('ddModalBody').innerHTML =
-    '<div style="padding:12px;color:var(--text-muted);">Loading…</div>';
+  // spinnerHtml(), matching every other popup in this file (2026-08-31, GitHub #148) --
+  // /api/about hits GitHub live for the release list, so this is a real fetch delay that
+  // deserves the same spinner as openWinLossPopup/openPerformancePopup/openChartExpand.
+  document.getElementById('ddModalBody').innerHTML = spinnerHtml();
   document.getElementById('deepDiveModal').classList.add('active');
 
   let data;
@@ -3745,19 +3839,16 @@ function renderNearMissGrid(data) {
     return pa.tier !== pb.tier ? pb.tier - pa.tier : pb.score - pa.score;
   });
   if (items.length === 0) {
-    document.getElementById('stockGrid').innerHTML =
+    setStockGridHtml(
       '<div style="color:var(--text-muted);padding:20px;text-align:center;font-size:12px;">' +
       `No on-deck candidates right now — good stocks (conviction ${_MIN_CONVICTION_GATE.toFixed(1)}+) ` +
-      'rejected only on R/R appear here, watched for a price recovery + confirmed uptick.</div>';
+      'rejected only on R/R appear here, watched for a price recovery + confirmed uptick.</div>');
     return;
   }
-  // Signal badge label/class — same mapping updateTickerSignal() uses for the live-push path,
-  // duplicated here (not shared) since this one runs at render time from nm.signal (a plain
-  // string on the data object) rather than reacting to a WS badge event.
-  const _sigMap = {
-    'STRONG BUY': ['sig-sbuy', 'Strong Buy'],
-    'BUY':        ['sig-buy',  'Buy'],
-  };
+  // Signal badge label/class comes from the shared signalBadgeFor() helper, which
+  // updateTickerSignal()'s live-push path now also calls (2026-08-31, GitHub #120) -- this
+  // used to be a duplicated local _sigMap + gate check here, and the live path's own copy
+  // had silently drifted to omitting the gate entirely.
   // Two explicit JS-rendered columns (fixed 2026-07-19), not CSS multi-column (`columns:2`).
   // Multi-column layout has a real footgun: once the container's cross-size (height, since
   // overflow-y:auto implies a bounded height) is constrained, the spec has the browser add
@@ -3798,8 +3889,7 @@ function renderNearMissGrid(data) {
     // for a candidate the system won't actually promote yet. sig-none (transparent,
     // same slot) hides it without disturbing layout; "need >=X.XX" stays visible
     // either way so the gap to a real buy is still shown.
-    const rrClearedGate = (nm.rr || 0) >= requiredRR;
-    const [sigClass, sigLabel] = rrClearedGate ? (_sigMap[nm.signal] || ['sig-none', '']) : ['sig-none', ''];
+    const [sigClass, sigLabel] = signalBadgeFor(nm.signal, nm.rr, requiredRR);
     const addedMs = nm.added_at ? new Date(nm.added_at).getTime() : 0;
     // "NEW" badge dropped (2026-08-12, owner request) -- with how often On Deck now
     // churns, nearly every card qualified as "added within 24h" anyway, so the badge had
@@ -3848,7 +3938,7 @@ function renderNearMissGrid(data) {
   // panel. .stock-col still wraps the list (flex:1;min-width:0), just with one column
   // instead of two now.
   const cards = items.map((nm, i) => renderCard(nm, i)).join('');
-  document.getElementById('stockGrid').innerHTML = `<div class="stock-col">${cards}</div>`;
+  setStockGridHtml(`<div class="stock-col">${cards}</div>`);
   items.forEach(async nm => {
     const el = document.getElementById('rrspark-' + nm.ticker);
     if (!el) return;
@@ -3872,9 +3962,9 @@ function renderTodayScanGrid(data) {
       || (r.sector || '').toLowerCase().includes(q));
   }
   if (items.length === 0) {
-    document.getElementById('stockGrid').innerHTML =
+    setStockGridHtml(
       '<div style="color:var(--text-muted);padding:20px;text-align:center;font-size:12px;">' +
-      'No scan rejects yet today — populated after the next pre-open universe scan.</div>';
+      'No scan rejects yet today — populated after the next pre-open universe scan.</div>');
     return;
   }
   // Matches On Deck's own _sigMap exactly (2026-08-12, owner request: "the on shore
@@ -3883,11 +3973,8 @@ function renderTodayScanGrid(data) {
   // On Deck; Hold/Sell/Strong Sell/No Action all fall through to the blank default,
   // where On Deck's own signal set never included them in the first place. Previously
   // On Shore had a much wider map showing all six signals, plus a literal "N/A" text
-  // fallback for anything unrecognized.
-  const _sigMap = {
-    'STRONG BUY': ['sig-sbuy', 'Strong Buy'],
-    'BUY':        ['sig-buy',  'Buy'],
-  };
+  // fallback for anything unrecognized. Both grids and the live WS push now share one
+  // signalBadgeFor() helper (2026-08-31, GitHub #120) rather than each keeping a copy.
   const renderCard = (r) => {
     const requiredRR = r.required_rr != null ? r.required_rr : _MIN_RR_GATE;
     // Colors green when rr sits in the qualifying [floor, gate] range -- see the matching
@@ -3896,8 +3983,7 @@ function renderTodayScanGrid(data) {
     const convColor = (r.conviction_score || 0) >= _MIN_CONVICTION_GATE ? 'var(--green)' : 'var(--text-primary)';
     // Same "not really a buy yet" fix as the On Deck card above -- badge only shows once
     // R/R has actually reached its own gate.
-    const rrClearedGate = (r.rr || 0) >= requiredRR;
-    const [sigClass, sigLabel] = rrClearedGate ? (_sigMap[r.signal] || ['sig-none', '']) : ['sig-none', ''];
+    const [sigClass, sigLabel] = signalBadgeFor(r.signal, r.rr, requiredRR);
     const priceStr = r.last_price ? `$${r.last_price.toFixed(2)}` : '';
     const fv = r.fair_value_estimate || 0;
     const mos = r.margin_of_safety_pct || 0;
@@ -3937,13 +4023,26 @@ function renderTodayScanGrid(data) {
   };
   // Single column (2026-07-27), matching renderNearMissGrid's change -- see its comment.
   const cards = items.map(renderCard).join('');
-  document.getElementById('stockGrid').innerHTML = `<div class="stock-col">${cards}</div>`;
+  setStockGridHtml(`<div class="stock-col">${cards}</div>`);
   items.forEach(async r => {
     const el = document.getElementById('rrspark-' + r.ticker);
     if (!el) return;
     const points = await _getCardCandlePoints(r.ticker);
     renderCardCandleLWC(document.getElementById('rrspark-' + r.ticker), points);
   });
+}
+
+async function fetchDeepDiveReports() {
+  // Moved off the WS init payload (2026-09-01) for the same reason research reports
+  // were — the dict only grows (~810KB already) and the init payload is what the
+  // 10s disconnect-fallback poll re-sends in full. Fetched lazily here instead;
+  // individual fresh deep dives still arrive live via the deep_dive_report message.
+  try {
+    const resp = await fetch('/api/deep-dive-reports');
+    if (!resp.ok) return;
+    deepDiveReports = await resp.json();
+    updateDDHistory();
+  } catch(e) { console.error('fetchDeepDiveReports:', e); }
 }
 
 async function fetchResearchReports() {
@@ -4419,7 +4518,14 @@ async function showPositionDetail(ticker) {
   }
 }
 
-function closeModal() { document.getElementById('reportModal').classList.remove('active'); }
+function closeModal() {
+  document.getElementById('reportModal').classList.remove('active');
+  // Same leak class as the chart-expand/Deep Dive modals (2026-08-31, GitHub #119):
+  // showPositionDetail rewrites #reportContent on every open, so its #posChartMount
+  // price chart is a brand-new node each time and the previous instance was never
+  // disposed by anything.
+  disposeChartsIn(document.getElementById('reportContent'));
+}
 
 // ── AI log ─────────────────────────────────────────────────────────────────
 
@@ -5242,6 +5348,12 @@ async function openPositionChartExpand(ticker) {
 
 function closeChartExpand() {
   document.getElementById('chartExpandModal').style.display = 'none';
+  // Dispose whatever chart this open mounted (2026-08-31, GitHub #119) -- this modal is
+  // shared by four different openers (R/R expand, position price expand, position
+  // candlestick expand, Deep Dive candlestick expand) and every one of them replaces
+  // #chartExpandBody's markup on the NEXT open, so without this each expand click
+  // orphaned one live LightweightCharts instance with no cleanup path anywhere.
+  disposeChartsIn(document.getElementById('chartExpandBody'));
 }
 
 // targets: optional array of {rr, lowT, color, label} — see renderRRSparkline's matching
@@ -5424,6 +5536,11 @@ async function runDeepDiveFromResearch() {
 
 function showResearchModal(ticker, r) {
   _ddModalCurrentTicker = ticker;
+  // Remount guard (2026-08-31, GitHub #119): this rewrites #ddModalBody wholesale, and it
+  // can run while the modal is ALREADY open with live charts in it (the Deep Dive history
+  // dropdown re-opens straight into a different ticker without ever closing). Without
+  // this, that path orphans whatever was mounted, since closeDeepDiveModal never runs.
+  disposeChartsIn(document.getElementById('ddModalBody'));
   // Button visibility: research mode shows "Run Deep Dive", hides Re-run + Deeper Dive
   document.getElementById('ddRunDiveBtn').style.display = '';
   document.getElementById('ddRerunBtn').style.display = 'none';
@@ -5551,6 +5668,8 @@ async function triggerManualDeepDive() {
 
 function showDeepDiveModal(ticker, dd) {
   _ddModalCurrentTicker = ticker;
+  // Remount guard -- see showResearchModal's matching comment (2026-08-31, GitHub #119).
+  disposeChartsIn(document.getElementById('ddModalBody'));
   // Button visibility: deep dive mode shows Re-run + Deeper Dive, hides Run Deep Dive
   document.getElementById('ddRunDiveBtn').style.display = 'none';
   document.getElementById('ddRerunBtn').style.display = '';
@@ -5830,8 +5949,12 @@ function copyDeepDiveContent() {
 function closeDeepDiveModal() {
   const m = document.getElementById('deepDiveModal');
   m.classList.remove('active');
-  const candleEl = document.getElementById('ddCandleChart');
-  if (candleEl && candleEl._lwcChart) { candleEl._lwcChart.remove(); candleEl._lwcChart = null; }
+  // Was a single hand-rolled disposal of #ddCandleChart only (2026-08-14) -- this shared
+  // modal body also hosts the On Deck/On Shore R/R chart (appendOnDeckChart's
+  // #rrChartContainer-TICKER), the Day/Total/YTD performance chart, and the Portfolio
+  // Value chart, none of which were ever disposed (2026-08-31, GitHub #119). Disposing
+  // the whole subtree covers every one of them, and any chart a future popup mounts here.
+  disposeChartsIn(document.getElementById('ddModalBody'));
   // Defensive: this modal has two openers (showResearchModal, showDeepDiveModal) that must
   // both use classList so this one classList-only close actually works. One of them used to
   // set style.display='flex' directly instead (fixed 2026-07-18) -- an inline style always

@@ -103,5 +103,13 @@ class Broker(ABC):
         pass
 
     @abstractmethod
-    async def get_quote(self, ticker: str) -> float:
-        pass
+    async def get_quote(self, ticker: str) -> float | None:
+        """Latest quote price, or None if the broker has no usable price right now.
+
+        Optional in the signature (fixed 2026-08-31, GitHub #139) -- AlpacaBroker's real
+        implementation genuinely returns None when both the ask and bid are missing, and
+        its live callers already handle that defensively. The ABC used to declare a
+        non-Optional `-> float`, i.e. the interface itself misdescribed the shape callers
+        actually receive -- the same class of mismatch behind the BEN incident, where a
+        caller assumed the wrong return shape from this exact method.
+        """

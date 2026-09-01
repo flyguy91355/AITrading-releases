@@ -12,6 +12,8 @@ import httpx
 import pandas as pd
 import yfinance as yf
 
+from src.analytics.composition_benchmark import is_usable_price
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,7 +92,17 @@ def _compute_long_term_trend(
 ) -> LongTermTrend:
     """Pure: given (date_str, close) pairs spanning `years`, find the high/low and their
     dates. Separated from get_long_term_trend's yfinance fetch so this logic is directly
-    unit-testable without a network call."""
+    unit-testable without a network call.
+
+    NaN/Infinity closes are dropped before the max/min (GitHub #122): every comparison
+    against NaN is False in Python, so max()/min() -- which work by pairwise comparison
+    against a running candidate -- get permanently STUCK on a NaN if the NaN happens to
+    be the first element scanned (here, the oldest close, since this list is
+    chronological oldest-first). The result was a NaN high/low reaching
+    format_long_term_trend_summary, whose own `high <= 0` guard is also False for NaN,
+    embedding a literal "nan%" straight into the live ANALYSIS_PROMPT. Filtering the
+    input fixes it regardless of where in the list the bad close sits."""
+    closes = [p for p in closes if is_usable_price(p[1])]
     if not closes:
         return LongTermTrend(ticker=ticker, years=years, current_price=current_price)
     high_date, high = max(closes, key=lambda p: p[1])
@@ -134,7 +146,16 @@ def find_sma_crossover_date(
     state for the ENTIRE computable window (no flip found -- a sustained, longer-
     standing relationship rather than a fresh cross). The caller
     (_build_sma_trend_section, via its own "no crossover found" branch) already
-    treats None as "held this relationship the whole time," never as an error."""
+    treats None as "held this relationship the whole time," never as an error.
+
+    NaN/Infinity closes are dropped first (GitHub #104): the SMA series below is built
+    with raw Python sum()/N, so a single bad close poisons EVERY 50- or 200-bar window
+    that contains it, and since NaN comparisons are always False the _qualifies() check
+    then silently returns False for those points -- which can hide a real crossover, or
+    misreport None ("held this relationship the whole time") when the window merely had
+    one bad data point. The sibling get_technicals() never had this problem because it
+    uses pandas' .mean(), which is skipna=True by default."""
+    closes = [p for p in closes if is_usable_price(p[1])]
     if len(closes) < 201:
         return None
 
@@ -168,7 +189,16 @@ def find_sma_crossover_date(
 def format_long_term_trend_summary(trend: LongTermTrend) -> str:
     """Pure formatter -- builds the ANALYSIS_PROMPT section text from a LongTermTrend.
     Returns "" when there's no usable data (an empty/failed fetch upstream), so the
-    prompt section can be omitted cleanly rather than showing garbage."""
+    prompt section can be omitted cleanly rather than showing garbage.
+
+    The `<= 0` checks alone can never catch a NaN (every NaN comparison is False), so
+    they're paired with the shared is_usable_price guard (GitHub #122) -- defense in
+    depth behind _compute_long_term_trend's own input filter, since a LongTermTrend
+    can also be constructed directly by a caller."""
+    if not is_usable_price(trend.high) or not is_usable_price(trend.low):
+        return ""
+    if not is_usable_price(trend.current_price):
+        return ""
     if trend.high <= 0 or trend.low <= 0:
         return ""
     pct_off_high = (trend.current_price - trend.high) / trend.high * 100
@@ -218,6 +248,23 @@ def format_technical_summary(price: float, technicals: "TechnicalIndicators") ->
         f"picture as genuinely mixed rather than picking whichever one supports a "
         f"preferred conclusion."
     )
+
+
+def _usable_closes(hist) -> list[tuple[str, float]]:
+    """Builds the oldest-first (date_str, close) pair list both get_long_term_trend and
+    get_sma_crossover_info feed into their own pure computation, dropping any bar whose
+    close isn't a real finite number (GitHub #104/#122).
+
+    Single shared builder rather than a filter re-written at each call site, matching
+    the consolidation this codebase already applied to its other NaN guard (GitHub #85,
+    is_usable_price) -- the recurring failure mode here has been the SAME guard being
+    re-implemented inconsistently, not the guard itself being wrong."""
+    closes: list[tuple[str, float]] = []
+    for idx, row in hist.iterrows():
+        close = float(row["Close"])
+        if is_usable_price(close):
+            closes.append((idx.strftime("%Y-%m-%d"), close))
+    return closes
 
 
 class MarketDataFetcher:
@@ -278,7 +325,17 @@ class MarketDataFetcher:
             if math.isnan(row["Close"]):
                 return await self._finnhub_quote(ticker)
             prev_close = info.previous_close if hasattr(info, "previous_close") else row["Close"]
-            change_pct = ((row["Close"] - prev_close) / prev_close * 100) if prev_close else 0.0
+            # A bare truthiness check can never catch NaN -- bool(float('nan')) is True
+            # (GitHub #112), so a NaN previous_close (fast_info is not NaN-checked
+            # anywhere upstream) used to run the arithmetic and produce a NaN
+            # change_pct. That value flows into get_market_change_pct(), gets cached,
+            # and is handed straight to the live "is the market up or down today"
+            # line in every real buy/sell prompt -- so it must degrade to 0.0 here
+            # rather than silently reaching a trading decision as NaN.
+            prev_close_usable = is_usable_price(prev_close) and prev_close != 0
+            change_pct = (
+                ((row["Close"] - prev_close) / prev_close * 100) if prev_close_usable else 0.0
+            )
 
             return StockQuote(
                 ticker=ticker,
@@ -325,8 +382,22 @@ class MarketDataFetcher:
         info = await asyncio.to_thread(lambda: yf.Ticker(ticker).info or {})
 
         def _g(key: str, default=0.0):
+            # `v is not None` is True for float('nan') (GitHub #109), so a NaN field
+            # from yfinance's .info dict -- routine for a sparse/missing fundamental --
+            # used to become a real NaN on the Financials object instead of the
+            # intended safe default, propagating into fundamental scoring and every
+            # downstream AI prompt. Coerce first (so a numeric string still parses, as
+            # it always did), then apply the shared finite-value guard; a genuinely
+            # unparseable value now falls back to the default too, rather than raising
+            # ValueError out of this whole method as it previously would have.
             v = info.get(key)
-            return float(v) if v is not None else default
+            if v is None:
+                return default
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return default
+            return v if is_usable_price(v) else default
 
         return Financials(
             ticker=ticker,
@@ -375,13 +446,25 @@ class MarketDataFetcher:
             # still good, so report volume=0 rather than losing the whole bar (or, before
             # this fix, crashing every bar in this call).
             volume = row["Volume"]
+            # Price fields get a stricter guard than Volume (GitHub #121): there is no
+            # safe substitute value for a bad price the way 0 works for volume, so a bar
+            # with any non-finite OHLC is DROPPED rather than emitted with a raw NaN
+            # embedded in it. This is the same thing /api/stock-chart already does to
+            # this function's output after the fact (2026-08-18 fix) -- doing it here
+            # means every other/future caller (chart data, the composition-benchmark
+            # feature, ...) gets that protection too, instead of only the one endpoint
+            # that happened to be crashed into fixing it.
+            ohlc = [float(row[k]) for k in ("Open", "High", "Low", "Close")]
+            if not all(is_usable_price(v) for v in ohlc):
+                continue
+            open_, high, low, close = ohlc
             results.append({
                 "date": date.strftime("%Y-%m-%d"),
                 "timestamp": date.timestamp(),
-                "open": float(row["Open"]),
-                "high": float(row["High"]),
-                "low": float(row["Low"]),
-                "close": float(row["Close"]),
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
                 "volume": 0 if (isinstance(volume, float) and math.isnan(volume)) else int(volume),
             })
         return results
@@ -461,8 +544,7 @@ class MarketDataFetcher:
         if hist.empty:
             return LongTermTrend(ticker=ticker, years=years, current_price=current_price)
 
-        closes = [(idx.strftime("%Y-%m-%d"), float(row["Close"])) for idx, row in hist.iterrows()]
-        return _compute_long_term_trend(ticker, years, closes, current_price)
+        return _compute_long_term_trend(ticker, years, _usable_closes(hist), current_price)
 
     async def get_sma_crossover_info(
         self, ticker: str, direction: str = "above", lookback_days: int = 252, *, hist=None,
@@ -487,10 +569,16 @@ class MarketDataFetcher:
                 logger.warning("SMA crossover fetch failed for %s: %s", ticker, e)
                 return SmaCrossoverInfo(ticker=ticker)
 
-        if hist.empty or len(hist) < 201:
+        if hist.empty:
             return SmaCrossoverInfo(ticker=ticker)
 
-        closes = [(idx.strftime("%Y-%m-%d"), float(row["Close"])) for idx, row in hist.iterrows()]
+        # Length is checked AFTER dropping non-finite closes (GitHub #104) -- the raw
+        # sum()/N below has no skipna behaviour, so a single bad close would otherwise
+        # poison both current SMA values as well as the crossover series.
+        closes = _usable_closes(hist)
+        if len(closes) < 201:
+            return SmaCrossoverInfo(ticker=ticker)
+
         sma_50 = round(sum(c for _, c in closes[-50:]) / 50, 2)
         sma_200 = round(sum(c for _, c in closes[-200:]) / 200, 2)
 

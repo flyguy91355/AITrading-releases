@@ -40,8 +40,11 @@ from src.data.news_feed import NewsFeed
 
 
 def load_config() -> dict:
-    with open(Path(__file__).resolve().parent.parent / "config" / "settings.yaml") as f:
-        return yaml.safe_load(f)
+    # encoding= explicit (2026-09-01) -- CLAUDE.md's Windows rule names scripts/**, and
+    # bare open() escapes the read_text/write_text AST test that enforces it.
+    return yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "config" / "settings.yaml")
+        .read_text(encoding="utf-8"))
 
 
 def load_company_names() -> dict[str, str]:
@@ -51,9 +54,9 @@ def load_company_names() -> dict[str, str]:
     missing or a given ticker was never cached."""
     path = Path(__file__).resolve().parent.parent / "data" / "reports_cache.json"
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         return {t: r.get("company_name", t) for t, r in data.items() if isinstance(r, dict)}
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
 
 

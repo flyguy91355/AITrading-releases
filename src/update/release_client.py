@@ -5,9 +5,35 @@ injected-callable pattern (see classify_ticker() in
 src/analytics/benchmark_store.py).
 See docs/superpowers/specs/2026-08-11-update-available-feature-design.md."""
 
+import re
+
 import requests
 
 _DEFAULT_TIMEOUT_SECS = 10
+
+# A release tag we're willing to interpolate into a download URL: an
+# optional "v", a dotted numeric version, and an optional pre-release/build
+# suffix built only from characters that can't change the URL's shape.
+# Anything with "/", "\", ":", whitespace, or ".." is refused outright.
+_VALID_TAG_PATTERN = re.compile(r"v?\d+(?:\.\d+)*[0-9A-Za-z._+-]*")
+
+
+def _validated_tag(tag) -> str:
+    """Returns the stripped tag if it looks like a real release tag, else
+    raises ValueError (GitHub #147).
+
+    tag_name arrives from the GitHub API — a trust boundary, even for a
+    self-controlled releases repo — and is interpolated straight into the
+    URL a live production apply then downloads and unpacks over the running
+    install. A tag containing "/" or ".." could point that URL at an
+    entirely different path. Callers already treat a raise here the same as
+    any other release-fetch failure ("no update info available")."""
+    if not isinstance(tag, str):
+        raise ValueError(f"Release tag_name is not a string: {tag!r}")
+    stripped = tag.strip()
+    if ".." in stripped or not _VALID_TAG_PATTERN.fullmatch(stripped):
+        raise ValueError(f"Refusing to build a download URL for release tag: {tag!r}")
+    return stripped
 
 
 def parse_release_notes(body: str) -> tuple[str, str]:
@@ -31,14 +57,15 @@ def fetch_latest_release(repo: str, http_get=None) -> dict:
     credential needed since the distribution repo is public. Raises on any
     HTTP error (caller decides how to handle — see web/app.py's
     /api/update-status, which treats a failure as 'no update info
-    available' rather than crashing)."""
+    available' rather than crashing). Also raises ValueError if the
+    returned tag_name doesn't validate — see _validated_tag."""
     getter = http_get or requests.get
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     response = getter(url, timeout=_DEFAULT_TIMEOUT_SECS)
     response.raise_for_status()
     data = response.json()
     severity, notes = parse_release_notes(data.get("body", ""))
-    tag = data["tag_name"]
+    tag = _validated_tag(data["tag_name"])
     # Use the direct github.com archive URL rather than the API tarball_url —
     # api.github.com/tarball/... counts against the unauthenticated 60 req/hr
     # rate limit; the github.com/archive URL bypasses it entirely for public repos.

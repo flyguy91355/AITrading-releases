@@ -769,7 +769,7 @@ input[type=time].setting-input { font-family: monospace; }
           <div class="setting-desc">Still admit a first-look candidate whose R/R is just above its own gate, within this margin, instead of hard-rejecting it</div>
         </div>
         <input type="number" class="setting-input" name="research.on_deck_rr_ceiling_margin"
-               value="{{ cfg.research.on_deck_rr_ceiling_margin }}"
+               value="{{ cfg.research.on_deck_rr_ceiling_margin if cfg.research.on_deck_rr_ceiling_margin is not none else '' }}"
                min="0" max="5" step="0.05" placeholder="0.15">
         <div class="default-label">default<br><span class="default-val">0.15</span></div>
       </div>
@@ -1593,7 +1593,11 @@ const DEFAULTS = {
   'research.on_deck_auto_deep_dive_brief': 'false',
   'research.on_deck_auto_deep_dive_daily_cap': 20,
   'research.on_deck_block_breakout_pct': 2.0,
-  'research.position_deep_dive_enabled': 'true',
+  // 2026-08-31, GitHub #130: 'false', matching this field's own on-page "Disabled"
+  // label and the real default flipped 2026-08-04 (the recurring per-holding Deep Dive
+  // cost bought no real risk management). Was 'true' here, so Reset Changes silently
+  // re-enabled it against the label sitting right next to it.
+  'research.position_deep_dive_enabled': 'false',
   'research.position_deep_dive_interval_hours': 3,
   'research.position_monitor_enabled': 'false',
   'research.position_monitor_interval_minutes': 120,
@@ -1688,6 +1692,11 @@ function onRiskTierNumberInput(value) {
   const v = Math.max(0, Math.min(100, parseFloat(value) || 0));
   const sliderEl = document.getElementById('risk_tier_value');
   if (sliderEl) sliderEl.value = v;
+  // 2026-08-31, GitHub #150: write the clamped value back into the number box too --
+  // otherwise typing e.g. 150 leaves the box showing 150 while the slider and preview
+  // both correctly sit at 100.
+  const numEl = document.getElementById('risk_tier_value_number');
+  if (numEl && String(numEl.value) !== String(v)) numEl.value = v;
   clearTimeout(riskTierPreviewTimer);
   riskTierPreviewTimer = setTimeout(() => fetchRiskTierPreview(v), 150);
 }
@@ -1744,6 +1753,22 @@ function applyRiskTierLockState() {
   });
 }
 
+// The Risk Tier preview table's cells, as [element id, formatter] pairs -- one entry
+// per displayed factor (the take-profit ladder is one cell covering T1/T2/T3). Kept as
+// data rather than 9 near-identical assignment statements so a future 12th factor is
+// one line here instead of an easily-missed extra statement (GitHub #164).
+const RISK_TIER_PREVIEW_CELLS = [
+  ['rtpConviction', p => p.min_conviction_score.toFixed(1)],
+  ['rtpRr',         p => p.min_risk_reward_ratio.toFixed(2) + ':1'],
+  ['rtpPosition',   p => p.starting_position_pct.toFixed(1) + '%'],
+  ['rtpMaxLoss',    p => p.max_loss_per_trade_pct.toFixed(1) + '%'],
+  ['rtpStop',       p => p.stop_loss_pct.toFixed(1) + '%'],
+  ['rtpTp',         p => `${p.t1_pct.toFixed(1)}% / ${p.t2_pct.toFixed(1)}% / ${p.t3_pct.toFixed(1)}%`],
+  ['rtpCash',       p => p.min_cash_reserve_pct.toFixed(1) + '%'],
+  ['rtpDrawdown',   p => p.drawdown_halt_pct.toFixed(1) + '%'],
+  ['rtpDaily',      p => p.daily_loss_limit_pct.toFixed(1) + '%'],
+];
+
 async function fetchRiskTierPreview(value, modeOverride) {
   try {
     const resp = await fetch(`/api/risk-tier-preview?value=${value}`);
@@ -1753,16 +1778,10 @@ async function fetchRiskTierPreview(value, modeOverride) {
     const mode = modeOverride || (modeEl ? modeEl.value : 'auto');
     const suffix = mode === 'manual' ? ' — preview only, mode is Manual' : '';
     document.getElementById('riskTierLabel').textContent = `${p.label} (${value})${suffix}`;
-    document.getElementById('rtpConviction').textContent = p.min_conviction_score.toFixed(1);
-    document.getElementById('rtpRr').textContent = p.min_risk_reward_ratio.toFixed(2) + ':1';
-    document.getElementById('rtpPosition').textContent = p.starting_position_pct.toFixed(1) + '%';
-    document.getElementById('rtpMaxLoss').textContent = p.max_loss_per_trade_pct.toFixed(1) + '%';
-    document.getElementById('rtpStop').textContent = p.stop_loss_pct.toFixed(1) + '%';
-    document.getElementById('rtpTp').textContent =
-      `${p.t1_pct.toFixed(1)}% / ${p.t2_pct.toFixed(1)}% / ${p.t3_pct.toFixed(1)}%`;
-    document.getElementById('rtpCash').textContent = p.min_cash_reserve_pct.toFixed(1) + '%';
-    document.getElementById('rtpDrawdown').textContent = p.drawdown_halt_pct.toFixed(1) + '%';
-    document.getElementById('rtpDaily').textContent = p.daily_loss_limit_pct.toFixed(1) + '%';
+    RISK_TIER_PREVIEW_CELLS.forEach(([id, fmt]) => {
+      const cell = document.getElementById(id);
+      if (cell) cell.textContent = fmt(p);
+    });
   } catch {
     // Silent -- this is a display-only preview; a failed fetch just leaves the
     // last-known preview showing rather than disrupting the rest of the page.
@@ -1774,6 +1793,27 @@ document.addEventListener('DOMContentLoaded', () => {
   if (el) fetchRiskTierPreview(el.value);
   applyRiskTierLockState();
 });
+
+// Fold a pair of <input type="time"> fields into the one JSON-array setting the
+// backend actually stores. Shared by both time pairs so the two can't drift apart
+// (GitHub #163). Returns false -- blocking the whole save -- if either half is blank,
+// since a native time picker can be cleared and the old code just dropped that slot
+// (GitHub #152). Always deletes the raw per-slot keys so they never reach the payload.
+function combineTimePair(payload, keys, outputKey, label) {
+  const times = [];
+  let hasBlank = false;
+  keys.forEach(k => {
+    if (payload[k]) times.push(payload[k]);
+    else hasBlank = true;
+    delete payload[k];
+  });
+  if (hasBlank) {
+    showToast(`${label}: both times are required — nothing was saved`, 'error');
+    return false;
+  }
+  if (times.length) payload[outputKey] = JSON.stringify(times);
+  return true;
+}
 
 async function saveSettings() {
   const btn = document.getElementById('saveBtn');
@@ -1790,21 +1830,20 @@ async function saveSettings() {
   document.querySelectorAll('.universe-cb:checked').forEach(cb => universeIndexes.push(cb.value));
   payload['research.universe_indexes'] = JSON.stringify(universeIndexes);
 
-  // Combine the two scan time inputs into a JSON array
-  const scanTimes = [];
-  ['research.scan_time_0','research.scan_time_1'].forEach(k => {
-    if (payload[k]) scanTimes.push(payload[k]);
-    delete payload[k];
-  });
-  if (scanTimes.length) payload['research.scan_times'] = JSON.stringify(scanTimes);
-
-  // Combine the two mid-day re-scan time inputs into a JSON array
-  const middayScanTimes = [];
-  ['research.midday_scan_time_0','research.midday_scan_time_1'].forEach(k => {
-    if (payload[k]) middayScanTimes.push(payload[k]);
-    delete payload[k];
-  });
-  if (middayScanTimes.length) payload['research.midday_scan_times'] = JSON.stringify(middayScanTimes);
+  // Combine each pair of time inputs into its one JSON-array setting. Both pairs are
+  // validated before anything is sent -- a cleared half used to be silently dropped,
+  // shrinking the real schedule from 2 slots to 1 with no indication (GitHub #152).
+  const scanOk = combineTimePair(payload,
+    ['research.scan_time_0','research.scan_time_1'],
+    'research.scan_times', 'On Deck Re-Check Times');
+  const middayOk = combineTimePair(payload,
+    ['research.midday_scan_time_0','research.midday_scan_time_1'],
+    'research.midday_scan_times', 'Mid-Day Full Universe Scan Times');
+  if (!scanOk || !middayOk) {
+    btn.disabled = false;
+    btn.textContent = 'Save Settings';
+    return;
+  }
 
   try {
     const resp = await fetch('/api/settings', {

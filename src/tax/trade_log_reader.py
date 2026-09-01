@@ -11,6 +11,8 @@ import logging
 from pathlib import Path
 from typing import NamedTuple
 
+from src.analytics.trade_log_signal import classify_trade_signal
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,20 +36,18 @@ def read_tax_events(jsonl_dir: Path, since: str | None = None) -> list[TaxTradeE
     timestamp."""
     events: list[TaxTradeEvent] = []
     for path in sorted(jsonl_dir.glob("*.jsonl")):
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             row = json.loads(line)
-            signal = row.get("signal", "")
-            if "BUY" in signal:
-                is_buy = True
-            elif "SELL" in signal:
-                is_buy = False
-            else:
-                logger.warning(
-                    "read_tax_events: unrecognized signal %r for %s in %s -- skipping",
-                    signal, row.get("ticker"), path.name,
-                )
+            # Shared with composition_benchmark.parse_trade_events (GitHub #143)
+            # -- one BUY/SELL convention for both readers of this same log; the
+            # field extraction below stays this reader's own (see module docstring).
+            is_buy = classify_trade_signal(
+                row.get("signal", ""), source="read_tax_events",
+                ticker=row.get("ticker"), file_name=path.name,
+            )
+            if is_buy is None:
                 continue
             if since is not None and row["timestamp"] < since:
                 continue

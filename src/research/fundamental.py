@@ -1,5 +1,6 @@
 """Fundamental analysis module — scores financials across five dimensions."""
 
+import math
 from dataclasses import dataclass
 
 from src.data.market_data import Financials
@@ -68,7 +69,19 @@ class FundamentalAnalyzer:
         )
 
     def _score_revenue_growth(self, f: Financials) -> float:
-        g = f.revenue_growth
+        # A missing/NaN growth figure means "no data," not "catastrophic decline"
+        # (2026-08-31, GitHub #110). Every `>=` branch below is False for NaN, so
+        # this used to fall through to the final `return 1.0` — the WORST score on
+        # the single highest-weighted (25%) fundamental factor — for a stock that
+        # simply isn't well covered by yfinance. Falls back to the same neutral 5.0
+        # the sibling _score_profitability/_score_valuation/_score_balance_sheet
+        # methods already return when they have no usable metrics.
+        try:
+            g = float(f.revenue_growth)
+        except (TypeError, ValueError):
+            return 5.0
+        if not math.isfinite(g):
+            return 5.0
         if g >= 0.30:
             return 10.0
         if g >= 0.20:

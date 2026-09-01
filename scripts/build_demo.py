@@ -198,11 +198,11 @@ def build_demo_html(snapshot: dict, dashboard_html: str, lwc_source: str = "") -
 
 
 def main():
-    snapshot = json.loads(SNAPSHOT_PATH.read_text())
-    dashboard_html = DASHBOARD_PATH.read_text()
-    lwc_source = LWC_VENDOR_PATH.read_text()
+    snapshot = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    dashboard_html = DASHBOARD_PATH.read_text(encoding="utf-8")
+    lwc_source = LWC_VENDOR_PATH.read_text(encoding="utf-8")
     out = build_demo_html(snapshot, dashboard_html, lwc_source)
-    OUTPUT_PATH.write_text(out)
+    OUTPUT_PATH.write_text(out, encoding="utf-8")
     print(f"Wrote {OUTPUT_PATH} ({len(out):,} bytes)")
 
 

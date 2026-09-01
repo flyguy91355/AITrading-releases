@@ -125,7 +125,7 @@ def main():
         sys.exit(1)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PATH.write_text(blob)
+    OUTPUT_PATH.write_text(blob, encoding="utf-8")
     print(f"Wrote {OUTPUT_PATH} ({len(blob):,} bytes, {len(snapshot)} endpoints captured)")
 
 

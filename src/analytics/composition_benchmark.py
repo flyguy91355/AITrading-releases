@@ -14,6 +14,8 @@ import math
 from pathlib import Path
 from typing import NamedTuple
 
+from src.analytics.trade_log_signal import classify_trade_signal
+
 logger = logging.getLogger(__name__)
 
 SECTOR_ETF_MAP: dict[str, str] = {
@@ -77,20 +79,41 @@ def weighted_daily_return(
     sector, see cap_tier_to_etf's SPY-default). classifications maps ticker
     -> (sector_etf_or_None, cap_tier_etf). etf_daily_returns maps ETF ticker
     -> that day's fractional return; only the ETFs actually needed for the
-    held tickers must be present."""
-    total_value = sum(holdings_value.values())
-    if total_value == 0:
-        return 0.0
+    held tickers must be present.
+
+    A position whose own dollar value, or whose required ETF return(s), is
+    not a real finite number (NaN/Infinity -- see is_usable_price) is dropped
+    from BOTH the numerator and the denominator, so the remaining positions
+    still produce a real weighted average instead of the whole day's figure
+    silently collapsing to NaN (GitHub #106; the 2026-07-29 production
+    incident documented on carry_forward_price is exactly this failure mode
+    one layer up -- a single NaN close from yfinance poisoning every sum it
+    touches). A genuinely MISSING ETF key still raises KeyError, unchanged --
+    callers (web/app.py's get_performance_today, weighted_intraday_series
+    below) deliberately depend on that to detect an incomplete bar and carry
+    the previous value forward rather than silently reweighting."""
     weighted_sum = 0.0
+    total_value = 0.0
     for ticker, value in holdings_value.items():
         sector_etf, cap_tier_etf = classifications[ticker]
         cap_tier_return = etf_daily_returns[cap_tier_etf]
         if sector_etf is None:
+            inputs = (cap_tier_return,)
             position_return = cap_tier_return
         else:
             sector_return = etf_daily_returns[sector_etf]
+            inputs = (sector_return, cap_tier_return)
             position_return = (sector_return + cap_tier_return) / 2
+        if not is_usable_price(value) or not all(is_usable_price(r) for r in inputs):
+            logger.warning(
+                "weighted_daily_return: dropping %s from today's benchmark weighting -- "
+                "unusable value (%r) or ETF return(s) (%r)", ticker, value, inputs,
+            )
+            continue
         weighted_sum += value * position_return
+        total_value += value
+    if total_value == 0:
+        return 0.0
     return weighted_sum / total_value
 
 
@@ -122,20 +145,17 @@ def parse_trade_events(jsonl_dir: Path, since: str | None = None) -> list[TradeE
     count as a real held position forever."""
     events: list[TradeEvent] = []
     for path in sorted(jsonl_dir.glob("*.jsonl")):
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             row = json.loads(line)
-            signal = row.get("signal", "")
-            if "BUY" in signal:
-                is_buy = True
-            elif "SELL" in signal:
-                is_buy = False
-            else:
-                logger.warning(
-                    "parse_trade_events: unrecognized signal %r for %s in %s -- skipping",
-                    signal, row.get("ticker"), path.name,
-                )
+            # Shared with src/tax/trade_log_reader.py (GitHub #143) -- only the
+            # BUY/SELL convention is shared; field extraction stays separate.
+            is_buy = classify_trade_signal(
+                row.get("signal", ""), source="parse_trade_events",
+                ticker=row.get("ticker"), file_name=path.name,
+            )
+            if is_buy is None:
                 continue
             if since is not None and row["timestamp"] < since:
                 continue
@@ -156,7 +176,13 @@ def reconstruct_daily_holdings(
     holdings: dict[str, float] = {}
     event_idx = 0
     for d in dates:
-        day_end = d + "T23:59:59"
+        # ".999999", not ".999999"-less "T23:59:59" (GitHub #142): real
+        # timestamps carry microseconds (datetime.now().isoformat()), and a
+        # longer string sharing the same prefix sorts GREATER
+        # lexicographically -- so "...T23:59:59.500000" <= "...T23:59:59" is
+        # False, and a trade logged in the final second of a calendar day was
+        # silently pushed into the next day's holdings snapshot.
+        day_end = d + "T23:59:59.999999"
         while event_idx < len(events) and events[event_idx].timestamp <= day_end:
             e = events[event_idx]
             holdings[e.ticker] = holdings.get(e.ticker, 0.0) + (e.shares if e.is_buy else -e.shares)
@@ -192,19 +218,38 @@ def weighted_intraday_series(
     # 500; this function has the identical shape and was only saved from
     # the same crash by its caller's broader try/except silently dropping
     # the whole live point instead of just the one affected bar).
+    #
+    # A bar whose own close is NaN/Infinity, or an ETF whose opening close is
+    # unusable (or zero -- it's the divisor), is treated exactly like a
+    # missing bar: that ETF is simply absent from this bar's returns dict, so
+    # the required-ETFs subset check below fails and the previous value is
+    # carried forward for that one timestamp (GitHub #106). Without this, a
+    # single bad intraday close produced a NaN return that propagated into
+    # last_pct and then poisoned every SUBSEQUENT timestamp too, since
+    # last_pct is what the carry-forward path re-emits -- corrupting the live
+    # "today" benchmark line for the rest of the trading day.
     required_etfs = {c[0] for c in classifications.values() if c[0]} | {
         c[1] for c in classifications.values()}
-    first_close = {etf: bars[0][1] for etf, bars in etf_bars.items() if bars}
+    first_close = {
+        etf: bars[0][1] for etf, bars in etf_bars.items()
+        if bars and is_usable_price(bars[0][1]) and bars[0][1] != 0
+    }
     series = []
     last_pct = 0.0
     for i, ts in enumerate(timestamps):
         etf_returns_since_open = {
             etf: (bars[i][1] / first_close[etf] - 1)
             for etf, bars in etf_bars.items()
-            if i < len(bars)
+            if etf in first_close and i < len(bars) and is_usable_price(bars[i][1])
         }
         if required_etfs <= etf_returns_since_open.keys():
-            last_pct = weighted_daily_return(holdings_value, classifications, etf_returns_since_open) * 100
+            blended = weighted_daily_return(
+                holdings_value, classifications, etf_returns_since_open) * 100
+            # Belt-and-braces: weighted_daily_return already drops unusable
+            # inputs, so this can only fire on a genuinely unforeseen shape --
+            # never let a non-finite value become the carried-forward value.
+            if is_usable_price(blended):
+                last_pct = blended
         series.append((ts, last_pct))
     return series
 

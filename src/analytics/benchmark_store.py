@@ -135,7 +135,21 @@ def classify_ticker(ticker: str, store: "BenchmarkStore", get_sector, get_cap_ti
     sector_etf = sector_to_etf(sector)
     sp500, sp400, sp600 = get_cap_tier_membership()
     cap_tier_etf = cap_tier_to_etf(ticker, sp500, sp400, sp600)
-    cap_tier_label = "S&P 500" if cap_tier_etf == "SPY" else ("S&P 400" if cap_tier_etf == "MDY" else "S&P 600")
+    # Label only -- cap_tier_etf itself (the value the benchmark math actually
+    # uses) is untouched. "SPY" has two distinct causes: genuine S&P 500
+    # membership, and cap_tier_to_etf's documented default for a ticker found
+    # in NONE of the three index sets. Labelling both "S&P 500" permanently
+    # cached a misleading composition breakdown for anyone auditing/debugging
+    # ticker_classification or benchmark_composition_history's composition_json
+    # (GitHub #141), so the fallback now says so honestly.
+    if cap_tier_etf == "MDY":
+        cap_tier_label = "S&P 400"
+    elif cap_tier_etf == "IJR":
+        cap_tier_label = "S&P 600"
+    elif ticker in sp500:
+        cap_tier_label = "S&P 500"
+    else:
+        cap_tier_label = "Unclassified (SPY default)"
 
     store.save_classification(ticker, sector, sector_etf, cap_tier_label, cap_tier_etf)
     return (sector_etf, cap_tier_etf)

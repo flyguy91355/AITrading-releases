@@ -74,7 +74,7 @@ def get_universe(enabled: list[str] | None = None) -> list[str]:
     cache: dict[str, dict] = {}
     if _CACHE_PATH.exists():
         try:
-            raw = json.loads(_CACHE_PATH.read_text())
+            raw = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
             # New format has index-name keys; old format has top-level "cached_at"/"tickers"
             if isinstance(raw, dict) and not raw.get("cached_at"):
                 cache = raw
@@ -118,7 +118,7 @@ def get_universe(enabled: list[str] | None = None) -> list[str]:
     if cache_dirty:
         try:
             _CACHE_PATH.parent.mkdir(exist_ok=True)
-            _CACHE_PATH.write_text(json.dumps(cache))
+            _CACHE_PATH.write_text(json.dumps(cache), encoding="utf-8")
         except Exception as e:
             logger.warning("Failed to write universe cache: %s", e)
 

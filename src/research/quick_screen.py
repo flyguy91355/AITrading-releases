@@ -23,6 +23,8 @@ rejected — that nuance is left to the full Claude analysis rather than
 guessed at here)."""
 
 import logging
+import math
+
 import numpy as np
 import yfinance as yf
 
@@ -45,6 +47,25 @@ _MOMENTUM_MIN_GAIN = 0.99    # v6 (2026-07-16): reverted v3's +2%-required momen
 _MAX_TRAILING_PE = 35        # v2: 60 -> v3: 35 — real valuation bar, not just "not
                              # absurd"; missing/negative P/E (e.g. a loss-making growth
                              # stock) is still NOT rejected — left to the full analysis
+
+
+def _finite_or_none(value) -> float | None:
+    """Return `value` as a plain float, or None if it isn't a real, finite number
+    (2026-08-31, GitHub #108).
+
+    Yahoo's `fast_info` fields routinely come back as NaN rather than missing, and
+    NaN defeats every guard this module used to rely on: `NaN or 0` evaluates to
+    NaN (NaN is truthy), and EVERY comparison against NaN is False — so a NaN
+    average volume silently skipped the low-liquidity rejection, and a NaN moving
+    average silently skipped the below-trend rejection AND leaked NaN out through
+    the returned sma_50/sma_200 (whose documented contract is "None means not
+    available"). Uses `math.isfinite`, matching the codebase's canonical
+    `is_usable_price()` guard, so Infinity is rejected too, not just NaN."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _rsi(closes: np.ndarray, period: int = 14) -> float:
@@ -77,6 +98,8 @@ def quick_screen(ticker: str) -> tuple[bool, str, float | None, float | None]:
     None/None whenever the function returns before reaching that point (the
     volume or price checks failed first) or on any error — a caller must treat
     None as "not available this pass," not "definitely no golden/death cross."
+    A NaN/Infinity value from Yahoo is normalized to None here too (GitHub #108),
+    so a caller can never receive a NaN through this tuple.
     This is a coarse, Yahoo-precomputed value suitable for a cheap mechanical
     pre-filter only; a caller needing precise, freshly-computed SMAs (e.g. the
     real AI-facing crossover context) should still fetch its own via
@@ -85,16 +108,18 @@ def quick_screen(ticker: str) -> tuple[bool, str, float | None, float | None]:
         t = yf.Ticker(ticker)
         info = t.fast_info
 
-        avg_vol = getattr(info, "three_month_average_volume", 0) or 0
+        # NaN-safe reads throughout (GitHub #108) — a NaN here used to pass every
+        # check below silently instead of rejecting; see _finite_or_none.
+        avg_vol = _finite_or_none(getattr(info, "three_month_average_volume", 0)) or 0
         if avg_vol < _MIN_AVG_VOLUME:
             return False, f"low volume ({avg_vol:,.0f} avg)", None, None
 
-        price = getattr(info, "last_price", None)
+        price = _finite_or_none(getattr(info, "last_price", None))
         if not price or price <= 0:
             return False, "no price data", None, None
 
-        ma50 = getattr(info, "fifty_day_average", None)
-        ma200 = getattr(info, "two_hundred_day_average", None)
+        ma50 = _finite_or_none(getattr(info, "fifty_day_average", None))
+        ma200 = _finite_or_none(getattr(info, "two_hundred_day_average", None))
 
         if ma50 and price < ma50:
             return False, f"below 50-day trend (${price:.2f} < 50-MA ${ma50:.2f})", ma50, ma200

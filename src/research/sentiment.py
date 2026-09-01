@@ -1,5 +1,6 @@
 """News and sentiment analysis module — keyword-based scoring with aggregation."""
 
+import string
 from dataclasses import dataclass
 
 from src.data.news_feed import NewsItem, SentimentScore
@@ -33,6 +34,29 @@ RISK_KEYWORDS = {
     "bankruptcy", "default", "subpoena", "fine", "penalty", "probe",
     "indictment", "class action", "whistleblower",
 }
+
+
+_EDGE_PUNCTUATION = string.punctuation + "’‘“”—–…"
+
+
+def _tokenize(text: str) -> set[str]:
+    """Whitespace-split, then strip punctuation from each token's edges
+    (2026-08-31, GitHub #137).
+
+    A plain `text.split()` left real headlines tokenized as {"beats",
+    "estimates,", "raises", "guidance."} — "guidance." never matched the keyword
+    "guidance", so any keyword followed by a comma/period/quote (extremely common,
+    including at the end of nearly every headline) was silently dropped from
+    scoring, systematically undercounting real sentiment signal.
+
+    Deliberately strips only the EDGES rather than translating punctuation out of
+    the whole string, so an internally-hyphenated keyword ("sell-off") still
+    matches its own entry in the keyword sets."""
+    return {
+        stripped
+        for stripped in (w.strip(_EDGE_PUNCTUATION) for w in text.split())
+        if stripped
+    }
 
 
 @dataclass
@@ -115,7 +139,7 @@ class SentimentAnalyzer:
 
     def _score_item(self, item: NewsItem) -> float:
         text = f"{item.headline} {item.summary}".lower()
-        words = set(text.split())
+        words = _tokenize(text)
 
         pos = len(words & POSITIVE_KEYWORDS)
         neg = len(words & NEGATIVE_KEYWORDS)

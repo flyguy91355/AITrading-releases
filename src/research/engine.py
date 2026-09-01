@@ -28,6 +28,25 @@ from src.research.ai_cost_tracker import AICostTracker, CostTrackingClient
 
 logger = logging.getLogger(__name__)
 
+# Models observed to reject the `temperature` parameter (2026-07-19, claude-sonnet-5 on
+# the deep-dive dial). Learned at runtime by _call_claude_with_retry's fallback and read
+# by submit_analysis_batch, which has no per-request retry of its own: the Batch API
+# surfaces a bad param as a per-request error, so every ticker in a ~1,500-request
+# pre-open batch came back errored -> is_fallback -> On Deck got nothing that day, with
+# no automatic recovery (errored requests complete promptly, so the zero-progress stall
+# detector that would have triggered the sequential fallback never fired). Process-wide
+# and deliberately not persisted -- one sequential call re-learns it after a restart.
+_MODELS_REJECTING_TEMPERATURE: set[str] = set()
+
+
+def _rejects_temperature(err: Exception) -> bool:
+    """True when an Anthropic error is the "temperature is deprecated/unsupported for
+    this model" rejection rather than a real failure. Shared by the sequential retry
+    and the batch submission so both recognize it identically."""
+    msg = str(err).lower()
+    return "temperature" in msg and ("deprecat" in msg or "unsupported" in msg
+                                     or "not supported" in msg)
+
 
 class Signal(Enum):
     STRONG_BUY = "STRONG BUY"
@@ -562,13 +581,34 @@ def _build_sma_trend_section(
     would be factually false and could mislead the judgment. The approaching
     framing asks a narrower question (early entry ahead of mechanical
     confirmation) rather than the confirmed framing's "is this still meaningful
-    now that some time has passed" question."""
+    now that some time has passed" question.
+
+    The usable-data guard checks math.isfinite, not just `<= 0` (fixed 2026-08-31,
+    GitHub #105): a NaN SMA -- routine for a low-history or otherwise data-poor
+    ticker -- silently passed the old `sma_50 <= 0` test (NaN <= 0 is False) and
+    then flowed into BOTH f"${sma_50:.2f}" (printing a literal "$nan" into a real
+    live prompt) AND `"above" if sma_50 > sma_200 else "below"` (NaN > NaN is also
+    False, so it fabricated a confidently-stated "below" from garbage data). This
+    section feeds trend_confirms_entry, which gates a real R/R-override buy, so a
+    fabricated relationship here is a real AI Data Integrity violation -- omit the
+    section entirely instead, the same graceful degradation every other bad-data
+    case here already gets. isfinite rather than a bare isnan check, so +/-inf is
+    rejected for the same reason (matches is_usable_price's own precedent in
+    src/analytics/composition_benchmark.py)."""
+    if not math.isfinite(sma_50) or not math.isfinite(sma_200):
+        return ""
     if sma_50 <= 0 or sma_200 <= 0:
         return ""
     tier = _market_cap_tier_label(market_cap)
     tier_text = tier if tier else "unknown size"
     if approaching:
-        gap_text = f"{gap_pct:.2f}%" if gap_pct is not None else "a small amount"
+        # Same isfinite reasoning as the SMA guard above -- a non-finite gap would
+        # otherwise render as a literal "nan%" in the prompt.
+        gap_text = (
+            f"{gap_pct:.2f}%"
+            if gap_pct is not None and math.isfinite(gap_pct)
+            else "a small amount"
+        )
         return (
             f"\n── SMA TREND SIGNAL (approaching, not yet crossed) ──\n"
             f"SMA50 (${sma_50:.2f}) is still below SMA200 (${sma_200:.2f}), but the gap "
@@ -660,6 +700,28 @@ def _build_trade_history_section(trade_history_summary: str) -> str:
         "and technicals as the primary basis for your decision) ──\n"
         f"{trade_history_summary}\n"
     )
+
+
+def extract_response_text(content, context: str = "Claude response") -> str:
+    """The ONE place a Claude API response's text is extracted from its content
+    blocks (extracted 2026-08-31, GitHub #158 -- previously duplicated verbatim in
+    _call_claude_with_retry's sequential path and fetch_batch_results' batch path).
+
+    Skips any non-text block (a ThinkingBlock in particular -- see CLAUDE.md's AI
+    Data Integrity section: blindly reading content[0].text returns a thinking block's
+    reasoning instead of the real JSON payload, silently corrupting every downstream
+    parse). This invariant has to hold at EVERY site a Claude response is parsed, not
+    just some, which is exactly why it lives here as one shared helper rather than as
+    N independently-maintained copies -- this codebase has a documented track record
+    of one call site drifting away from a shared invariant the others still honor.
+
+    Raises ValueError when no text block exists at all, so the caller's own existing
+    error handling (a retry, or a fallback report flagged is_fallback=True) engages --
+    never returns a fabricated/empty result that could be parsed as a real decision."""
+    text_block = next((b for b in content if hasattr(b, "text")), None)
+    if not text_block:
+        raise ValueError(f"No text block in {context}")
+    return text_block.text
 
 
 def is_account_lockout_error(error: Exception) -> bool:
@@ -756,10 +818,22 @@ class ResearchEngine:
             self.news_feed.get_company_news(ticker, days=7),
         )
 
-        fundamental_score = await self.fundamental_analyzer.analyze(financials)
-        sentiment_analysis = await self.sentiment_analyzer.analyze(news_items)
-        insider_analysis = await self.insider_analyzer.analyze(insider_summary)
-        competitive_analysis = await self.competitor_analyzer.analyze(ticker)
+        # Concurrent local analysis (2026-08-31, GitHub #159) -- the same fix, and
+        # the same reasoning, as the 5-way data fetch immediately above (GitHub #96).
+        # Each of these 4 takes an already-resolved input and consumes none of the
+        # others' output, so there is no data dependency forcing them to be serial;
+        # competitor_analyzer.analyze in particular does real network I/O (a yfinance
+        # peer lookup), so this was paying avoidable sequential latency on every
+        # single analyze_stock call -- i.e. every promotion attempt, every backfill
+        # re-check, and every held-position re-analysis.
+        (
+            fundamental_score, sentiment_analysis, insider_analysis, competitive_analysis,
+        ) = await asyncio.gather(
+            self.fundamental_analyzer.analyze(financials),
+            self.sentiment_analyzer.analyze(news_items),
+            self.insider_analyzer.analyze(insider_summary),
+            self.competitor_analyzer.analyze(ticker),
+        )
 
         company_name = ""
         try:
@@ -836,10 +910,15 @@ class ResearchEngine:
                         )
                     )
                 except Exception as temp_err:
-                    msg = str(temp_err).lower()
-                    if "temperature" in msg and "deprecat" in msg:
+                    if _rejects_temperature(temp_err):
                         logger.info(
                             "Model %s rejects temperature param — retrying without it", model)
+                        # Remember it process-wide (2026-09-01, full-codebase review) so
+                        # the Batch API path stops sending temperature for this model
+                        # too -- it has no per-request retry of its own, so a model that
+                        # rejects the parameter errored every request in the pre-open
+                        # batch and produced a whole day of fallback reports.
+                        _MODELS_REJECTING_TEMPERATURE.add(model)
                         message = await asyncio.to_thread(
                             lambda: self.client.messages.create(
                                 model=model, max_tokens=max_tokens, messages=messages,
@@ -847,10 +926,7 @@ class ResearchEngine:
                         )
                     else:
                         raise
-                text_block = next((b for b in message.content if hasattr(b, "text")), None)
-                if not text_block:
-                    raise ValueError("No text block in Claude response")
-                return text_block.text
+                return extract_response_text(message.content, "Claude response")
             except Exception as e:
                 last_error = e
                 logger.warning("Claude API attempt %d/%d failed: %s", attempt + 1, max_retries, e)
@@ -1769,10 +1845,19 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             self.news_feed.get_company_news(ticker, days=7),
         )
 
-        fundamental_score = await self.fundamental_analyzer.analyze(financials)
-        sentiment_analysis = await self.sentiment_analyzer.analyze(news_items)
-        insider_analysis = await self.insider_analyzer.analyze(insider_summary_raw)
-        competitive_analysis = await self.competitor_analyzer.analyze(ticker)
+        # Concurrent local analysis (2026-08-31, GitHub #159) -- see analyze_stock's
+        # own identical block for the full reasoning. Matters more here than there:
+        # this function runs once per ticker inside submit_analysis_batch's own
+        # semaphore-bounded 5-at-a-time fan-out across a 1,000+ ticker universe scan,
+        # so the saved latency compounds across every one of those slots.
+        (
+            fundamental_score, sentiment_analysis, insider_analysis, competitive_analysis,
+        ) = await asyncio.gather(
+            self.fundamental_analyzer.analyze(financials),
+            self.sentiment_analyzer.analyze(news_items),
+            self.insider_analyzer.analyze(insider_summary_raw),
+            self.competitor_analyzer.analyze(ticker),
+        )
 
         company_name = ""
         try:
@@ -1900,21 +1985,44 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 analysis_history_summary=_history.get(ticker, ""),
                 sma_context=_sma.get(ticker),
             )
-            requests.append({
-                "custom_id": ticker,
-                "params": {
-                    "model": model,
-                    "max_tokens": 2000,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                },
-            })
+            _params = {
+                "model": model,
+                "max_tokens": 2000,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            # Omitted for a model already known to reject it (2026-09-01, full-codebase
+            # review) -- see _MODELS_REJECTING_TEMPERATURE. The sequential path has had
+            # a retry-without-temperature fallback since the 2026-07-19 incident; this
+            # path had nothing equivalent, and a per-request param rejection errors
+            # EVERY request in the batch.
+            if model not in _MODELS_REJECTING_TEMPERATURE:
+                _params["temperature"] = 0.0
+            requests.append({"custom_id": ticker, "params": _params})
 
         try:
             batch = await asyncio.to_thread(
                 self.client.beta.messages.batches.create, requests=requests,
             )
         except Exception as e:
+            # A create-time temperature rejection is recoverable: drop the parameter,
+            # remember the model, and resubmit once rather than losing the whole batch.
+            if _rejects_temperature(e) and model not in _MODELS_REJECTING_TEMPERATURE:
+                logger.warning(
+                    "Model %s rejected the temperature param on batch submission — "
+                    "resubmitting without it", model)
+                _MODELS_REJECTING_TEMPERATURE.add(model)
+                for _r in requests:
+                    _r["params"].pop("temperature", None)
+                try:
+                    batch = await asyncio.to_thread(
+                        self.client.beta.messages.batches.create, requests=requests,
+                    )
+                    return batch.id, inputs_by_ticker
+                except Exception as e2:
+                    logger.error(
+                        "Batch resubmission without temperature also failed for %d "
+                        "tickers: %s", len(requests), e2)
+                    return None, {}
             logger.error("Batch submission failed for %d tickers: %s", len(requests), e)
             return None, {}
 
@@ -1973,14 +2081,12 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                     logger.debug("AI cost tracking failed for a batch result "
                                  "(non-fatal): %s", e)
                 try:
-                    text_block = next(
-                        (b for b in result.result.message.content if hasattr(b, "text")), None)
-                    if not text_block:
-                        raise ValueError("No text block in batch response")
+                    response_text = extract_response_text(
+                        result.result.message.content, "batch response")
                     report = self._parse_quick_scan_response(
                         ticker, inp["company_name"], inp["current_price"],
                         inp["fundamental_summary"], inp["insider_summary"],
-                        inp["news_summary"], inp["competitive_summary"], text_block.text,
+                        inp["news_summary"], inp["competitive_summary"], response_text,
                         atr_pct=inp.get("atr_pct", 0.0),
                     )
                 except Exception as e:
@@ -1990,6 +2096,23 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                         inp["news_summary"], inp["competitive_summary"], e,
                     )
             else:
+                # Learn a per-request param rejection from the error body (2026-09-01,
+                # full-codebase review) so the NEXT batch omits temperature for this
+                # model instead of erroring every request again -- see
+                # _MODELS_REJECTING_TEMPERATURE. The batch API reports a bad param this
+                # way rather than failing the create call, which is why the submission
+                # -side retry alone isn't enough.
+                _err_detail = getattr(result.result, "error", None)
+                if _err_detail is not None and _rejects_temperature(
+                        Exception(str(_err_detail))):
+                    _batch_model = self.config.get("research", {}).get(
+                        "model_pre_open_scan", "")
+                    if _batch_model and _batch_model not in _MODELS_REJECTING_TEMPERATURE:
+                        logger.warning(
+                            "Batch requests are failing because model %s rejects the "
+                            "temperature param — future batches will omit it",
+                            _batch_model)
+                        _MODELS_REJECTING_TEMPERATURE.add(_batch_model)
                 report = self._fallback_report(
                     ticker, inp["company_name"], inp["current_price"],
                     inp["fundamental_summary"], inp["insider_summary"],
@@ -2328,7 +2451,12 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             "is_deeper_dive": report.is_deeper_dive,
             "is_fallback": report.is_fallback,
         }
-        with open(filepath, "w") as f:
+        # encoding= explicit (2026-09-01) -- CLAUDE.md's Windows rule covers src/**, and
+        # bare open() is the variant the read_text/write_text AST test can't see. Harmless
+        # today only because json.dump defaults to ensure_ascii=True; a future
+        # ensure_ascii=False (the usual "make the JSON readable" tweak) would otherwise
+        # reintroduce the cp1252 write bug for thesis text full of em-dashes.
+        with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
     def _rule_based_analysis(
@@ -2438,5 +2566,10 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             "time_horizon": report.time_horizon,
             "reasoning": report.reasoning,
         }
-        with open(filepath, "w") as f:
+        # encoding= explicit (2026-09-01) -- CLAUDE.md's Windows rule covers src/**, and
+        # bare open() is the variant the read_text/write_text AST test can't see. Harmless
+        # today only because json.dump defaults to ensure_ascii=True; a future
+        # ensure_ascii=False (the usual "make the JSON readable" tweak) would otherwise
+        # reintroduce the cp1252 write bug for thesis text full of em-dashes.
+        with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)

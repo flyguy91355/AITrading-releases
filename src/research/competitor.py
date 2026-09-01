@@ -146,16 +146,45 @@ class CompetitorAnalyzer:
 
         our_pe = info.get("trailingPE", 0) or 0
 
+        selected = peers[:3]
+
+        # 2026-08-30, GitHub #111 -- same fix as analyze() above; this loop
+        # compounds the block up to 3x sequentially per call when unwrapped.
+        #
+        # 2026-08-31 follow-up -- the up-to-3 peer fetches are genuinely
+        # independent (each reads only its own ticker, writes nothing the others
+        # see, and avg_pe below is order-independent), so they now run
+        # concurrently instead of paying each real network round-trip serially --
+        # roughly max(per-peer latency) instead of sum(). Same asyncio.gather
+        # treatment already applied to the independent-I/O loops in
+        # gather_analysis_inputs (GitHub #96) and near_miss_monitor_loop's quote
+        # fetches (GitHub #94).
+        #
+        # return_exceptions=True preserves the original per-peer
+        # skip-on-failure semantics exactly: one peer's fetch failing never
+        # blocks or fails the others. A non-Exception BaseException
+        # (asyncio.CancelledError, raised by a real Pause/Stop cancelling this
+        # task) is deliberately re-raised rather than swallowed -- the original
+        # bare `except Exception` would not have caught it either.
+        results = await asyncio.gather(
+            *(
+                asyncio.to_thread(lambda p=peer: yf.Ticker(p).info or {})
+                for peer in selected
+            ),
+            return_exceptions=True,
+        )
+
         peer_metrics = []
-        for peer in peers[:3]:
+        for peer, pi in zip(selected, results):
+            if isinstance(pi, BaseException):
+                if not isinstance(pi, Exception):
+                    raise pi
+                continue
             try:
-                # 2026-08-30, GitHub #111 -- same fix as analyze() above; this loop
-                # compounds the block up to 3x sequentially per call when unwrapped.
-                pi = await asyncio.to_thread(lambda p=peer: yf.Ticker(p).info or {})
                 peer_pe = pi.get("trailingPE", 0) or 0
-                peer_metrics.append((peer, peer_pe))
             except Exception:
                 continue
+            peer_metrics.append((peer, peer_pe))
 
         if not peer_metrics:
             return ""
