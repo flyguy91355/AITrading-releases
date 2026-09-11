@@ -2285,6 +2285,15 @@ class DashboardState:
             "closed_current_arch": self._win_rate_cache.get("closed_current_arch", 0),
             "win_rate_all_time_pct": self._win_rate_cache.get("win_rate_all_time_pct", 0.0),
             "closed_all_time": self._win_rate_cache.get("closed_all_time", 0),
+            # Drawdown-halt visibility (2026-09-11) -- check_drawdown() already silently
+            # blocked every buy path once triggered, but nothing on the dashboard ever
+            # showed it; the only trace was a scrolling AI-log line and a Settings-page
+            # control the owner had no reason to know existed. Sent on every portfolio
+            # broadcast (this function's existing call pattern) so the banner in
+            # dashboard.html tracks the real state live, not just at page load.
+            "drawdown_state": self.risk_manager.check_drawdown(p),
+            "drawdown_pct": round((p.peak_value - p.total_value) / p.peak_value * 100, 2) if p.peak_value else 0.0,
+            "peak_value": round(p.peak_value, 2),
         }
 
     async def get_init_payload(self) -> dict:
@@ -10996,6 +11005,10 @@ async def recalibrate_drawdown_baseline():
         f"${new_peak:,.2f} (real Alpaca equity). State: {old_dd_state} -> {new_dd_state}.",
         "warning")
     await state.broadcast({"type": "ai_log", "entry": entry})
+    # Also push a fresh portfolio snapshot (2026-09-11) so the dashboard's drawdown-halt
+    # banner clears for every connected client immediately, not just whoever clicked --
+    # and not only once the next unrelated portfolio broadcast happens to fire.
+    await state.broadcast({"type": "portfolio", "portfolio": state.get_portfolio_snapshot()})
     return {
         "status": "ok", "old_peak_value": old_peak, "new_peak_value": new_peak,
         "old_drawdown_state": old_dd_state, "new_drawdown_state": new_dd_state,

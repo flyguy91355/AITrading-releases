@@ -815,6 +815,33 @@ tbody tr:hover { background: var(--bg-card-hover); }
   </div>
 </div>
 
+<!-- Drawdown-halt banner (2026-09-11) -- RiskManager.check_drawdown() has silently
+     blocked every buy path (promotion, Track 2, backfill) since day one whenever the
+     portfolio falls drawdown_halt_pct% below its all-time peak, but the only trace was
+     a scrolling AI-log line and a control buried at the bottom of Settings > System --
+     owner ran halted for a week with no idea buying had stopped. Shown/hidden and
+     filled in by updatePortfolio() below from the drawdown_state/drawdown_pct/
+     peak_value fields on every 'portfolio' broadcast, so it tracks the real state live.
+     Same fixed/overlay positioning as wsDisconnectedBanner immediately above (doesn't
+     disturb .main-layout's height calc); z-index sits between that banner (600, more
+     urgent -- a frozen page hides this one too) and firstScanBanner (500) since the two
+     can't really coexist at the same top offset either, same accepted tradeoff as
+     those two already make. The button calls the SAME /api/recalibrate-drawdown-baseline
+     endpoint Settings > System already exposed -- this doesn't add a new un-halt
+     mechanism, it just makes the existing self-service one visible from the page the
+     owner is actually looking at. -->
+<div id="drawdownHaltBanner" style="display:none;position:fixed;top:112px;left:0;right:0;z-index:550;
+     background:#3a2a14;border-bottom:2px solid #f59e0b;padding:10px 20px;
+     align-items:center;justify-content:space-between;gap:16px;box-shadow:0 2px 8px rgba(0,0,0,0.4);">
+  <div style="font-size:13px;color:#fff;">
+    <b id="drawdownHaltTitle">⚠ Auto-buying halted</b> — <span id="drawdownHaltDetail">--</span>
+  </div>
+  <div style="display:flex;gap:8px;flex-shrink:0;align-items:center;">
+    <span style="font-size:11px;color:#d1a85a;max-width:360px;">Positions are still being managed (stops/take-profits unaffected). Only new buys are blocked.</span>
+    <button class="pause-btn" onclick="recalibrateDrawdownFromBanner()" style="background:#b45309;color:#fff;border:none;white-space:nowrap;">⟳ Recalibrate Baseline</button>
+  </div>
+</div>
+
 <!-- Fresh-install banner (2026-07-21) -- fixed/overlay positioned so it never disturbs
      .main-layout's own height calc (see "Main Page Bottom Cut Off" fix, which accounts for
      exactly the header + ticker-tape strip); shown only when the backend reports no scan
@@ -1726,8 +1753,64 @@ function updateAiStatus(analyzing, ticker) {
 // on every 'portfolio' broadcast, no reason to recompute or refetch them.
 let _latestPortfolio = null;
 
+// Drawdown-halt banner (2026-09-11) -- see the banner markup's own comment above for
+// why this exists. drawdown_state comes straight from RiskManager.check_drawdown():
+// "normal" (hidden), "halt" (all new buying blocked), "defensive" (buying continues,
+// smaller sizes / higher conviction bar), "exit_review" (positions flagged for review,
+// most severe short of a halt). Shown for all three non-normal states since "defensive"
+// and "exit_review" are just as invisible today as "halt" was.
+function updateDrawdownHaltBanner(p) {
+  const banner = document.getElementById('drawdownHaltBanner');
+  const state = p.drawdown_state || 'normal';
+  if (state === 'normal') {
+    banner.style.display = 'none';
+    return;
+  }
+  const labels = {
+    halt: ['⚠ Auto-buying halted', 'new buy orders are blocked'],
+    defensive: ['⚠ Defensive mode', 'buying continues at reduced size / higher conviction bar'],
+    exit_review: ['⚠ Exit review', 'open positions are flagged for review — buying blocked'],
+  };
+  const [title, detail] = labels[state] || labels.halt;
+  document.getElementById('drawdownHaltTitle').textContent = title;
+  document.getElementById('drawdownHaltDetail').textContent =
+    `portfolio is ${p.drawdown_pct.toFixed(2)}% below its peak ($${p.peak_value.toFixed(2)}) — ${detail}`;
+  banner.style.display = 'flex';
+}
+
+// Reuses the same /api/recalibrate-drawdown-baseline endpoint Settings > System already
+// calls (see recalibrateDrawdownBaseline() there) -- this button doesn't add a second
+// un-halt mechanism, it just puts the existing self-service one where the owner is
+// actually looking. Updates the banner immediately from the response rather than
+// waiting for the next unrelated portfolio broadcast (the endpoint also broadcasts a
+// fresh snapshot itself, for every OTHER connected client).
+async function recalibrateDrawdownFromBanner() {
+  if (!confirm('Reset the drawdown baseline to your real current Alpaca balance?\n\n'
+    + 'Only do this if the halt does NOT reflect real trading losses you\'re willing to '
+    + 'accept as the new baseline. This does not touch positions, cash, or any other '
+    + 'setting — it only resets the peak_value drawdown is measured from.')) return;
+  try {
+    const resp = await fetch('/api/recalibrate-drawdown-baseline', { method: 'POST' });
+    const data = await resp.json();
+    if (data.status === 'ok') {
+      if (_latestPortfolio) {
+        _latestPortfolio.peak_value = data.new_peak_value;
+        _latestPortfolio.drawdown_state = data.new_drawdown_state;
+        _latestPortfolio.drawdown_pct = data.new_peak_value
+          ? (data.new_peak_value - _latestPortfolio.total_value) / data.new_peak_value * 100 : 0;
+        updateDrawdownHaltBanner(_latestPortfolio);
+      }
+    } else {
+      alert(data.message || 'Recalibration failed');
+    }
+  } catch (e) {
+    alert('Network error — recalibration may not have completed.');
+  }
+}
+
 function updatePortfolio(p) {
   _latestPortfolio = p;
+  updateDrawdownHaltBanner(p);
   document.getElementById('totalValue').textContent = fmt$(p.total_value);
 
   const dayEl = document.getElementById('dayPnl');
