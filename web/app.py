@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta, time as dtime, date
+from datetime import datetime, timedelta, time as dtime, date, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -9454,6 +9454,55 @@ async def dashboard():
     )
 
 
+_AVAILABLE_MODELS_PATH = Path("data/available_models.json")
+_MODEL_DIAL_DEFAULTS = {
+    # Mirrors settings.html's DEFAULTS reset map -- kept selectable on every dial.
+    "model_quick_scan": "claude-haiku-4-5",
+    "model_deep_dive": "claude-sonnet-5",
+    "model_deeper_dive": "claude-opus-4-8",
+    "model_pre_open_scan": "claude-haiku-4-5",
+    "model_position_monitor": "claude-haiku-4-5",
+    "model_dip_entry": "claude-haiku-4-5",
+    "model_periodic_deep_dive": "claude-haiku-4-5",
+    "model_portfolio_health": "claude-haiku-4-5",
+}
+
+
+async def _available_models() -> list[dict]:
+    """Model list for the Settings dropdowns (2026-10-13, see
+    src/research/model_catalog.py). Serves data/available_models.json; refreshes it
+    from the free Models API when older than model_catalog.MAX_AGE_HOURS. A failed
+    refresh keeps the old cache (or FALLBACK_MODELS if there is none) and retries on
+    the next Settings load -- it never blocks the page beyond the short timeout."""
+    from src.research import model_catalog
+    cached: dict = {}
+    try:
+        if _AVAILABLE_MODELS_PATH.exists():
+            cached = json.loads(_AVAILABLE_MODELS_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Unreadable %s, refetching: %s", _AVAILABLE_MODELS_PATH, e)
+    models = cached.get("models") or []
+    client = getattr(state.research_engine, "client", None)
+    if client is not None and (not models or model_catalog.catalog_is_stale(cached.get("fetched_at"))):
+        try:
+            fresh = await asyncio.wait_for(
+                asyncio.to_thread(model_catalog.fetch_available_models,
+                                  client.with_options(timeout=8.0, max_retries=0)),
+                timeout=10.0,
+            )
+            if fresh:
+                models = fresh
+                await asyncio.to_thread(
+                    _atomic_write_json, _AVAILABLE_MODELS_PATH,
+                    {"fetched_at": datetime.now(timezone.utc).isoformat(), "models": fresh},
+                    "available models cache",
+                )
+        except Exception as e:
+            logger.warning("Models API refresh failed, using %s model list: %s",
+                           "cached" if models else "built-in fallback", e)
+    return models or model_catalog.FALLBACK_MODELS
+
+
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page():
     cfg = state.config
@@ -9493,7 +9542,17 @@ async def settings_page():
 
     # Render Jinja2-style template
     from jinja2 import Template
-    rendered = Template(template).render(cfg=ns, api_keys=api_keys)
+    from src.research.model_catalog import build_model_options
+    _models = await _available_models()
+    _research_cfg = cfg.get("research", {})
+    model_options = {}
+    for key, default in _MODEL_DIAL_DEFAULTS.items():
+        current = _research_cfg.get(key) or default
+        model_options[key] = [
+            {**opt, "selected": opt["id"] == current}
+            for opt in build_model_options(_models, current, default)
+        ]
+    rendered = Template(template).render(cfg=ns, api_keys=api_keys, model_options=model_options)
     return Response(
         content=rendered,
         media_type="text/html",
@@ -11586,12 +11645,22 @@ async def get_portfolio_summary():
     }
 
 
-_MODEL_DISPLAY_NAMES = {
-    "claude-haiku-4-5": "Haiku 4.5",
-    "claude-sonnet-5": "Sonnet 5",
-    "claude-opus-4-8": "Opus 4.8",
-    "claude-fable-5": "Fable 5",
-}
+def _model_display_name(model: str) -> str:
+    """Short name ("Haiku 5.5") from the Settings model list cache (2026-10-13 --
+    replaced a hardcoded 4-model map that went stale with every model release).
+    Cache read only, never a Models API call; falls back to the raw id."""
+    from src.research.model_catalog import FALLBACK_MODELS
+    models = []
+    try:
+        if _AVAILABLE_MODELS_PATH.exists():
+            models = json.loads(_AVAILABLE_MODELS_PATH.read_text(encoding="utf-8")).get("models") or []
+    except Exception:
+        pass
+    models = list(models) + FALLBACK_MODELS
+    for m in models:
+        if m.get("id") == model and m.get("display_name"):
+            return m["display_name"].removeprefix("Claude ").strip()
+    return model
 
 
 @app.get("/api/portfolio-health-model")
@@ -11602,7 +11671,7 @@ async def get_portfolio_health_model():
     opening the Portfolio Summary modal used to fire the assessment immediately with no
     way to back out)."""
     model = state.config["research"].get("model_portfolio_health", "claude-haiku-4-5")
-    return {"model": model, "label": _MODEL_DISPLAY_NAMES.get(model, model)}
+    return {"model": model, "label": _model_display_name(model)}
 
 
 @app.get("/api/portfolio-health")

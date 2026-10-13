@@ -1319,10 +1319,7 @@ input[type=time].setting-input { font-family: monospace; }
           <div class="setting-desc">Model used for the live On Deck buy pipeline (promotions, backfill/swap, signal tracking) — not the universe scans, see Pre-Open Scan Model</div>
         </div>
         <select class="setting-input" name="research.model_quick_scan">
-          <option value="claude-haiku-4-5" {% if cfg.research.model_quick_scan == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
-          <option value="claude-sonnet-5" {% if cfg.research.model_quick_scan == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
-          <option value="claude-opus-4-8" {% if cfg.research.model_quick_scan == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
-          <option value="claude-fable-5" {% if cfg.research.model_quick_scan == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+          {% for opt in model_options.model_quick_scan %}<option value="{{ opt.id|e }}" {% if opt.selected %}selected{% endif %}>{{ opt.label|e }}</option>{% endfor %}
         </select>
         <div class="default-label">default<br><span class="default-val">Haiku</span></div>
       </div>
@@ -1332,10 +1329,7 @@ input[type=time].setting-input { font-family: monospace; }
           <div class="setting-desc">Model used for deep analysis before each buy decision</div>
         </div>
         <select class="setting-input" name="research.model_deep_dive">
-          <option value="claude-haiku-4-5" {% if cfg.research.model_deep_dive == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
-          <option value="claude-sonnet-5" {% if cfg.research.model_deep_dive == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced (Recommended)</option>
-          <option value="claude-opus-4-8" {% if cfg.research.model_deep_dive == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
-          <option value="claude-fable-5" {% if cfg.research.model_deep_dive == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+          {% for opt in model_options.model_deep_dive %}<option value="{{ opt.id|e }}" {% if opt.selected %}selected{% endif %}>{{ opt.label|e }}</option>{% endfor %}
         </select>
         <div class="default-label">default<br><span class="default-val">Sonnet 5</span></div>
       </div>
@@ -1345,10 +1339,7 @@ input[type=time].setting-input { font-family: monospace; }
           <div class="setting-desc">Model for the manual Deeper Dive (peer comparison, macro, expected returns)</div>
         </div>
         <select class="setting-input" name="research.model_deeper_dive">
-          <option value="claude-haiku-4-5" {% if (cfg.research.model_deeper_dive|default('claude-opus-4-8')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
-          <option value="claude-sonnet-5" {% if (cfg.research.model_deeper_dive|default('claude-opus-4-8')) == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
-          <option value="claude-opus-4-8" {% if (cfg.research.model_deeper_dive|default('claude-opus-4-8')) == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful (Recommended)</option>
-          <option value="claude-fable-5" {% if (cfg.research.model_deeper_dive|default('claude-opus-4-8')) == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+          {% for opt in model_options.model_deeper_dive %}<option value="{{ opt.id|e }}" {% if opt.selected %}selected{% endif %}>{{ opt.label|e }}</option>{% endfor %}
         </select>
         <div class="default-label">default<br><span class="default-val">Opus 4.8</span></div>
       </div>
@@ -1358,10 +1349,7 @@ input[type=time].setting-input { font-family: monospace; }
           <div class="setting-desc">Model used for the pre-open scan, the mid-day re-scans, and the Full Scan button — the overnight 1,500+ stock universe screen</div>
         </div>
         <select class="setting-input" name="research.model_pre_open_scan">
-          <option value="claude-haiku-4-5" {% if cfg.research.model_pre_open_scan == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
-          <option value="claude-sonnet-5" {% if cfg.research.model_pre_open_scan == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
-          <option value="claude-opus-4-8" {% if cfg.research.model_pre_open_scan == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
-          <option value="claude-fable-5" {% if cfg.research.model_pre_open_scan == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+          {% for opt in model_options.model_pre_open_scan %}<option value="{{ opt.id|e }}" {% if opt.selected %}selected{% endif %}>{{ opt.label|e }}</option>{% endfor %}
         </select>
         <div class="default-label">default<br><span class="default-val">Haiku</span></div>
       </div>
@@ -1371,10 +1359,7 @@ input[type=time].setting-input { font-family: monospace; }
           <div class="setting-desc">Model used for the hourly sell-decision re-check on holdings</div>
         </div>
         <select class="setting-input" name="research.model_position_monitor">
-          <option value="claude-haiku-4-5" {% if (cfg.research.model_position_monitor|default('claude-haiku-4-5')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
-          <option value="claude-sonnet-5" {% if (cfg.research.model_position_monitor|default('claude-haiku-4-5')) == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
-          <option value="claude-opus-4-8" {% if (cfg.research.model_position_monitor|default('claude-haiku-4-5')) == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
-          <option value="claude-fable-5" {% if (cfg.research.model_position_monitor|default('claude-haiku-4-5')) == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+          {% for opt in model_options.model_position_monitor %}<option value="{{ opt.id|e }}" {% if opt.selected %}selected{% endif %}>{{ opt.label|e }}</option>{% endfor %}
         </select>
         <div class="default-label">default<br><span class="default-val">Haiku</span></div>
       </div>
@@ -1384,10 +1369,7 @@ input[type=time].setting-input { font-family: monospace; }
           <div class="setting-desc">Model used for the AI dip-entry price recommendation</div>
         </div>
         <select class="setting-input" name="research.model_dip_entry">
-          <option value="claude-haiku-4-5" {% if (cfg.research.model_dip_entry|default('claude-haiku-4-5')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
-          <option value="claude-sonnet-5" {% if (cfg.research.model_dip_entry|default('claude-haiku-4-5')) == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
-          <option value="claude-opus-4-8" {% if (cfg.research.model_dip_entry|default('claude-haiku-4-5')) == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
-          <option value="claude-fable-5" {% if (cfg.research.model_dip_entry|default('claude-haiku-4-5')) == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+          {% for opt in model_options.model_dip_entry %}<option value="{{ opt.id|e }}" {% if opt.selected %}selected{% endif %}>{{ opt.label|e }}</option>{% endfor %}
         </select>
         <div class="default-label">default<br><span class="default-val">Haiku</span></div>
       </div>
@@ -1397,10 +1379,7 @@ input[type=time].setting-input { font-family: monospace; }
           <div class="setting-desc">Model used for the automatic periodic deep dive on holdings</div>
         </div>
         <select class="setting-input" name="research.model_periodic_deep_dive">
-          <option value="claude-haiku-4-5" {% if (cfg.research.model_periodic_deep_dive|default('claude-haiku-4-5')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
-          <option value="claude-sonnet-5" {% if (cfg.research.model_periodic_deep_dive|default('claude-haiku-4-5')) == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
-          <option value="claude-opus-4-8" {% if (cfg.research.model_periodic_deep_dive|default('claude-haiku-4-5')) == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
-          <option value="claude-fable-5" {% if (cfg.research.model_periodic_deep_dive|default('claude-haiku-4-5')) == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+          {% for opt in model_options.model_periodic_deep_dive %}<option value="{{ opt.id|e }}" {% if opt.selected %}selected{% endif %}>{{ opt.label|e }}</option>{% endfor %}
         </select>
         <div class="default-label">default<br><span class="default-val">Haiku</span></div>
       </div>
@@ -1410,10 +1389,7 @@ input[type=time].setting-input { font-family: monospace; }
           <div class="setting-desc">Model used for the Portfolio Health Assessment modal</div>
         </div>
         <select class="setting-input" name="research.model_portfolio_health">
-          <option value="claude-haiku-4-5" {% if (cfg.research.model_portfolio_health|default('claude-haiku-4-5')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>
-          <option value="claude-sonnet-5" {% if (cfg.research.model_portfolio_health|default('claude-haiku-4-5')) == 'claude-sonnet-5' %}selected{% endif %}>Sonnet 5 — Balanced</option>
-          <option value="claude-opus-4-8" {% if (cfg.research.model_portfolio_health|default('claude-haiku-4-5')) == 'claude-opus-4-8' %}selected{% endif %}>Opus 4.8 — Most Powerful</option>
-          <option value="claude-fable-5" {% if (cfg.research.model_portfolio_health|default('claude-haiku-4-5')) == 'claude-fable-5' %}selected{% endif %}>Fable 5 — Flagship / Most Capable</option>
+          {% for opt in model_options.model_portfolio_health %}<option value="{{ opt.id|e }}" {% if opt.selected %}selected{% endif %}>{{ opt.label|e }}</option>{% endfor %}
         </select>
         <div class="default-label">default<br><span class="default-val">Haiku</span></div>
       </div>
