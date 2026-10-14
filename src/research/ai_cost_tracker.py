@@ -49,6 +49,51 @@ PRICING_PER_MILLION = {
 _DEFAULT_PRICING = (3.00, 15.00)  # conservative mid-tier fallback for an unrecognized model
 BATCH_DISCOUNT = 0.5
 
+# Per-model accounting (2026-10-14). Before this, only pooled token totals were kept and
+# every day -- today AND every settled history day -- was priced at whatever
+# model_quick_scan was set to at READ time, so switching the dials to claude-haiku-5-5
+# silently re-priced every past Haiku 4.5 day at 1/10th its real cost. record() already
+# received the model and discarded it; it's now kept per model.
+_BUCKET_FIELDS = ("calls", "input_tokens", "output_tokens",
+                  "batch_calls", "batch_input_tokens", "batch_output_tokens")
+# Settled history rows written before per-model tracking carry no model breakdown. Every
+# research.model_* dial on this install was claude-haiku-4-5 until 2026-10-14, so that's
+# what they're priced at -- a fixed fact about the past, never the current dial.
+LEGACY_HISTORY_MODEL = "claude-haiku-4-5"
+# Tokens recorded with no breakdown on the transition day itself (a pre-upgrade cache
+# file loaded after the upgrade). Priced at the caller's current dial, exactly as the
+# whole day was before -- correct for that day, which already ran on the new dial.
+UNATTRIBUTED = "__unattributed__"
+
+
+def _empty_bucket() -> dict:
+    return {f: 0 for f in _BUCKET_FIELDS}
+
+
+def _bucket_from(data: dict) -> dict:
+    return {f: int(data.get(f, 0) or 0) for f in _BUCKET_FIELDS}
+
+
+def _cost_by_model(by_model: dict, unattributed_model: str) -> float:
+    total = 0.0
+    for model, b in by_model.items():
+        m = unattributed_model if model == UNATTRIBUTED else model
+        total += estimate_cost_usd(m, b.get("input_tokens", 0), b.get("output_tokens", 0),
+                                   is_batch=False)
+        total += estimate_cost_usd(m, b.get("batch_input_tokens", 0),
+                                   b.get("batch_output_tokens", 0), is_batch=True)
+    return total
+
+
+def _by_model_from_cache(data: dict) -> dict:
+    """A cache file's per-model breakdown; an older file without one becomes a single
+    UNATTRIBUTED bucket so its real tokens are still counted (and priced as before)."""
+    raw = data.get("by_model")
+    if isinstance(raw, dict):
+        return {m: _bucket_from(b) for m, b in raw.items() if isinstance(b, dict)}
+    bucket = _bucket_from(data)
+    return {UNATTRIBUTED: bucket} if any(bucket.values()) else {}
+
 
 def _pricing_for(model: str) -> tuple[float, float]:
     """Exact table hit, else the priciest known model of the same family (a new
@@ -102,6 +147,7 @@ class AICostTracker:
         self._batch_calls = 0
         self._batch_input_tokens = 0
         self._batch_output_tokens = 0
+        self._by_model: dict[str, dict] = {}
         self._load()
 
     def _today_str(self) -> str:
@@ -113,8 +159,10 @@ class AICostTracker:
             self._append_history_row(
                 self._date_str, self._calls, self._input_tokens, self._output_tokens,
                 self._batch_calls, self._batch_input_tokens, self._batch_output_tokens,
+                by_model=self._by_model,
             )
             self._date_str = today
+            self._by_model = {}
             self._calls = 0
             self._input_tokens = 0
             self._output_tokens = 0
@@ -124,7 +172,8 @@ class AICostTracker:
 
     def _append_history_row(self, date_str: str, calls: int, input_tokens: int,
                              output_tokens: int, batch_calls: int,
-                             batch_input_tokens: int, batch_output_tokens: int) -> None:
+                             batch_input_tokens: int, batch_output_tokens: int,
+                             by_model: dict | None = None) -> None:
         """Settles one finished day's raw totals into the history file. Raw
         token/call counts are stored, not a precomputed dollar estimate, so a
         later pricing correction in PRICING_PER_MILLION naturally applies to
@@ -147,6 +196,7 @@ class AICostTracker:
                 "output_tokens": output_tokens, "batch_calls": batch_calls,
                 "batch_input_tokens": batch_input_tokens,
                 "batch_output_tokens": batch_output_tokens,
+                "by_model": by_model or {},
             })
             rows.sort(key=lambda r: r["date"])
             self._history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,7 +207,12 @@ class AICostTracker:
     def history(self, model_for_estimate: str = "claude-haiku-4-5") -> list[dict]:
         """Every already-settled day's totals plus an estimated dollar cost,
         most-recent-first. Today itself is never included here (it hasn't
-        settled yet) -- summary() is the live view for today."""
+        settled yet) -- summary() is the live view for today.
+
+        Each day is priced by the models it actually used (its `by_model`).
+        model_for_estimate prices only an UNATTRIBUTED bucket (the transition day);
+        a row with no breakdown at all predates per-model tracking and is priced at
+        LEGACY_HISTORY_MODEL, never the current dial."""
         try:
             if not self._history_path.exists():
                 return []
@@ -171,10 +226,10 @@ class AICostTracker:
             output_tokens = r.get("output_tokens", 0)
             batch_input_tokens = r.get("batch_input_tokens", 0)
             batch_output_tokens = r.get("batch_output_tokens", 0)
-            cost = (estimate_cost_usd(model_for_estimate, input_tokens, output_tokens,
-                                       is_batch=False)
-                    + estimate_cost_usd(model_for_estimate, batch_input_tokens,
-                                         batch_output_tokens, is_batch=True))
+            by_model = r.get("by_model")
+            if not isinstance(by_model, dict):
+                by_model = {LEGACY_HISTORY_MODEL: _bucket_from(r)}
+            cost = _cost_by_model(by_model, model_for_estimate)
             result.append({
                 "date": r.get("date"),
                 "calls": r.get("calls", 0) + r.get("batch_calls", 0),
@@ -196,6 +251,15 @@ class AICostTracker:
             self._roll_if_new_day()
             input_tokens = max(0, int(input_tokens or 0))
             output_tokens = max(0, int(output_tokens or 0))
+            bucket = self._by_model.setdefault(str(model or "unknown"), _empty_bucket())
+            if is_batch:
+                bucket["batch_calls"] += 1
+                bucket["batch_input_tokens"] += input_tokens
+                bucket["batch_output_tokens"] += output_tokens
+            else:
+                bucket["calls"] += 1
+                bucket["input_tokens"] += input_tokens
+                bucket["output_tokens"] += output_tokens
             if is_batch:
                 self._batch_calls += 1
                 self._batch_input_tokens += input_tokens
@@ -209,18 +273,11 @@ class AICostTracker:
             logger.debug("AICostTracker.record failed (non-fatal): %s", e)
 
     def summary(self, model_for_estimate: str = "claude-haiku-4-5") -> dict:
-        """Today's running totals plus an estimated dollar cost. model_for_estimate
-        is used for BOTH the sequential and batch token pools -- accurate for this
-        codebase's real configuration (every research.model_* dial confirmed set to
-        the same claude-haiku-4-5 as of 2026-08-26), and a reasonable single-number
-        estimate even if a caller later mixes models, since per-model tracking
-        would require carrying a model breakdown through record() that nothing
-        currently needs."""
+        """Today's running totals plus an estimated dollar cost, priced per model
+        actually used (2026-10-14). model_for_estimate prices only tokens recorded
+        before per-model tracking existed (UNATTRIBUTED)."""
         self._roll_if_new_day()
-        cost = (estimate_cost_usd(model_for_estimate, self._input_tokens,
-                                   self._output_tokens, is_batch=False)
-                + estimate_cost_usd(model_for_estimate, self._batch_input_tokens,
-                                     self._batch_output_tokens, is_batch=True))
+        cost = _cost_by_model(self._by_model, model_for_estimate)
         return {
             "date": self._date_str,
             "calls": self._calls + self._batch_calls,
@@ -242,6 +299,7 @@ class AICostTracker:
                 "batch_calls": self._batch_calls,
                 "batch_input_tokens": self._batch_input_tokens,
                 "batch_output_tokens": self._batch_output_tokens,
+                "by_model": self._by_model,
             }), encoding="utf-8")
         except Exception as e:
             logger.debug("AICostTracker._save failed (non-fatal): %s", e)
@@ -259,6 +317,7 @@ class AICostTracker:
                     self._batch_calls = data.get("batch_calls", 0)
                     self._batch_input_tokens = data.get("batch_input_tokens", 0)
                     self._batch_output_tokens = data.get("batch_output_tokens", 0)
+                    self._by_model = _by_model_from_cache(data)
                 elif cached_date:
                     # A restart landed on a new day before the prior day's totals
                     # were ever rolled over (_roll_if_new_day never got a chance to
@@ -268,6 +327,7 @@ class AICostTracker:
                         cached_date, data.get("calls", 0), data.get("input_tokens", 0),
                         data.get("output_tokens", 0), data.get("batch_calls", 0),
                         data.get("batch_input_tokens", 0), data.get("batch_output_tokens", 0),
+                        by_model=_by_model_from_cache(data),
                     )
         except Exception as e:
             logger.debug("AICostTracker._load failed (non-fatal): %s", e)
