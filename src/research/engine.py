@@ -39,6 +39,40 @@ logger = logging.getLogger(__name__)
 _MODELS_REJECTING_TEMPERATURE: set[str] = set()
 
 
+# Thinking-by-default models (2026-10-14, claude-haiku-5-5 on all 8 dials): Haiku 5.5
+# runs adaptive thinking whenever a request doesn't set `thinking`, and thinking tokens
+# count against max_tokens. Every cap in this file was sized for the ANSWER alone back
+# when the dialed models never thought, so the 300-500 judgment-call caps were consumed
+# entirely by thinking (HTTP 200, no text block -- ~1,300 failed calls in one day) and
+# the 2,000-token analyze_stock cap truncated the JSON mid-string (89 fallback reports
+# across that day's scans). Headroom is added on top of each call's own answer cap so
+# every call site keeps its meaning; it costs nothing on a model that doesn't think
+# (output is billed on tokens actually produced, not the cap). The 16,000 ceiling keeps
+# non-streaming requests under the SDK's long-request timeout guard.
+_THINKING_HEADROOM_TOKENS = 8000
+_NON_STREAMING_MAX_TOKENS = 16000
+
+
+def _with_thinking_headroom(max_tokens: int) -> int:
+    """The max_tokens actually sent for a call whose answer needs `max_tokens`: the
+    answer cap plus room for adaptive thinking, never above the non-streaming ceiling
+    (and never below the caller's own cap)."""
+    return max(max_tokens, min(max_tokens + _THINKING_HEADROOM_TOKENS,
+                               _NON_STREAMING_MAX_TOKENS))
+
+
+def _warn_if_hit_max_tokens(message, context: str) -> None:
+    """Logs the real cause when a response stopped at max_tokens -- otherwise it
+    surfaces only as an opaque downstream "No text block" or JSON parse error."""
+    if getattr(message, "stop_reason", None) == "max_tokens":
+        usage = getattr(message, "usage", None)
+        logger.warning(
+            "%s hit max_tokens (model %s, %s output tokens) -- thinking may have used "
+            "the budget; the response is empty or truncated",
+            context, getattr(message, "model", "?"),
+            getattr(usage, "output_tokens", "?"))
+
+
 def _rejects_temperature(err: Exception) -> bool:
     """True when an Anthropic error is the "temperature is deprecated/unsupported for
     this model" rejection rather than a real failure. Shared by the sequential retry
@@ -894,7 +928,13 @@ class ResearchEngine:
         a hardcoded model-name check, since which models accept the parameter can change
         independently of this codebase: on that specific error, retries once immediately
         with temperature omitted entirely, without consuming one of the real retry attempts
-        meant for genuine transient failures."""
+        meant for genuine transient failures. A model already known to reject it skips
+        straight to the no-temperature request (2026-10-14) -- before that, every call
+        paid for a guaranteed 400 first.
+
+        `max_tokens` is the ANSWER's size; thinking headroom is added on top (see
+        _with_thinking_headroom)."""
+        max_tokens = _with_thinking_headroom(max_tokens)
         last_error: Exception | None = None
         for attempt in range(max_retries):
             if attempt > 0:
@@ -903,12 +943,19 @@ class ResearchEngine:
                 await asyncio.sleep(delay)
             try:
                 try:
-                    message = await asyncio.to_thread(
-                        lambda: self.client.messages.create(
-                            model=model, max_tokens=max_tokens, messages=messages,
-                            temperature=0.0,
+                    if model in _MODELS_REJECTING_TEMPERATURE:
+                        message = await asyncio.to_thread(
+                            lambda: self.client.messages.create(
+                                model=model, max_tokens=max_tokens, messages=messages,
+                            )
                         )
-                    )
+                    else:
+                        message = await asyncio.to_thread(
+                            lambda: self.client.messages.create(
+                                model=model, max_tokens=max_tokens, messages=messages,
+                                temperature=0.0,
+                            )
+                        )
                 except Exception as temp_err:
                     if _rejects_temperature(temp_err):
                         logger.info(
@@ -926,6 +973,7 @@ class ResearchEngine:
                         )
                     else:
                         raise
+                _warn_if_hit_max_tokens(message, "Claude response")
                 return extract_response_text(message.content, "Claude response")
             except Exception as e:
                 last_error = e
@@ -1987,7 +2035,9 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             )
             _params = {
                 "model": model,
-                "max_tokens": 2000,
+                # Same answer cap as analyze_stock's sequential path, plus the same
+                # thinking headroom (2026-10-14) -- see _with_thinking_headroom.
+                "max_tokens": _with_thinking_headroom(2000),
                 "messages": [{"role": "user", "content": prompt}],
             }
             # Omitted for a model already known to reject it (2026-09-01, full-codebase
@@ -2081,6 +2131,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                     logger.debug("AI cost tracking failed for a batch result "
                                  "(non-fatal): %s", e)
                 try:
+                    _warn_if_hit_max_tokens(result.result.message, f"{ticker} batch response")
                     response_text = extract_response_text(
                         result.result.message.content, "batch response")
                     report = self._parse_quick_scan_response(
