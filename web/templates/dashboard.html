@@ -690,6 +690,22 @@ tbody tr:hover { background: var(--bg-card-hover); }
 .trade-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 200; }
 .trade-modal-overlay.active { display: flex; }
 .trade-modal { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; width: 420px; max-width: 90vw; }
+/* All Sells window (2026-10-26) -- period chips, filters, totals strip, sortable table. */
+.as-toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 10px; }
+.as-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg-secondary); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 14px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+.as-chip:hover { border-color: var(--accent); }
+.as-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.as-chip select, .as-chip input { background: transparent; color: inherit; border: none; font-size: 12px; cursor: pointer; color-scheme: dark light; }
+.as-chip select option { color: var(--text-primary); background: var(--bg-secondary); }
+.as-input { background: var(--bg-input); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+.as-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.as-stat { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; }
+.as-stat-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; }
+.as-stat-value { font-size: 15px; font-weight: 700; margin-top: 2px; }
+.as-table-wrap { overflow: auto; flex: 1; min-height: 120px; }
+.as-table-wrap thead th { position: sticky; top: 0; background: var(--bg-card); z-index: 1; }
+.as-table-wrap th[data-sort] { cursor: pointer; user-select: none; white-space: nowrap; }
+.as-table-wrap th[data-sort]:hover { color: var(--text-primary); }
 /* Loading spinner (2026-08-14, owner request) -- shown immediately when a popup starts
    fetching, replaced once real content arrives. Several popups used to fetch first and
    only open/update afterward, so clicking one visibly did nothing for however long the
@@ -1021,6 +1037,12 @@ tbody tr:hover { background: var(--bg-card-hover); }
             <tr><td colspan="8"><div class="empty-state"><div class="icon">📉</div>No sells yet</div></td></tr>
           </tbody>
         </table>
+        <!-- View all (2026-10-26, owner request) -- this table keeps only the newest 30;
+             the All Sells window below holds every one, with period filters. -->
+        <div id="sellsMoreRow" style="display:none;justify-content:space-between;align-items:center;gap:8px;margin-top:8px;">
+          <span id="sellsMoreCount" style="font-size:11px;color:var(--text-muted);"></span>
+          <button onclick="openAllSells()" style="background:none;border:1px solid var(--accent);color:var(--accent);border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;">View all sells →</button>
+        </div>
       </div>
     </div>
 
@@ -1105,6 +1127,57 @@ tbody tr:hover { background: var(--bg-card-hover); }
     </div>
   </div>
 
+</div>
+
+<!-- All Sells window (2026-10-26, owner request) -- the Recent Sells panel keeps only the
+     newest 30, so older sells used to drop out of sight. z-index 95 keeps it BELOW every
+     other overlay (.modal-overlay 100, .trade-modal-overlay 200): a row click opens the
+     trade detail in #deepDiveModal, which must land on top of it. -->
+<div class="trade-modal-overlay" id="allSellsModal" style="z-index:95;" onclick="if(event.target===this)closeAllSells()">
+  <div class="trade-modal" style="max-width:1100px;width:94vw;height:88vh;display:flex;flex-direction:column;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <h3 style="margin:0;font-size:17px;">All Sells</h3>
+      <button class="cancel-btn" onclick="closeAllSells()" style="padding:4px 12px;">✕</button>
+    </div>
+    <div class="as-toolbar">
+      <span class="as-chip" data-period="week" onclick="setAllSellsPeriod('week')">This Week</span>
+      <span class="as-chip" data-period="month" onclick="setAllSellsPeriod('month')">Month <select id="allSellsMonth" onchange="onAllSellsInput('month')"></select></span>
+      <span class="as-chip" data-period="ytd" onclick="setAllSellsPeriod('ytd')">YTD</span>
+      <span class="as-chip" data-period="year" onclick="setAllSellsPeriod('year')">Year <select id="allSellsYear" onchange="onAllSellsInput('year')"></select></span>
+      <span class="as-chip" data-period="all" onclick="setAllSellsPeriod('all')">All</span>
+      <span class="as-chip" data-period="custom" onclick="setAllSellsPeriod('custom')">Custom
+        <input type="date" id="allSellsFrom" onchange="onAllSellsInput('custom')" aria-label="From date"> –
+        <input type="date" id="allSellsTo" onchange="onAllSellsInput('custom')" aria-label="To date"></span>
+    </div>
+    <div class="as-toolbar">
+      <input class="as-input" id="allSellsSearch" placeholder="Search ticker…" oninput="onAllSellsInput()" style="flex:1;min-width:140px;">
+      <select class="as-input" id="allSellsReason" onchange="onAllSellsInput()">
+        <option value="all">All reasons</option>
+        <option value="tp">Take-profit</option>
+        <option value="stop">Stop / trailing stop</option>
+        <option value="other">Other</option>
+      </select>
+      <button class="as-input" onclick="exportAllSellsCsv()" style="cursor:pointer;">⬇ Export CSV</button>
+    </div>
+    <div class="as-stats" id="allSellsTotals"></div>
+    <div class="as-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th data-sort="ticker" onclick="setAllSellsSort('ticker')">Ticker</th>
+            <th data-sort="trade_id" onclick="setAllSellsSort('trade_id')">ID</th>
+            <th class="right" data-sort="shares" onclick="setAllSellsSort('shares')">Shares</th>
+            <th class="right" data-sort="price" onclick="setAllSellsSort('price')">Sell Price</th>
+            <th class="right" data-sort="proceeds" onclick="setAllSellsSort('proceeds')">Proceeds</th>
+            <th class="right" data-sort="pnl" onclick="setAllSellsSort('pnl')">P/L</th>
+            <th data-sort="timestamp" onclick="setAllSellsSort('timestamp')">Date</th>
+            <th data-sort="reason" onclick="setAllSellsSort('reason')">Reason</th>
+          </tr>
+        </thead>
+        <tbody id="allSellsBody"></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <!-- Report Modal -->
@@ -3118,22 +3191,149 @@ function formatSellReason(reason) {
   return reason;
 }
 
-function renderSellsTable(allTrades) {
-  const tbody = document.getElementById('sellsBody');
-  if (!tbody) return;
-  // Keep each row's index into allTrades (== _tradeHistoryData, same array/order — see
-  // fetchTradeHistory) alongside it, so a click can open the same detail modal the Trades
-  // tab list already uses (2026-07-24 fix -- this table never had a click handler wired
-  // up at all, since its first commit, unlike the Trades tab list right above it).
-  const sells = allTrades
-    .map((t, i) => ({ t, i }))
-    .filter(x => x.t.action === 'SELL')
-    .slice(0, 30);
-  if (sells.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8"><div class="empty-state"><div class="icon">📉</div>No sells yet</div></td></tr>';
-    return;
+// ── All Sells window: pure helpers (no DOM) ──
+// (2026-10-26) Everything the window computes, kept free of the DOM so
+// tests/test_all_sells_window.py can run this exact block in Node. Rows are the same
+// { t, i } pairs as the Recent Sells table (t = a SELL row of _tradeHistoryData, i = its
+// index there, so a click can still open openTradeDetail(i)). Period boundaries are the
+// browser's local midnights -- the same clock the table's dates are shown in.
+function _sellsPad2(n) { return String(n).padStart(2, '0'); }
+function _sellsYmd(d) { return `${d.getFullYear()}-${_sellsPad2(d.getMonth() + 1)}-${_sellsPad2(d.getDate())}`; }
+function _sellsParseYmd(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || '');
+  return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null;
+}
+
+// Groups a raw trade_history reason for the reason filter: take-profit tranches, stop
+// and trailing-stop exits, and everything else (manual, rotation, broker-detected
+// "Stop/TP" closes whose cause is unknown, unreconciled fills).
+function sellReasonCategory(reason) {
+  const r = (reason || '').toLowerCase();
+  if (r.startsWith('take-profit')) return 'tp';
+  if (r.includes('stop') && !r.includes('stop/tp')) return 'stop';
+  return 'other';
+}
+
+// { start, end } for a period button: start inclusive, end exclusive, null = open-ended.
+// opts carries the Month/Year picker values ('YYYY-MM', 'YYYY') and the custom range's
+// 'YYYY-MM-DD' dates (the custom end date is inclusive -- the whole day counts).
+function sellsPeriodRange(period, opts, now) {
+  if (period === 'week') {
+    const daysSinceMonday = (now.getDay() + 6) % 7;
+    return { start: new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysSinceMonday), end: null };
   }
-  tbody.innerHTML = sells.map(({ t, i }) => {
+  if (period === 'month') {
+    const [y, m] = opts.month.split('-').map(Number);
+    return { start: new Date(y, m - 1, 1), end: new Date(y, m, 1) };
+  }
+  if (period === 'ytd') return { start: new Date(now.getFullYear(), 0, 1), end: null };
+  if (period === 'year') {
+    const y = Number(opts.year);
+    return { start: new Date(y, 0, 1), end: new Date(y + 1, 0, 1) };
+  }
+  if (period === 'custom') {
+    const from = _sellsParseYmd(opts.from);
+    const to = _sellsParseYmd(opts.to);
+    return { start: from, end: to ? new Date(to.getFullYear(), to.getMonth(), to.getDate() + 1) : null };
+  }
+  return { start: null, end: null };
+}
+
+function filterSells(sells, f) {
+  const q = (f.ticker || '').trim().toUpperCase();
+  return sells.filter(({ t }) => {
+    const ts = parseUtcTimestamp(t.timestamp);
+    if (f.start && (!ts || ts < f.start)) return false;
+    if (f.end && (!ts || ts >= f.end)) return false;
+    if (q && !(t.ticker || '').toUpperCase().includes(q)) return false;
+    if (f.reason && f.reason !== 'all' && sellReasonCategory(t.reason) !== f.reason) return false;
+    return true;
+  });
+}
+
+// New array sorted by one column; blank values (no P/L, no trade ID) sort last either way.
+function sortSells(rows, key, dir) {
+  const value = ({ t }) => key === 'proceeds' ? (t.shares || 0) * (t.price || 0)
+    : key === 'reason' ? formatSellReason(t.reason) : t[key];
+  const sign = dir === 'asc' ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const va = value(a), vb = value(b);
+    const blankA = va == null || va === '', blankB = vb == null || vb === '';
+    if (blankA || blankB) return blankA === blankB ? 0 : (blankA ? 1 : -1);
+    if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * sign;
+    return String(va).localeCompare(String(vb)) * sign;
+  });
+}
+
+// Wins/losses count each sell row (a 3-tranche exit counts three times) -- deliberately
+// not the dashboard's per-trade win rate, which groups by trade_id.
+function summarizeSells(rows) {
+  const s = { count: rows.length, proceeds: 0, pnl: 0, wins: 0, losses: 0 };
+  for (const { t } of rows) {
+    s.proceeds += (t.shares || 0) * (t.price || 0);
+    if (t.pnl != null) {
+      s.pnl += t.pnl;
+      if (t.pnl > 0) s.wins++;
+      else if (t.pnl < 0) s.losses++;
+    }
+  }
+  return s;
+}
+
+function _sellsCsvField(value) {
+  const s = value == null ? '' : String(value);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// Exactly the rows on screen, in on-screen order; dates in the same local clock the
+// table shows, the full trade ID, and the same reason label.
+function sellsToCsv(rows) {
+  const lines = ['Date,Ticker,Trade ID,Shares,Sell Price,Proceeds,P/L,Reason,Estimated'];
+  for (const { t } of rows) {
+    const shares = t.shares || 0, price = t.price || 0;
+    const ts = parseUtcTimestamp(t.timestamp);
+    lines.push([
+      ts ? ts.toLocaleString('sv-SE').slice(0, 16) : '',
+      t.ticker, t.trade_id || '', String(+shares.toFixed(6)), price.toFixed(2),
+      (shares * price).toFixed(2), t.pnl != null ? t.pnl.toFixed(2) : '',
+      formatSellReason(t.reason), t.is_estimated ? 'yes' : '',
+    ].map(_sellsCsvField).join(','));
+  }
+  return lines.join('\r\n');
+}
+
+function sellsCsvFilename(period, opts, now) {
+  if (period === 'month') return `sells-${opts.month}.csv`;
+  if (period === 'year') return `sells-${opts.year}.csv`;
+  if (period === 'ytd') return `sells-ytd-${now.getFullYear()}.csv`;
+  if (period === 'week') return `sells-week-of-${_sellsYmd(sellsPeriodRange('week', opts, now).start)}.csv`;
+  if (period === 'custom') return `sells-${opts.from || 'start'}-to-${opts.to || 'now'}.csv`;
+  return 'sells-all.csv';
+}
+
+// Picker choices run from the first sell's month/year through now, newest first, so a
+// month with no sells still shows (as an empty period) rather than vanishing.
+function sellsMonthOptions(sells, now) {
+  let first = new Date(now.getFullYear(), now.getMonth(), 1);
+  for (const { t } of sells) {
+    const ts = parseUtcTimestamp(t.timestamp);
+    if (ts && ts < first) first = new Date(ts.getFullYear(), ts.getMonth(), 1);
+  }
+  const out = [];
+  for (let d = new Date(now.getFullYear(), now.getMonth(), 1); d >= first; d = new Date(d.getFullYear(), d.getMonth() - 1, 1)) {
+    out.push(_sellsYmd(d).slice(0, 7));
+  }
+  return out;
+}
+
+function sellsYearOptions(sells, now) {
+  return [...new Set(sellsMonthOptions(sells, now).map(m => m.slice(0, 4)))];
+}
+// ── end All Sells pure helpers ──
+
+// One sell row, shared by the Recent Sells panel and the All Sells window so both
+// always format a sale identically.
+function sellRowHtml({ t, i }) {
     const shares = t.shares || 0;
     const price = t.price || 0;
     const proceeds = shares * price;
@@ -3172,15 +3372,165 @@ function renderSellsTable(allTrades) {
       <td style="white-space:nowrap;">${dateStr}</td>
       <td>${formatSellReason(t.reason)}</td>
     </tr>`;
-  }).join('');
+}
+
+function renderSellsTable(allTrades) {
+  const tbody = document.getElementById('sellsBody');
+  if (!tbody) return;
+  // Keep each row's index into allTrades (== _tradeHistoryData, same array/order — see
+  // fetchTradeHistory) alongside it, so a click can open the same detail modal the Trades
+  // tab list already uses (2026-07-24 fix -- this table never had a click handler wired
+  // up at all, since its first commit, unlike the Trades tab list right above it).
+  const allSells = allTrades
+    .map((t, i) => ({ t, i }))
+    .filter(x => x.t.action === 'SELL');
+  const sells = allSells.slice(0, 30);
+  const moreRow = document.getElementById('sellsMoreRow');
+  if (moreRow) {
+    moreRow.style.display = allSells.length ? 'flex' : 'none';
+    document.getElementById('sellsMoreCount').textContent = allSells.length > 30
+      ? `Showing newest 30 of ${allSells.length} sells`
+      : `${allSells.length} sell${allSells.length === 1 ? '' : 's'}`;
+  }
+  refreshAllSellsIfOpen();
+  if (sells.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8"><div class="empty-state"><div class="icon">📉</div>No sells yet</div></td></tr>';
+    return;
+  }
+  tbody.innerHTML = sells.map(sellRowHtml).join('');
+}
+
+// All Sells window (2026-10-26, owner request) -- every sell, not just the newest 30,
+// filtered by the period chips / ticker search / reason and sorted by any column. The
+// filter state survives closing and reopening the window within a page load.
+let _allSellsState = null;
+let _allSellsRows = [];   // what's on screen right now -- the CSV export's source
+
+function openAllSells() {
+  if (!_allSellsState) {
+    const now = new Date();
+    _allSellsState = {
+      period: 'month', month: _sellsYmd(now).slice(0, 7), year: String(now.getFullYear()),
+      from: '', to: '', ticker: '', reason: 'all', sortKey: 'timestamp', sortDir: 'desc',
+    };
+  }
+  document.getElementById('allSellsModal').classList.add('active');
+  renderAllSells();
+}
+
+function closeAllSells() {
+  document.getElementById('allSellsModal').classList.remove('active');
+}
+
+function refreshAllSellsIfOpen() {
+  const modal = document.getElementById('allSellsModal');
+  if (modal && modal.classList.contains('active')) renderAllSells();
+}
+
+function setAllSellsPeriod(period) {
+  _allSellsState.period = period;
+  renderAllSells();
+}
+
+// A picker or date change also selects its chip (choosing a month means "show that
+// month"); the search box and reason filter keep the current period.
+function onAllSellsInput(period) {
+  const s = _allSellsState;
+  s.ticker = document.getElementById('allSellsSearch').value;
+  s.reason = document.getElementById('allSellsReason').value;
+  s.month = document.getElementById('allSellsMonth').value || s.month;
+  s.year = document.getElementById('allSellsYear').value || s.year;
+  s.from = document.getElementById('allSellsFrom').value;
+  s.to = document.getElementById('allSellsTo').value;
+  if (period) s.period = period;
+  renderAllSells();
+}
+
+function setAllSellsSort(key) {
+  const s = _allSellsState;
+  if (s.sortKey === key) {
+    s.sortDir = s.sortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    s.sortKey = key;
+    s.sortDir = ['ticker', 'trade_id', 'reason'].includes(key) ? 'asc' : 'desc';
+  }
+  renderAllSells();
+}
+
+// Rebuilds a picker's options only when the list itself changed, so an open dropdown
+// isn't torn down by an unrelated re-render (search typing, a new trade arriving).
+function _fillAllSellsPicker(id, values, label, selected) {
+  const sel = document.getElementById(id);
+  const key = values.join(',');
+  if (sel.dataset.options !== key) {
+    sel.innerHTML = values.map(v => `<option value="${v}">${label(v)}</option>`).join('');
+    sel.dataset.options = key;
+  }
+  sel.value = selected;
+}
+
+function renderAllSells() {
+  const s = _allSellsState;
+  if (!s) return;
+  const now = new Date();
+  const allSells = _tradeHistoryData.map((t, i) => ({ t, i })).filter(x => x.t.action === 'SELL');
+
+  const months = sellsMonthOptions(allSells, now);
+  const years = sellsYearOptions(allSells, now);
+  if (!months.includes(s.month)) s.month = months[0];
+  if (!years.includes(s.year)) s.year = years[0];
+  _fillAllSellsPicker('allSellsMonth', months, m => {
+    const [y, mo] = m.split('-').map(Number);
+    return new Date(y, mo - 1, 1).toLocaleString('en-US', { month: 'short', year: 'numeric' });
+  }, s.month);
+  _fillAllSellsPicker('allSellsYear', years, y => y, s.year);
+
+  const rows = sortSells(
+    filterSells(allSells, { ...sellsPeriodRange(s.period, s, now), ticker: s.ticker, reason: s.reason }),
+    s.sortKey, s.sortDir);
+  _allSellsRows = rows;
+
+  document.querySelectorAll('#allSellsModal [data-period]').forEach(el =>
+    el.classList.toggle('active', el.dataset.period === s.period));
+  document.querySelectorAll('#allSellsModal th[data-sort]').forEach(th => {
+    if (!th.dataset.label) th.dataset.label = th.textContent;
+    th.textContent = th.dataset.label + (th.dataset.sort === s.sortKey ? (s.sortDir === 'asc' ? ' ▲' : ' ▼') : '');
+  });
+
+  const sum = summarizeSells(rows);
+  const pnlColor = sum.pnl > 0 ? 'var(--green)' : sum.pnl < 0 ? 'var(--red)' : 'var(--text-primary)';
+  const stat = (label, value, style = '') =>
+    `<div class="as-stat"><div class="as-stat-label">${label}</div><div class="as-stat-value" style="${style}">${value}</div></div>`;
+  document.getElementById('allSellsTotals').innerHTML =
+    stat('Sells', sum.count) +
+    stat('Proceeds', `$${sum.proceeds.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`) +
+    stat('Realized P/L', `${sum.pnl < 0 ? '-' : '+'}$${Math.abs(sum.pnl).toFixed(2)}`, `color:${pnlColor}`) +
+    stat('Winning / losing sells', `${sum.wins} / ${sum.losses}`);
+
+  document.getElementById('allSellsBody').innerHTML = rows.length
+    ? rows.map(sellRowHtml).join('')
+    : '<tr><td colspan="8"><div class="empty-state"><div class="icon">📉</div>No sells match this period and filter</div></td></tr>';
+}
+
+function exportAllSellsCsv() {
+  // Leading BOM so Excel reads the file as UTF-8 (the reason labels use an em dash).
+  const blob = new Blob(['﻿' + sellsToCsv(_allSellsRows)], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = sellsCsvFilename(_allSellsState.period, _allSellsState, new Date());
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 // Expanded per-trade detail modal (2026-07-21) -- shows every field the unified
 // /api/trade-history response carries for this specific row: full timestamp, shares,
 // price, P&L (sells), reason/tranche (sells, with an ESTIMATED badge when the value was
 // reconstructed rather than recorded), and conviction/reasoning (buys). Reuses the
-// existing #reportModal shell (title + body) rather than building a new modal element,
-// same "share the modal, vary the content" pattern already used elsewhere on this page.
+// shared #deepDiveModal shell (see the note below -- not #reportModal, as this comment
+// used to say) rather than building a new modal element, same "share the modal, vary
+// the content" pattern already used elsewhere on this page.
 function openTradeDetail(index) {
   const t = _tradeHistoryData[index];
   if (!t) return;
@@ -4729,6 +5079,11 @@ document.addEventListener('keydown', (e) => {
   // modal (matching the existing click-outside pattern), so calling all of them
   // unconditionally is safe regardless of which one (if any) is open.
   if (e.key !== 'Escape') return;
+  // The All Sells window sits below every other overlay (z-index 95), so anything else
+  // open -- e.g. a sell's trade detail in #deepDiveModal -- is on top of it. Escape
+  // closes that first and leaves the list open behind it.
+  const anotherWasOpen = [...document.querySelectorAll('.modal-overlay.active, .trade-modal-overlay.active')]
+    .some(el => el.id !== 'allSellsModal');
   closeModal();
   closeDeepDiveModal();
   closeTradeModal();
@@ -4737,6 +5092,7 @@ document.addEventListener('keydown', (e) => {
   closePortfolioSummary();
   closeDDConfirm();
   closeOnDeckRemoveModal();
+  if (!anotherWasOpen) closeAllSells();
 });
 
 // ── Clock ──────────────────────────────────────────────────────────────────
