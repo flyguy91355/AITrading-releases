@@ -29,7 +29,7 @@ from src.utils.config import load_config
 from src.data.market_data import MarketDataFetcher
 from src.data.insider_tracker import InsiderTracker
 from src.data.news_feed import NewsFeed
-from src.research.engine import ResearchEngine, _clamp_ai_stop_loss, extract_response_text
+from src.research.engine import ResearchEngine, _clamp_ai_stop_loss
 from src.research.market_cap import market_cap_tier_label as _market_cap_tier_label
 from src.research.quick_screen import quick_screen
 
@@ -7301,31 +7301,34 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 return
 
             model = self.config.get("research", {}).get("model_quick_scan", "claude-haiku-4-5")
-            message = await asyncio.to_thread(
-                lambda: self.research_engine.client.messages.create(
-                    model=model, max_tokens=400,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            )
-            # Shared extract_response_text, not a 3rd local copy of the ThinkingBlock-skip
-            # (GitHub #158) -- CLAUDE.md's AI Data Integrity section requires that
-            # invariant hold at EVERY Claude-response parse site, and this file had
-            # independently duplicated it. The helper RAISES when no text block exists,
-            # so the ValueError is caught here to preserve this site's own deliberate
+            # Through the engine's shared call (2026-10-26), not a raw messages.create:
+            # its max_tokens=400 had no thinking headroom, so on Haiku 5.5 thinking used
+            # the whole cap and the report failed 7 of its first 8 days. The helper
+            # still extracts via extract_response_text and RAISES ValueError when no
+            # text block exists -- caught here to preserve this site's own deliberate
             # tolerance: unlike a real trading decision, this display-only daily report
             # still logs and pushes an explicit "no text in response" summary rather than
             # silently sending the owner nothing.
             try:
-                summary = extract_response_text(message.content, "daily report").strip()
+                summary = (await self.research_engine._call_claude_with_retry(
+                    model=model, max_tokens=400,
+                    messages=[{"role": "user", "content": prompt}],
+                )).strip()
+                generated = True
             except ValueError:
                 summary = "Daily report generation failed — no text in response."
+                generated = False
 
             entry = self.add_ai_log("SYSTEM", "DAILY_REPORT", summary, "info")
             await self.broadcast({"type": "ai_log", "entry": entry})
 
             await _notify(f"📊 Daily Report — {today_str}", summary,
                           priority="default", tags="bar_chart")
-            logger.info("Daily report generated and sent for %s", today_str)
+            if generated:
+                logger.info("Daily report generated and sent for %s", today_str)
+            else:
+                logger.warning("Daily report for %s had no text — sent the failure "
+                               "notice instead", today_str)
         except Exception as e:
             logger.error("Daily report generation failed: %s", e)
 

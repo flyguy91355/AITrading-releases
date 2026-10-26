@@ -28,16 +28,6 @@ from src.research.ai_cost_tracker import AICostTracker, CostTrackingClient
 
 logger = logging.getLogger(__name__)
 
-# Models observed to reject the `temperature` parameter (2026-07-19, claude-sonnet-5 on
-# the deep-dive dial). Learned at runtime by _call_claude_with_retry's fallback and read
-# by submit_analysis_batch, which has no per-request retry of its own: the Batch API
-# surfaces a bad param as a per-request error, so every ticker in a ~1,500-request
-# pre-open batch came back errored -> is_fallback -> On Deck got nothing that day, with
-# no automatic recovery (errored requests complete promptly, so the zero-progress stall
-# detector that would have triggered the sequential fallback never fired). Process-wide
-# and deliberately not persisted -- one sequential call re-learns it after a restart.
-_MODELS_REJECTING_TEMPERATURE: set[str] = set()
-
 
 # Thinking-by-default models (2026-10-14, claude-haiku-5-5 on all 8 dials): Haiku 5.5
 # runs adaptive thinking whenever a request doesn't set `thinking`, and thinking tokens
@@ -71,15 +61,6 @@ def _warn_if_hit_max_tokens(message, context: str) -> None:
             "the budget; the response is empty or truncated",
             context, getattr(message, "model", "?"),
             getattr(usage, "output_tokens", "?"))
-
-
-def _rejects_temperature(err: Exception) -> bool:
-    """True when an Anthropic error is the "temperature is deprecated/unsupported for
-    this model" rejection rather than a real failure. Shared by the sequential retry
-    and the batch submission so both recognize it identically."""
-    msg = str(err).lower()
-    return "temperature" in msg and ("deprecat" in msg or "unsupported" in msg
-                                     or "not supported" in msg)
 
 
 class Signal(Enum):
@@ -918,19 +899,14 @@ class ResearchEngine:
     ) -> str:
         """Call Claude API with exponential backoff retry. Returns the text response.
 
-        Some models reject the `temperature` parameter outright with a 400 "temperature is
-        deprecated for this model" error rather than silently ignoring it — discovered
-        2026-07-19 when claude-sonnet-5 (the deep-dive tier) hit this on every single call,
-        the first time this session actually exercised the deep-dive model path since the
-        2026-07-15 fix that added temperature=0.0 here for output-determinism (that fix was
-        only verified against the quick-scan tier's Haiku model at the time; nobody had run
-        a Deep Dive since, so it went undetected for 4 days). Handled generically rather than
-        a hardcoded model-name check, since which models accept the parameter can change
-        independently of this codebase: on that specific error, retries once immediately
-        with temperature omitted entirely, without consuming one of the real retry attempts
-        meant for genuine transient failures. A model already known to reject it skips
-        straight to the no-temperature request (2026-10-14) -- before that, every call
-        paid for a guaranteed 400 first.
+        Sends no sampling parameters (temperature/top_p/top_k) -- removed 2026-10-26. The
+        temperature=0.0 added 2026-07-15 for output-determinism was rejected by
+        claude-sonnet-5 (2026-07-19) and by claude-haiku-5-5 (every dial since
+        2026-10-14, which accepts only the default), and API version 2026-10-21 rejects
+        all three on every model. The retry-without-it workaround only remembered a
+        rejecting model in memory, so after a restart the pre-open batch -- often the
+        first AI call -- still sent it and lost every ticker (10/15, 10/26). Omitting it
+        changes nothing on a model that only accepts the default anyway.
 
         `max_tokens` is the ANSWER's size; thinking headroom is added on top (see
         _with_thinking_headroom)."""
@@ -942,37 +918,11 @@ class ResearchEngine:
                 logger.warning("Claude API retry %d/%d in %.0fs...", attempt + 1, max_retries, delay)
                 await asyncio.sleep(delay)
             try:
-                try:
-                    if model in _MODELS_REJECTING_TEMPERATURE:
-                        message = await asyncio.to_thread(
-                            lambda: self.client.messages.create(
-                                model=model, max_tokens=max_tokens, messages=messages,
-                            )
-                        )
-                    else:
-                        message = await asyncio.to_thread(
-                            lambda: self.client.messages.create(
-                                model=model, max_tokens=max_tokens, messages=messages,
-                                temperature=0.0,
-                            )
-                        )
-                except Exception as temp_err:
-                    if _rejects_temperature(temp_err):
-                        logger.info(
-                            "Model %s rejects temperature param — retrying without it", model)
-                        # Remember it process-wide (2026-09-01, full-codebase review) so
-                        # the Batch API path stops sending temperature for this model
-                        # too -- it has no per-request retry of its own, so a model that
-                        # rejects the parameter errored every request in the pre-open
-                        # batch and produced a whole day of fallback reports.
-                        _MODELS_REJECTING_TEMPERATURE.add(model)
-                        message = await asyncio.to_thread(
-                            lambda: self.client.messages.create(
-                                model=model, max_tokens=max_tokens, messages=messages,
-                            )
-                        )
-                    else:
-                        raise
+                message = await asyncio.to_thread(
+                    lambda: self.client.messages.create(
+                        model=model, max_tokens=max_tokens, messages=messages,
+                    )
+                )
                 _warn_if_hit_max_tokens(message, "Claude response")
                 return extract_response_text(message.content, "Claude response")
             except Exception as e:
@@ -2033,6 +1983,9 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 analysis_history_summary=_history.get(ticker, ""),
                 sma_context=_sma.get(ticker),
             )
+            # No sampling params (2026-10-26) -- see _call_claude_with_retry. The Batch
+            # API reports a rejected param per request, so one bad param errors EVERY
+            # ticker in the batch.
             _params = {
                 "model": model,
                 # Same answer cap as analyze_stock's sequential path, plus the same
@@ -2040,13 +1993,6 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 "max_tokens": _with_thinking_headroom(2000),
                 "messages": [{"role": "user", "content": prompt}],
             }
-            # Omitted for a model already known to reject it (2026-09-01, full-codebase
-            # review) -- see _MODELS_REJECTING_TEMPERATURE. The sequential path has had
-            # a retry-without-temperature fallback since the 2026-07-19 incident; this
-            # path had nothing equivalent, and a per-request param rejection errors
-            # EVERY request in the batch.
-            if model not in _MODELS_REJECTING_TEMPERATURE:
-                _params["temperature"] = 0.0
             requests.append({"custom_id": ticker, "params": _params})
 
         try:
@@ -2054,25 +2000,6 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 self.client.beta.messages.batches.create, requests=requests,
             )
         except Exception as e:
-            # A create-time temperature rejection is recoverable: drop the parameter,
-            # remember the model, and resubmit once rather than losing the whole batch.
-            if _rejects_temperature(e) and model not in _MODELS_REJECTING_TEMPERATURE:
-                logger.warning(
-                    "Model %s rejected the temperature param on batch submission — "
-                    "resubmitting without it", model)
-                _MODELS_REJECTING_TEMPERATURE.add(model)
-                for _r in requests:
-                    _r["params"].pop("temperature", None)
-                try:
-                    batch = await asyncio.to_thread(
-                        self.client.beta.messages.batches.create, requests=requests,
-                    )
-                    return batch.id, inputs_by_ticker
-                except Exception as e2:
-                    logger.error(
-                        "Batch resubmission without temperature also failed for %d "
-                        "tickers: %s", len(requests), e2)
-                    return None, {}
             logger.error("Batch submission failed for %d tickers: %s", len(requests), e)
             return None, {}
 
@@ -2147,28 +2074,15 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                         inp["news_summary"], inp["competitive_summary"], e,
                     )
             else:
-                # Learn a per-request param rejection from the error body (2026-09-01,
-                # full-codebase review) so the NEXT batch omits temperature for this
-                # model instead of erroring every request again -- see
-                # _MODELS_REJECTING_TEMPERATURE. The batch API reports a bad param this
-                # way rather than failing the create call, which is why the submission
-                # -side retry alone isn't enough.
+                # Carry the API's own error (2026-10-26) -- "type=errored" alone says
+                # nothing about why every request in a batch failed.
                 _err_detail = getattr(result.result, "error", None)
-                if _err_detail is not None and _rejects_temperature(
-                        Exception(str(_err_detail))):
-                    _batch_model = self.config.get("research", {}).get(
-                        "model_pre_open_scan", "")
-                    if _batch_model and _batch_model not in _MODELS_REJECTING_TEMPERATURE:
-                        logger.warning(
-                            "Batch requests are failing because model %s rejects the "
-                            "temperature param — future batches will omit it",
-                            _batch_model)
-                        _MODELS_REJECTING_TEMPERATURE.add(_batch_model)
                 report = self._fallback_report(
                     ticker, inp["company_name"], inp["current_price"],
                     inp["fundamental_summary"], inp["insider_summary"],
                     inp["news_summary"], inp["competitive_summary"],
-                    Exception(f"batch result type={result.result.type}"),
+                    Exception(f"batch result type={result.result.type}"
+                              + (f": {_err_detail}" if _err_detail is not None else "")),
                 )
 
             report.sector = inp.get("sector", "")
