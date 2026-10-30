@@ -459,6 +459,14 @@ Respond with ONLY the JSON object, no other text.
 """
 
 
+# entry_price and the risk/reward rule (2026-10-30, Haiku 5.5): the buy pipeline computes
+# R/R at report.entry_price (admission, the promotion re-check, the On Deck card's
+# last_price, Track 2's cross gap) and assumes it is the market price. Haiku 4.5 always
+# used the current price; Haiku 5.5 honored the R/R rule literally by moving entry_price a
+# median ~5% BELOW market, so its R/R looked fine on paper and collapsed at the open. A
+# same-day A/B on 54 tickers (current / entry rule alone / entry rule + "the system
+# enforces R/R") picked the last: BUY share 7% -> 24%, entries at market, stops 9.3% ->
+# 7.2% below price. The entry rule alone made 5.5 stricter still (BUY share 4%).
 ANALYSIS_PROMPT = """\
 You are a senior equity research analyst. Analyze the following stock data and produce a structured investment recommendation.
 
@@ -468,7 +476,8 @@ IMPORTANT RULES:
 - Be conservative. The cardinal rule is NEVER LOSE MONEY.
 - Only recommend BUY or STRONG BUY if conviction is {min_conviction:.1f}/10 or higher.
 - Every recommendation MUST include a stop loss.
-- Risk/reward ratio must be at least {rr_base:.1f}:1 for a stock right at the {min_conviction:.1f}/10 conviction minimum, scaling down modestly for higher conviction — never below {rr_floor:.1f}:1 regardless of how high conviction is.
+- The system applies its own risk/reward gate — at least {rr_base:.1f}:1 for a stock right at the {min_conviction:.1f}/10 conviction minimum, scaling down modestly for higher conviction, never below {rr_floor:.1f}:1 — computed from the current price, your stop_loss and your fair_value_estimate, and it waits for a better price before buying when needed. So set the signal from conviction and the quality of the business and setup: do not downgrade a BUY to HOLD only because today's price doesn't clear that ratio yet.
+- For BUY or STRONG BUY, entry_price is the CURRENT PRICE above — the system times the actual purchase itself (it watches for a dip and a confirmed uptick before buying). Measure risk/reward, stop_loss and take_profit_targets from the current price. Never set entry_price below the current price to make the risk/reward work: if the setup is only attractive at a lower price, the signal is HOLD and that price belongs in watch_condition.
 - If the data is insufficient or unclear, recommend NO ACTION.
 - Every numeric field you output (entry_price, stop_loss, take_profit_targets) must be used consistently everywhere else in your response, including inside reasoning — if you cite risk/reward math or a specific target price in reasoning, it must match the actual entry_price/stop_loss/take_profit_targets values you output, and "first target" must mean take_profit_targets[0], not a later one.
 - If a LONG-TERM TREND section is present below, weigh it explicitly: judge whether the current setup looks like a genuine fundamental turnaround versus a bounce back toward a level the stock has already failed at before.
@@ -503,7 +512,7 @@ Based on all of the above, provide your analysis as JSON with these exact fields
     "thesis": "<2-3 sentence investment thesis>",
     "risk_factors": "<key risks that could invalidate the thesis>",
     "recommended_action": "<specific action to take>",
-    "entry_price": <recommended entry price as number>,
+    "entry_price": <for BUY/STRONG BUY: the current price; otherwise the price at which you would buy>,
     {stop_tp_instructions}
     "position_size_pct": <recommended position size as % of portfolio, 1-10>,
     "time_horizon": "<days|weeks|months>",

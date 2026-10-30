@@ -331,6 +331,8 @@ _BUY_REASONING_CACHE_PATH = Path("data/buy_reasoning_cache.json")
 _EVENT_MONITOR_COOLDOWN_CACHE_PATH = Path("data/event_monitor_cooldown_cache.json")
 _MIDDAY_SCAN_FIRED_CACHE_PATH = Path("data/midday_scan_fired_cache.json")
 _ON_DECK_STALE_DIP_LOW_CACHE_PATH = Path("data/on_deck_stale_dip_low_cache.json")
+# Track 2 approaching-cross declines (2026-10-30) -- see _track2_decline_cooling.
+_TRACK2_DECLINE_CACHE_PATH = Path("data/track2_decline_cache.json")
 # Log of every real promotion ATTEMPT (2026-07-21) -- repurposes the old "Candidates" tab,
 # whose original data source (run_deep_dives -> _collect_buy_candidates) had zero live
 # callers left anywhere in this file, a dead leftover from the pre-2026-07-17 Watchlist-era
@@ -1411,6 +1413,38 @@ def _load_on_deck_blocked() -> dict:
     return {}
 
 
+def _save_track2_declines(declines: dict) -> None:
+    """ticker -> {"date", "outcome", "signal", "conviction"} for Track 2 approaching-cross
+    candidates a fresh analysis rejected (2026-10-30) -- see _track2_decline_cooling."""
+    _atomic_write_json(_TRACK2_DECLINE_CACHE_PATH, declines, "Track 2 decline cache")
+
+
+def _load_track2_declines() -> dict:
+    try:
+        if _TRACK2_DECLINE_CACHE_PATH.exists():
+            return json.loads(_TRACK2_DECLINE_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to load Track 2 decline cache: %s", e)
+    return {}
+
+
+def _track2_decline_cooling(declined: dict | None, today: date, cooldown_days: int) -> bool:
+    """True while a Track 2 approaching-cross candidate whose fresh analysis rejected it
+    is still inside its retry cooldown (2026-10-30). _run_sma_trend_scan re-sent the same
+    On Shore stocks to a full promotion analysis at the end of every mid-day scan --
+    WMB/KMI/KMB/FNB/RF/D/GME/VLY, ~10 real Claude calls a day, every one HOLD/NO ACTION
+    at conviction 4.5-5.6 -- because an approaching cross persists for days and nothing
+    remembered the verdict. Calendar days from the decline's ET date; 0 disables. A
+    missing or malformed record never cools (fail toward re-asking, the old behavior)."""
+    if not declined or cooldown_days <= 0:
+        return False
+    try:
+        declined_on = date.fromisoformat(str(declined.get("date")))
+    except (TypeError, ValueError):
+        return False
+    return (today - declined_on).days < cooldown_days
+
+
 def _save_on_deck_notes(notes: dict) -> None:
     """Persistent per-ticker notes attached to a manual On Deck removal (2026-07-29) --
     deliberately a SEPARATE store from on_deck_blocked: a note is meant to survive even
@@ -1923,6 +1957,10 @@ class DashboardState:
         # above, since this is a genuinely separate, additive mechanism from Track
         # 1's own scans.
         self._sma_trend_scan_in_progress: bool = False
+        # Track 2 approaching-cross candidates a fresh analysis rejected (2026-10-30),
+        # persisted (_save_track2_declines) and restored in startup() -- see
+        # _track2_decline_cooling.
+        self._track2_declines: dict[str, dict] = {}
 
         # Shared SMA50/SMA200 cache, ticker -> (sma_50, sma_200) (2026-08-25, owner
         # concern: "why cant it do both track 1 and 2 withe the same scan... does it
@@ -6746,6 +6784,22 @@ class DashboardState:
             min_conviction = self.config["research"]["min_conviction_score"]
             base_rr = self.config["research"]["min_risk_reward_ratio"]
 
+            def _note_track2_decline(outcome: str) -> None:
+                # Only a real verdict on a Track 2 approaching-cross attempt that paid for
+                # its own fresh analysis starts the retry cooldown (2026-10-30) -- never a
+                # fallback report, and never the portfolio-state gates (cash, sector,
+                # drawdown...), which can clear at any moment. See _track2_decline_cooling.
+                if (sma_context is None or not sma_context.get("approaching")
+                        or prefetched_report is not None
+                        or getattr(report, "is_fallback", True)):
+                    return
+                self._track2_declines[ticker] = {
+                    "date": self._now_et().date().isoformat(), "outcome": outcome,
+                    "signal": report.signal.value, "conviction": report.conviction_score,
+                }
+                asyncio.create_task(asyncio.to_thread(
+                    _save_track2_declines, dict(self._track2_declines)))
+
             def _refresh_nm_from_report(rr_val=None, required_rr_val=None):
                 # 2026-07-28, user request: a failed promotion attempt used to discard the
                 # fresh report it just paid for, leaving the On Deck card showing whatever
@@ -6799,6 +6853,7 @@ class DashboardState:
                 self._record_promotion_attempt(
                     ticker, dip_low, f"No longer qualifies — {report.signal.value}",
                     conviction=report.conviction_score, price=report.entry_price)
+                _note_track2_decline(f"No longer qualifies — {report.signal.value}")
                 if not getattr(report, "is_fallback", True):
                     _refresh_nm_from_report()
                 return
@@ -6856,6 +6911,7 @@ class DashboardState:
                 await _fail_gate(
                     f"R/R fell below gate ({rr:.2f} < {min_rr:.2f})",
                     f"R/R fell back below gate on fresh data — {rr:.2f} < {min_rr:.2f}")
+                _note_track2_decline(f"R/R fell below gate ({rr:.2f} < {min_rr:.2f})")
                 return
             if track2_override and rr < min_rr:
                 entry = self.add_ai_log(ticker, "ON_DECK",
@@ -6890,6 +6946,8 @@ class DashboardState:
                         f"R/R above gate, AI declined at buy trigger ({rr:.2f} > {min_rr:.2f})",
                         f"R/R {rr:.2f} above its own gate ({min_rr:.2f}) at the buy trigger "
                         f"— AI judged it's not a genuine opportunity: {reasoning}")
+                    _note_track2_decline(
+                        f"R/R above gate, AI declined at buy trigger ({rr:.2f} > {min_rr:.2f})")
                     return
 
             if ticker in self.portfolio.positions:  # re-check post-await race
@@ -9142,9 +9200,13 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         self._sma_trend_scan_in_progress = True
         try:
             near_threshold_pct = self.config["research"].get("sma_near_crossover_threshold_pct", 2.0)
+            decline_cooldown_days = int(
+                self.config["research"].get("sma_track2_decline_cooldown_days", 3))
+            today = self._now_et().date()
             checked = 0
             near_crossover = 0
             attempted = 0
+            cooling = 0
 
             entry = self.add_ai_log("SYSTEM", source_label,
                 "SMA trend-confirmation scan (Track 2, approaching-cross only) starting...", "info")
@@ -9177,6 +9239,13 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     continue
                 near_crossover += 1
 
+                # A fresh analysis already rejected this approaching cross recently --
+                # don't pay to re-ask until the cooldown runs out (2026-10-30).
+                if _track2_decline_cooling(
+                        self._track2_declines.get(ticker), today, decline_cooldown_days):
+                    cooling += 1
+                    continue
+
                 if self._no_buying_capacity():
                     continue
 
@@ -9202,9 +9271,13 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 await self.broadcast({"type": "ai_log", "entry": entry})
                 await self._attempt_near_miss_promotion(ticker, sma_context=sma_context)
 
+            _cooling_note = (
+                f", {cooling} skipped (a fresh analysis declined them within the last "
+                f"{decline_cooldown_days} days)" if cooling else "")
             entry = self.add_ai_log("SYSTEM", source_label,
                 f"SMA trend-confirmation scan complete — {checked:,} tickers checked, "
-                f"{near_crossover} approaching a cross, {attempted} sent for analysis.",
+                f"{near_crossover} approaching a cross, {attempted} sent for analysis"
+                f"{_cooling_note}.",
                 "success")
             await self.broadcast({"type": "ai_log", "entry": entry})
         finally:
@@ -12446,6 +12519,10 @@ async def startup():
     state.on_deck_notes = _load_on_deck_notes()
     if state.on_deck_notes:
         logger.info("Restored %d On Deck note(s)", len(state.on_deck_notes))
+
+    state._track2_declines = _load_track2_declines()
+    if state._track2_declines:
+        logger.info("Restored %d Track 2 decline(s)", len(state._track2_declines))
 
     state.on_deck_stale_dip_low = _load_on_deck_stale_dip_low()
     if state.on_deck_stale_dip_low:
