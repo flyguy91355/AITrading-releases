@@ -6416,7 +6416,11 @@ class DashboardState:
         than an approximate one -- it leaves the lot with no basis at all)."""
         is_paper = getattr(self.order_manager.broker, "paper", True)
         try:
-            if order.filled_price is None:
+            # Only a FILLED response is final (2026-10-30, CSX): a partially_filled one
+            # already carries filled_avg_price/filled_qty for just the portion done so
+            # far, and a notional buy's submit response can itself be partial (BEN,
+            # 2026-07-29) -- so anything short of FILLED goes through the poll.
+            if order.status != OrderStatus.FILLED or order.filled_price is None:
                 await self._await_buy_fill(signal, order)
             else:
                 signal.entry_price = order.filled_price
@@ -6437,7 +6441,15 @@ class DashboardState:
     async def _await_buy_fill(self, signal, order) -> None:
         """Poll a just-submitted buy order briefly for its real fill and write the true
         price/quantity onto `signal` — see _log_buy_trade. Silent no-op if the order
-        never reaches a fill inside the window, or if the broker can't be read."""
+        never reaches a fill inside the window, or if the broker can't be read.
+
+        Waits for status FILLED, never just non-null fill fields (2026-10-30, CSX):
+        Alpaca fills a fractional/notional buy in pieces (whole shares first, then the
+        fraction, usually <1s apart) and a partially_filled order already reports
+        filled_avg_price/filled_qty for the portion done so far. Accepting that wrote
+        8 buys since 9/1 with a fraction of their real quantity (CSX 10/29: 7 of
+        12.8445). A window that closes still partial keeps the estimate, which for a
+        notional order is far closer to the final quantity than any partial."""
         broker = self.order_manager.broker
         if broker is None or not getattr(order, "broker_order_id", None):
             return
@@ -6447,7 +6459,8 @@ class DashboardState:
                 live = await broker.get_order_status(order.broker_order_id)
             except Exception:
                 return
-            if live.filled_price is not None and getattr(live, "filled_quantity", None):
+            if (live.status == OrderStatus.FILLED and live.filled_price is not None
+                    and getattr(live, "filled_quantity", None)):
                 signal.entry_price = live.filled_price
                 signal.shares = live.filled_quantity
                 signal.position_size_dollars = round(
