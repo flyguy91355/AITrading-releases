@@ -262,6 +262,72 @@ def rejudge(spy: list[tuple[str, float]], vix: list[tuple[str, float]], prev: Ma
     return state
 
 
+@dataclass(frozen=True)
+class MarketReadings:
+    """The numbers in the dashboard's market readings box (2026-11-21, owner request: "can the right vix be put
+    on the ticker?" -- TradingView's free strip refuses the real VIX index). The real VIX and SPY against its
+    N-day average, from the same Yahoo fetches the pause decides on. Display only: the rule never reads it.
+    Spec: docs/superpowers/specs/2026-11-21-market-readings-box-design.md."""
+    kind: str                      # "close" | "live"
+    as_of: str                     # close: "YYYY-MM-DD"; live: ISO ET timestamp
+    vix: float
+    vix_prev_close: float | None   # the VIX close before as_of's session (for the change), None if unknown
+    spy: float
+    spy_sma: float
+    sma_days: int
+
+
+def close_readings(spy: list[tuple[str, float]], vix: list[tuple[str, float]],
+                   sma_days: int) -> MarketReadings | None:
+    """The newest close both series share (the same date evaluate_close judges), or None on too little or bad
+    data. The SPY average is the mean of the sma_days closes ending at that date."""
+    spy_map, vix_map = _as_map(spy), _as_map(vix)
+    if spy_map is None or vix_map is None or not isinstance(sma_days, int) or sma_days < 1:
+        return None
+    spy_dates = sorted(spy_map)
+    shared = [d for d in spy_dates if d in vix_map]
+    if not shared:
+        return None
+    day = shared[-1]
+    window = _window(spy_dates, spy_map, spy_dates.index(day), sma_days)
+    vix_close = vix_map[day]
+    if window is None or not _ok(vix_close):
+        return None
+    vix_dates = sorted(vix_map)
+    at = vix_dates.index(day)
+    prev = vix_map[vix_dates[at - 1]] if at > 0 else None
+    return MarketReadings(kind="close", as_of=day, vix=float(vix_close),
+                          vix_prev_close=float(prev) if _ok(prev) else None,
+                          spy=float(window[-1]), spy_sma=sum(window) / sma_days, sma_days=sma_days)
+
+
+def live_readings(spy_closes: list[float], spy_live: float, vix_live: float, vix_prev_close: float | None,
+                  sma_days: int, now_iso: str) -> MarketReadings | None:
+    """Live SPY/VIX with the live average evaluate_live judges: the last sma_days-1 finished closes plus the
+    live price. None on too little or bad data."""
+    if not isinstance(sma_days, int) or sma_days < 2:
+        return None
+    window = list(spy_closes)[-(sma_days - 1):]
+    if len(window) < sma_days - 1 or not all(_ok(c) for c in window) or not _ok(spy_live) or not _ok(vix_live):
+        return None
+    return MarketReadings(kind="live", as_of=now_iso, vix=float(vix_live),
+                          vix_prev_close=float(vix_prev_close) if _ok(vix_prev_close) else None,
+                          spy=float(spy_live), spy_sma=(sum(window) + spy_live) / sma_days, sma_days=sma_days)
+
+
+def current_readings(close: MarketReadings | None, live: MarketReadings | None) -> MarketReadings | None:
+    """What the box shows: a live reading from a newer session than the newest close, else the close. So the
+    16:20 close replaces the day's live numbers, and a Settings re-judge (which recomputes yesterday's close
+    during market hours) never knocks today's live numbers back to yesterday."""
+    if close is None or live is None:
+        return close or live
+    return live if live.as_of[:10] > close.as_of[:10] else close
+
+
+def readings_to_dict(r: MarketReadings | None, vix_level: float) -> dict | None:
+    return None if r is None else {**dataclasses.asdict(r), "vix_level": vix_level}
+
+
 def to_dict(state: MarketPauseState) -> dict:
     return dataclasses.asdict(state)
 

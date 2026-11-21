@@ -156,6 +156,18 @@ body {
      page down instead of sitting over the panel headers. 0px when no banner shows. */
   margin-top: var(--buy-block-h, 0px);
 }
+/* Ticker bar (2026-11-21): the fixed market readings box plus the TradingView strip, one row.
+   It must stay 56px tall -- .main-layout's height calc subtracts exactly that. */
+.ticker-bar { display: flex; height: 56px; overflow: hidden; }
+.market-readings {
+  flex: 0 0 auto; display: flex; flex-direction: column; justify-content: center; gap: 2px;
+  padding: 0 14px; border-right: 1px solid var(--border);
+  font-size: 12px; line-height: 1.3; white-space: nowrap; cursor: default;
+  font-variant-numeric: tabular-nums; color: var(--text-primary);
+}
+.market-readings .mr-label { color: var(--text-secondary); font-weight: 600; }
+.market-readings .mr-change, .market-readings .mr-sep { color: var(--text-secondary); }
+.market-readings .mr-alert { color: var(--yellow); font-weight: 700; }
 .main-layout-resize {
   cursor: ew-resize;
   background: transparent;
@@ -811,8 +823,18 @@ tbody tr:hover { background: var(--bg-card-hover); }
 <!-- Index ticker strip — symbols list built dynamically in JS (see initTickerTape below) so the
      crypto count can come from the dashboard.ticker_tape_crypto_count setting without a
      server-side template dependency for this static page. -->
-<div class="tradingview-widget-container" style="height:56px;overflow:hidden;">
-  <div class="tradingview-widget-container__widget" id="tickerTapeWidget"></div>
+<!-- Market readings box (2026-11-21, owner request: "can the right vix be put on the ticker?") -- the
+     real VIX and SPY vs its average, from the bot's own Yahoo data (the numbers the market buy pause
+     decides on). TradingView's free strip refuses the real VIX index, so this sits beside it, fixed.
+     Filled by updateMarketReadingsBox(). -->
+<div class="ticker-bar">
+  <div id="marketReadingsBox" class="market-readings" title="Waiting for the first market reading from Yahoo.">
+    <div><span class="mr-label">VIX</span> <span id="mrVix">--</span> <span id="mrVixChange" class="mr-change"></span></div>
+    <div><span class="mr-label">SPY</span> <span id="mrSpy">--</span> <span class="mr-sep">&middot;</span> <span id="mrSmaLabel" class="mr-label">50-day</span> <span id="mrSma">--</span></div>
+  </div>
+  <div class="tradingview-widget-container" style="flex:1;min-width:0;height:56px;overflow:hidden;">
+    <div class="tradingview-widget-container__widget" id="tickerTapeWidget"></div>
+  </div>
 </div>
 
 <!-- Live-connection-lost banner (2026-07-23) -- fixed/overlay positioned same as
@@ -1914,6 +1936,13 @@ function _marketPauseEtParts(date) {
     day: '2-digit', hour: 'numeric', minute: '2-digit', hour12: true});
   return Object.fromEntries(fmt.formatToParts(date).map(part => [part.type, part.value]));
 }
+// "2026-11-20" -> "Fri 11-20" (a close date; shared with the market readings box below).
+function _marketPauseCloseLabel(day) {
+  const [y, m, d] = day.split('-').map(Number);
+  const weekday = new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString('en-US',
+    {weekday: 'short', timeZone: 'UTC'});
+  return `${weekday} ${day.slice(5)}`;
+}
 function marketPauseBannerText(mp) {
   if (!(mp && mp.enabled && mp.active)) return {show: false, title: '', detail: ''};
   let title = '⏸ Market pause — auto-buys paused';
@@ -1922,10 +1951,7 @@ function marketPauseBannerText(mp) {
     const p = _marketPauseEtParts(new Date(since));
     title += ` since ${p.hour}:${p.minute} ${p.dayPeriod} on ${p.month}-${p.day} (live)`;
   } else if (since) {
-    const [y, m, d] = since.split('-').map(Number);
-    const weekday = new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString('en-US',
-      {weekday: 'short', timeZone: 'UTC'});
-    title += ` since the ${weekday} ${since.slice(5)} close`;
+    title += ` since the ${_marketPauseCloseLabel(since)} close`;
   }
   let detail = (mp.reason || '') + '. Clears at a market close when either recovers.';
   const checked = mp.last_close_check_at || mp.checked_at;
@@ -1936,6 +1962,55 @@ function marketPauseBannerText(mp) {
   return {show: true, title, detail};
 }
 // ── end Market pause banner helpers ──
+
+// ── Market readings box: pure helpers (no DOM) ──
+// The ticker bar's fixed box (2026-11-21, owner request: "can the right vix be put on the ticker?").
+// r is market_pause.readings from get_portfolio_snapshot(), or null. Reuses the banner block's
+// date helpers, so tests/test_market_readings_box.py loads both blocks. The alerts mirror the
+// pause rule exactly: VIX strictly above the level, SPY strictly below its average.
+function marketReadingsText(r) {
+  const smaLabel = `${(r && r.sma_days) || 50}-day`;
+  if (!r) {
+    return {vix: '--', vixChange: '', vixAlert: false, spy: '--', sma: '--', smaLabel,
+      spyAlert: false, tooltip: 'Waiting for the first market reading from Yahoo.'};
+  }
+  let vixChange = '';
+  if (r.vix_prev_close) {
+    const pct = Number(((r.vix - r.vix_prev_close) / r.vix_prev_close * 100).toFixed(1));
+    vixChange = pct > 0 ? `▲ +${pct.toFixed(1)}%` : pct < 0 ? `▼ ${pct.toFixed(1)}%` : '0.0%';
+  }
+  let when;
+  if (r.kind === 'live') {
+    const p = _marketPauseEtParts(new Date(r.as_of));
+    when = `live at ${p.hour}:${p.minute} ${p.dayPeriod} ET on ${p.month}-${p.day}`;
+  } else {
+    when = `at the ${_marketPauseCloseLabel(r.as_of)} close`;
+  }
+  return {
+    vix: r.vix.toFixed(2), vixChange, vixAlert: r.vix > r.vix_level,
+    spy: r.spy.toFixed(2), sma: r.spy_sma.toFixed(2), smaLabel, spyAlert: r.spy < r.spy_sma,
+    tooltip: `Real VIX index and SPY from Yahoo, ${when}. `
+      + `Market pause: VIX above ${r.vix_level} and SPY below its ${smaLabel} average.`,
+  };
+}
+// ── end Market readings box helpers ──
+
+function updateMarketReadingsBox(p) {
+  const box = document.getElementById('marketReadingsBox');
+  if (!box) return;
+  const t = marketReadingsText(p.market_pause ? p.market_pause.readings : null);
+  const set = (id, text, alert) => {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    if (alert !== undefined) el.classList.toggle('mr-alert', alert);
+  };
+  set('mrVix', t.vix, t.vixAlert);
+  set('mrVixChange', t.vixChange);
+  set('mrSpy', t.spy, t.spyAlert);
+  set('mrSmaLabel', t.smaLabel);
+  set('mrSma', t.sma);
+  box.title = t.tooltip;
+}
 
 function updateMarketPauseBanner(p) {
   const banner = document.getElementById('marketPauseBanner');
@@ -1966,6 +2041,7 @@ function updatePortfolio(p) {
   _latestPortfolio = p;
   updateDrawdownHaltBanner(p);
   updateMarketPauseBanner(p);
+  updateMarketReadingsBox(p);
   document.getElementById('totalValue').textContent = fmt$(p.total_value);
 
   const dayEl = document.getElementById('dayPnl');
@@ -5222,13 +5298,14 @@ async function initTickerTape() {
     if (resp.ok) cryptoCount = (await resp.json()).crypto_count;
   } catch (e) { console.error('ticker tape config fetch failed, defaulting to 5:', e); }
 
-  // SPY sits right before VXX (2026-11-21, owner request) -- the market buy pause watches
-  // SPY vs its 50-day and VIX, so the two read side by side.
+  // SPY is labeled "SPY" (2026-11-21, owner request). VXX was dropped the same day: it's a
+  // VIX-futures fund the owner misread as VIX (its +14.6% day read as "VIX 14"). The real VIX is
+  // in the fixed #marketReadingsBox beside this strip -- TradingView's free strip refuses
+  // TVC:VIX and CBOE:VIX (rechecked 2026-11-21), and its VIX CFDs track futures, not the index.
   const symbols = [
     {"proName": "NASDAQ:QQQ",  "title": "Nasdaq 100"},
     {"proName": "AMEX:DIA",    "title": "Dow 30"},
     {"proName": "AMEX:SPY",    "title": "SPY (S&P 500)"},
-    {"proName": "AMEX:VXX",    "title": "VXX (VIX proxy)"},
     {"proName": "NASDAQ:TLT",  "title": "10Y Yield"},
     {"proName": "TVC:GOLD",    "title": "Gold"},
     {"proName": "TVC:USOIL",   "title": "Oil"},

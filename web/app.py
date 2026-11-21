@@ -111,16 +111,21 @@ from src.decision.market_pause import (
     NEVER_EVALUATED,
     MarketPauseConfig,
     MarketPauseState,
+    MarketReadings,
     close_check_slot,
+    close_readings,
     coerce_sma_days,
     coerce_vix_level,
+    current_readings,
     evaluate_close,
     evaluate_live,
     finished_closes,
     from_dict as _market_pause_from_dict,
     is_usable_quote,
     is_stale as _market_pause_is_stale,
+    live_readings,
     market_pause_config,
+    readings_to_dict,
     rejudge,
     status_text,
     to_dict as _market_pause_to_dict,
@@ -2008,6 +2013,11 @@ class DashboardState:
         self._market_pause_spy_closes: list[float] = []
         self._market_pause_slots_done: set[str] = set()
         self._market_pause_fetch_failing: bool = False
+        # The dashboard's market readings box (2026-11-21): the newest close and the newest live
+        # reading, from the same Yahoo fetches. In-memory only -- the loop's first-tick close
+        # check refills the close reading within a minute of a restart.
+        self._market_close_readings: MarketReadings | None = None
+        self._market_live_readings: MarketReadings | None = None
 
         # Shared SMA50/SMA200 cache, ticker -> (sma_50, sma_200) (2026-08-25, owner
         # concern: "why cant it do both track 1 and 2 withe the same scan... does it
@@ -6608,6 +6618,10 @@ class DashboardState:
             "last_close_date": s.last_close_date,
             "stale": _market_pause_is_stale(s, self._now_et()),
             "never_checked": s.source == "none",
+            # The ticker bar's readings box (2026-11-21): real VIX + SPY vs its average.
+            "readings": readings_to_dict(current_readings(self._market_close_readings,
+                                                          self._market_live_readings),
+                                         self._market_pause_cfg().vix_level),
         }
 
     async def _market_pause_close_check(self, force: bool = False) -> bool:
@@ -6636,6 +6650,7 @@ class DashboardState:
             return False
         self._market_pause_fetch_failing = False
         self._market_pause_spy_closes = [c for d, c in spy if d < today]
+        self._market_close_readings = close_readings(spy, vix, cfg.sma_days)
         if not force:
             new = evaluate_close(
                 spy, vix, self.market_pause, cfg.sma_days, cfg.vix_level, now.isoformat())
@@ -6666,7 +6681,10 @@ class DashboardState:
         return spy_q.price, vix_q.price
 
     async def _market_pause_live_check(self) -> None:
-        """Intraday watch: can only turn the pause ON (evaluate_live never turns it off)."""
+        """Intraday watch: can only turn the pause ON (evaluate_live never turns it off). The
+        same fetch keeps the dashboard's market readings box live, so it runs every market-hours
+        tick even with the pause or its live watch switched off -- but the pause itself is judged
+        only when both are on."""
         if not self._market_pause_spy_closes:
             return
         cfg = self._market_pause_cfg()
@@ -6678,9 +6696,15 @@ class DashboardState:
             self._market_pause_fetch_failing = True
             return
         self._market_pause_fetch_failing = False
+        now_iso = self._now_et().isoformat()
+        prev_close = self._market_close_readings.vix if self._market_close_readings else None
+        self._market_live_readings = live_readings(
+            self._market_pause_spy_closes, spy_live, vix_live, prev_close, cfg.sma_days, now_iso)
+        if not (cfg.enabled and cfg.live_watch):
+            return
         await self._apply_market_pause_state(evaluate_live(
             self._market_pause_spy_closes, spy_live, vix_live, self.market_pause,
-            cfg.sma_days, cfg.vix_level, self._now_et().isoformat()))
+            cfg.sma_days, cfg.vix_level, now_iso))
 
     async def _apply_market_pause_state(self, new: MarketPauseState) -> None:
         """Save any change; announce only an ON/OFF flip, and only while the feature is
@@ -6706,8 +6730,9 @@ class DashboardState:
     async def market_pause_loop(self) -> None:
         """60s ticks. A close-check on the first tick, then at the morning and evening slots
         (close_check_slot; a slot is marked done only after a successful fetch, so a failed
-        one retries next tick). Otherwise, during regular hours with the live watch on, a
-        live check. Deliberately ignores the Pause/Stop run state: it costs nothing (Yahoo
+        one retries next tick). Otherwise, during regular hours, a live fetch -- every tick,
+        since it also feeds the dashboard's readings box; it judges the pause only when the
+        pause and its live watch are on. Deliberately ignores the Pause/Stop run state: it costs nothing (Yahoo
         only) and the banner should be right the moment the owner presses Start."""
         first = True
         while True:
@@ -6719,11 +6744,10 @@ class DashboardState:
                         first = False
                         if slot:
                             self._market_pause_slots_done.add(f"{now.strftime('%Y-%m-%d')}:{slot}")
-                else:
-                    cfg = self._market_pause_cfg()
-                    if (cfg.enabled and cfg.live_watch and not self._is_holiday
-                            and self._is_market_open()):
-                        await self._market_pause_live_check()
+                elif not self._is_holiday and self._is_market_open():
+                    # Every market-hours tick: the fetch also feeds the readings box, so it runs
+                    # with the pause off too; _market_pause_live_check judges only when enabled.
+                    await self._market_pause_live_check()
             except Exception as e:
                 logger.exception("Market pause loop tick failed: %s", e)
             await asyncio.sleep(60)
