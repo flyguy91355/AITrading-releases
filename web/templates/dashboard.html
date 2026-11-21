@@ -156,18 +156,6 @@ body {
      page down instead of sitting over the panel headers. 0px when no banner shows. */
   margin-top: var(--buy-block-h, 0px);
 }
-/* Ticker bar (2026-11-21): the fixed market readings box plus the TradingView strip, one row.
-   It must stay 56px tall -- .main-layout's height calc subtracts exactly that. */
-.ticker-bar { display: flex; height: 56px; overflow: hidden; }
-.market-readings {
-  flex: 0 0 auto; display: flex; flex-direction: column; justify-content: center; gap: 2px;
-  padding: 0 14px; border-right: 1px solid var(--border);
-  font-size: 12px; line-height: 1.3; white-space: nowrap; cursor: default;
-  font-variant-numeric: tabular-nums; color: var(--text-primary);
-}
-.market-readings .mr-label { color: var(--text-secondary); font-weight: 600; }
-.market-readings .mr-change, .market-readings .mr-sep { color: var(--text-secondary); }
-.market-readings .mr-alert { color: var(--yellow); font-weight: 700; }
 .main-layout-resize {
   cursor: ew-resize;
   background: transparent;
@@ -257,6 +245,41 @@ body {
   align-items: center;
   gap: 12px;
   justify-content: center;
+}
+/* Market graph + smaller logo sharing the old logo cell (2026-11-21, owner request). */
+.brand-chart-row { display: flex; gap: 10px; min-width: 0; }
+.brand-mark-small { flex: 0 0 108px; flex-direction: column; gap: 4px; text-align: center; white-space: nowrap; }
+.market-chart-card {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; overflow: hidden;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px;
+}
+.mc-head, .mc-foot {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 6px;
+  font-size: 10px; color: var(--text-secondary); white-space: nowrap;
+}
+.mc-foot { color: var(--text-muted); line-height: 1.1; }
+.mc-legend i {
+  display: inline-block; width: 8px; height: 8px; margin-right: 4px; vertical-align: -1px;
+  background: rgba(59,130,246,0.35); border-radius: 1px;
+}
+.mc-values { overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.mc-date { color: var(--text-primary); font-weight: 600; margin-right: 4px; }
+.mc-spy { color: #3987e5; }
+.mc-sma { color: var(--yellow); }
+.mc-vix { color: var(--red); }
+.mc-ranges { flex-shrink: 0; }
+.mc-ranges button {
+  background: none; border: none; padding: 0 2px; cursor: pointer;
+  color: var(--text-muted); font-size: 10px; font-family: inherit;
+}
+.mc-ranges button.active { color: var(--accent); font-weight: 700; }
+/* No fixed height: the graph takes whatever the top row's existing height leaves, so adding it
+   never pushes the P/L tiles down. contain: size stops the chart's own pixel sizing from holding
+   the row open after something briefly makes it taller (e.g. a window resize). */
+.mc-chart { flex: 1; min-height: 0; position: relative; contain: size; }
+.mc-empty {
+  position: absolute; inset: 0; z-index: 2; pointer-events: none; display: none;
+  align-items: center; justify-content: center; font-size: 11px; color: var(--text-muted);
 }
 .stat-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
 .stat-value { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -823,18 +846,8 @@ tbody tr:hover { background: var(--bg-card-hover); }
 <!-- Index ticker strip — symbols list built dynamically in JS (see initTickerTape below) so the
      crypto count can come from the dashboard.ticker_tape_crypto_count setting without a
      server-side template dependency for this static page. -->
-<!-- Market readings box (2026-11-21, owner request: "can the right vix be put on the ticker?") -- the
-     real VIX and SPY vs its average, from the bot's own Yahoo data (the numbers the market buy pause
-     decides on). TradingView's free strip refuses the real VIX index, so this sits beside it, fixed.
-     Filled by updateMarketReadingsBox(). -->
-<div class="ticker-bar">
-  <div id="marketReadingsBox" class="market-readings" title="Waiting for the first market reading from Yahoo.">
-    <div><span class="mr-label">VIX</span> <span id="mrVix">--</span> <span id="mrVixChange" class="mr-change"></span></div>
-    <div><span class="mr-label">SPY</span> <span id="mrSpy">--</span> <span class="mr-sep">&middot;</span> <span id="mrSmaLabel" class="mr-label">50-day</span> <span id="mrSma">--</span></div>
-  </div>
-  <div class="tradingview-widget-container" style="flex:1;min-width:0;height:56px;overflow:hidden;">
-    <div class="tradingview-widget-container__widget" id="tickerTapeWidget"></div>
-  </div>
+<div class="tradingview-widget-container" style="height:56px;overflow:hidden;">
+  <div class="tradingview-widget-container__widget" id="tickerTapeWidget"></div>
 </div>
 
 <!-- Live-connection-lost banner (2026-07-23) -- fixed/overlay positioned same as
@@ -946,8 +959,25 @@ tbody tr:hover { background: var(--bg-card-hover); }
            (the trading data) with a connected-node overlay across the bar tops (an AI
            "reading the trend" motif) -- same accent->cyan gradient as the header .logo
            wordmark, so this reads as the same brand identity, not a mismatched addition. -->
-      <div class="brand-mark" style="grid-column: span 2;">
-        <svg viewBox="0 0 64 48" width="72" height="54" style="flex-shrink:0;">
+      <!-- Market graph (2026-11-21, owner request: "what about a graph instead with both on it ...
+           shows multiple days, weeks"; "logo in the middle can be moved over for a chart.. made
+           smaller if need be", "try to keep logo"). SPY vs its N-day average over VIX vs the pause
+           level, shaded on days both pause conditions held at the close -- the market pause's own
+           data (GET /api/market-chart + market_pause.readings). Shares the old logo cell with a
+           smaller logo; Portfolio Value and Cash are untouched. Drawn by initMarketChart(). -->
+      <div class="brand-chart-row" style="grid-column: span 2;">
+       <div class="market-chart-card" id="marketChartCard">
+        <div class="mc-head">
+          <span class="mc-values"><span id="mcDate" class="mc-date"></span><b class="mc-spy">SPY <span id="mcSpy">--</span></b> &middot; <span class="mc-sma"><span id="mcSmaLabel">50-day</span> <span id="mcSma">--</span></span> &middot; <b class="mc-vix">VIX <span id="mcVix">--</span></b> <span id="mcVixChange" class="mc-chg"></span></span>
+        </div>
+        <div class="mc-chart" id="marketChart"><div class="mc-empty" id="mcEmpty">Loading market data</div></div>
+        <div class="mc-foot">
+          <span class="mc-legend"><i></i>pause days</span>
+          <span class="mc-ranges"><button type="button" data-mc-range="1M">1M</button><button type="button" data-mc-range="3M">3M</button><button type="button" data-mc-range="6M">6M</button><button type="button" data-mc-range="1Y">1Y</button></span>
+        </div>
+       </div>
+      <div class="brand-mark brand-mark-small">
+        <svg viewBox="0 0 64 48" width="40" height="30" style="flex-shrink:0;">
           <defs>
             <linearGradient id="brandBarGrad" x1="0" y1="1" x2="0" y2="0">
               <stop offset="0%" stop-color="var(--accent)"/>
@@ -965,10 +995,10 @@ tbody tr:hover { background: var(--bg-card-hover); }
           <circle cx="51" cy="2"  r="2.75" fill="var(--cyan)"/>
         </svg>
         <div>
-          <div class="logo" style="font-size:26px;">Hilton's AITrading</div>
-          <div style="font-size:13px;color:var(--text-muted);letter-spacing:0.3px;">AI Powered Research &amp; Automatic Trading</div>
-          <div style="font-size:16px;color:var(--text-muted);letter-spacing:0.3px;margin-top:2px;">by the <span style="color:var(--cyan);font-weight:700;font-size:19px;">Hilton Group</span></div>
+          <div class="logo" style="font-size:13px;line-height:1.2;">Hilton's AITrading</div>
+          <div style="font-size:10.5px;color:var(--text-muted);letter-spacing:0.3px;margin-top:2px;">by the <span style="color:var(--cyan);font-weight:700;">Hilton Group</span></div>
         </div>
+      </div>
       </div>
     </div>
     <div class="stats-row" id="statsRow">
@@ -1936,7 +1966,7 @@ function _marketPauseEtParts(date) {
     day: '2-digit', hour: 'numeric', minute: '2-digit', hour12: true});
   return Object.fromEntries(fmt.formatToParts(date).map(part => [part.type, part.value]));
 }
-// "2026-11-20" -> "Fri 11-20" (a close date; shared with the market readings box below).
+// "2026-11-20" -> "Fri 11-20" (a close date; shared with the market graph helpers below).
 function _marketPauseCloseLabel(day) {
   const [y, m, d] = day.split('-').map(Number);
   const weekday = new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString('en-US',
@@ -1968,17 +1998,19 @@ function marketPauseBannerText(mp) {
 // r is market_pause.readings from get_portfolio_snapshot(), or null. Reuses the banner block's
 // date helpers, so tests/test_market_readings_box.py loads both blocks. The alerts mirror the
 // pause rule exactly: VIX strictly above the level, SPY strictly below its average.
+// "▲ +26.2%" / "▼ -2.6%" / "0.0%" for a VIX move, '' when there's no earlier value to compare.
+function _vixChangeText(now, prev) {
+  if (!prev) return '';
+  const pct = Number(((now - prev) / prev * 100).toFixed(1));
+  return pct > 0 ? `▲ +${pct.toFixed(1)}%` : pct < 0 ? `▼ ${pct.toFixed(1)}%` : '0.0%';
+}
 function marketReadingsText(r) {
   const smaLabel = `${(r && r.sma_days) || 50}-day`;
   if (!r) {
     return {vix: '--', vixChange: '', vixAlert: false, spy: '--', sma: '--', smaLabel,
       spyAlert: false, tooltip: 'Waiting for the first market reading from Yahoo.'};
   }
-  let vixChange = '';
-  if (r.vix_prev_close) {
-    const pct = Number(((r.vix - r.vix_prev_close) / r.vix_prev_close * 100).toFixed(1));
-    vixChange = pct > 0 ? `▲ +${pct.toFixed(1)}%` : pct < 0 ? `▼ ${pct.toFixed(1)}%` : '0.0%';
-  }
+  const vixChange = _vixChangeText(r.vix, r.vix_prev_close);
   let when;
   if (r.kind === 'live') {
     const p = _marketPauseEtParts(new Date(r.as_of));
@@ -1995,22 +2027,215 @@ function marketReadingsText(r) {
 }
 // ── end Market readings box helpers ──
 
-function updateMarketReadingsBox(p) {
-  const box = document.getElementById('marketReadingsBox');
-  if (!box) return;
-  const t = marketReadingsText(p.market_pause ? p.market_pause.readings : null);
-  const set = (id, text, alert) => {
-    const el = document.getElementById(id);
-    el.textContent = text;
-    if (alert !== undefined) el.classList.toggle('mr-alert', alert);
-  };
-  set('mrVix', t.vix, t.vixAlert);
-  set('mrVixChange', t.vixChange);
-  set('mrSpy', t.spy, t.spyAlert);
-  set('mrSmaLabel', t.smaLabel);
-  set('mrSma', t.sma);
-  box.title = t.tooltip;
+// ── Market chart: pure helpers (no DOM) ──
+// The top row's SPY/VIX graph (2026-11-21, owner request: "a graph instead with both on it ... shows
+// multiple days, weeks"). points come from GET /api/market-chart ({date, spy, sma, vix, paused},
+// oldest first); readings is market_pause.readings. Node-tested by tests/test_market_chart_panel.py.
+const MARKET_CHART_RANGES = {'1M': 21, '3M': 63, '6M': 126, '1Y': 252};   // trading days
+// Lightweight Charts hands crosshair times back as "YYYY-MM-DD" or {year, month, day}.
+function _mcDateKey(t) {
+  if (typeof t === 'string') return t.slice(0, 10);
+  if (t && typeof t === 'object' && 'year' in t) {
+    return `${t.year}-${String(t.month).padStart(2, '0')}-${String(t.day).padStart(2, '0')}`;
+  }
+  return null;
 }
+// Today's live point, appended only when it's from a session newer than the last close (so the
+// 16:20 close replaces it, never doubles it). paused is the rule on the live numbers.
+function marketChartPoints(points, readings) {
+  const pts = Array.isArray(points) ? points : [];
+  if (!pts.length || !readings || readings.kind !== 'live' || typeof readings.as_of !== 'string') return pts;
+  const day = readings.as_of.slice(0, 10);
+  if (day <= pts[pts.length - 1].date) return pts;
+  const level = readings.vix_level;
+  return pts.concat([{date: day, spy: readings.spy, sma: readings.spy_sma, vix: readings.vix,
+    paused: Number.isFinite(level) && readings.spy < readings.spy_sma && readings.vix > level, live: true}]);
+}
+function marketChartSeries(points, range) {
+  const view = (points || []).slice(-(MARKET_CHART_RANGES[range] || MARKET_CHART_RANGES['3M']));
+  return {
+    spy: view.map(p => ({time: p.date, value: p.spy})),
+    sma: view.map(p => ({time: p.date, value: p.sma})),
+    vix: view.map(p => ({time: p.date, value: p.vix})),
+    shade: view.map(p => ({time: p.date, value: p.paused ? 1 : 0})),
+  };
+}
+function marketChartHoverText(points, time, smaDays) {
+  const pts = points || [];
+  const key = _mcDateKey(time);
+  const i = pts.findIndex(p => p.date === key);
+  if (i < 0) return null;
+  const p = pts[i];
+  return {
+    date: _marketPauseCloseLabel(p.date) + (p.live ? ' (live)' : ''),
+    spy: p.spy.toFixed(2), sma: p.sma.toFixed(2), smaLabel: `${smaDays || 50}-day`,
+    vix: p.vix.toFixed(2), vixChange: _vixChangeText(p.vix, i > 0 ? pts[i - 1].vix : null),
+  };
+}
+// Refetch when there's nothing yet, when a newer close has landed, or when Settings changed the rule.
+function marketChartNeedsRefetch(chartData, readings) {
+  if (!chartData) return true;
+  if (!readings) return false;
+  const pts = chartData.points || [];
+  if (!pts.length) return true;
+  if (readings.sma_days !== chartData.sma_days || readings.vix_level !== chartData.vix_level) return true;
+  return readings.kind === 'close' && readings.as_of > pts[pts.length - 1].date;
+}
+// ── end Market chart helpers ──
+
+// ── Market chart: DOM ──
+let _mc = null;           // {chart, spy, sma, vix, shade, vixLine}
+let _mcData = null;       // last /api/market-chart payload
+let _mcReadings = null;   // latest market_pause.readings
+let _mcRange = '3M';
+let _mcHovering = false;
+let _mcLastFetch = 0;
+try {
+  const saved = localStorage.getItem('marketChartRange');
+  if (MARKET_CHART_RANGES[saved]) _mcRange = saved;
+} catch (e) { /* storage unavailable: default range */ }
+
+function _mcSetEmpty(text) {
+  const el = document.getElementById('mcEmpty');
+  if (!el) return;
+  el.textContent = text;
+  el.style.display = text ? 'flex' : 'none';
+}
+
+function _mcRenderHeader(hover) {
+  const t = hover || marketReadingsText(_mcReadings);
+  const set = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+  set('mcDate', hover ? hover.date + ':' : '');
+  set('mcSpy', t.spy);
+  set('mcSmaLabel', t.smaLabel.replace('-day', 'd'));   // "50d": the header is tight at this size
+  set('mcSma', t.sma);
+  set('mcVix', t.vix);
+  set('mcVixChange', t.vixChange);
+  const card = document.getElementById('marketChartCard');
+  if (card && !hover) {
+    card.title = t.tooltip + ' Shaded days: both pause conditions held at the close.';
+  }
+}
+
+function renderMarketChart() {
+  document.querySelectorAll('[data-mc-range]').forEach(b => b.classList.toggle('active', b.dataset.mcRange === _mcRange));
+  if (!_mc) return;
+  const points = marketChartPoints((_mcData && _mcData.points) || [], _mcReadings);
+  _mcSetEmpty(points.length ? '' : (_mcData ? 'Waiting for market data' : 'Loading market data'));
+  const s = marketChartSeries(points, _mcRange);
+  _mc.shade.setData(s.shade);
+  _mc.spy.setData(s.spy);
+  _mc.sma.setData(s.sma);
+  _mc.vix.setData(s.vix);
+  const level = _mcData ? _mcData.vix_level : null;
+  if (_mc.vixLine) { _mc.vix.removePriceLine(_mc.vixLine); _mc.vixLine = null; }
+  if (Number.isFinite(level)) {
+    _mc.vixLine = _mc.vix.createPriceLine({price: level, color: _lwcColor('--yellow'), lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: false});
+  }
+  _mc.chart.timeScale().fitContent();
+}
+
+async function fetchMarketChart() {
+  _mcLastFetch = Date.now();
+  try {
+    const resp = await fetch('/api/market-chart');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    _mcData = await resp.json();
+  } catch (e) {
+    console.error('market chart fetch failed:', e);
+  }
+  renderMarketChart();
+}
+
+function initMarketChart() {
+  const el = document.getElementById('marketChart');
+  if (!el) return;
+  document.querySelectorAll('[data-mc-range]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      _mcRange = btn.dataset.mcRange;
+      try { localStorage.setItem('marketChartRange', _mcRange); } catch (e) { /* not remembered */ }
+      renderMarketChart();
+    });
+  });
+  if (typeof LightweightCharts === 'undefined') {
+    _mcSetEmpty('Chart unavailable');
+    return;
+  }
+  const chart = LightweightCharts.createChart(el, {
+    autoSize: true,
+    layout: {background: {color: 'transparent'}, textColor: _lwcColor('--text-muted'), fontSize: 10},
+    grid: {vertLines: {visible: false}, horzLines: {visible: false}},
+    rightPriceScale: {visible: false, scaleMargins: {top: 0.06, bottom: 0.46}},
+    leftPriceScale: {visible: false},
+    timeScale: {visible: false},
+    crosshair: {mode: LightweightCharts.CrosshairMode.Normal,
+      horzLine: {visible: false, labelVisible: false}, vertLine: {labelVisible: false}},
+    handleScroll: false,
+    handleScale: false,
+  });
+  el._lwcChart = chart;
+  const line = (color, extra) => Object.assign({color, lineWidth: 1.5, priceLineVisible: false,
+    lastValueVisible: false, crosshairMarkerRadius: 2}, extra || {});
+  // Shading first, so the lines draw over it: a full-height bar on each paused day.
+  const shade = chart.addHistogramSeries({priceScaleId: 'mcShade', color: 'rgba(59,130,246,0.16)',
+    priceLineVisible: false, lastValueVisible: false,
+    autoscaleInfoProvider: () => ({priceRange: {minValue: 0, maxValue: 1}})});
+  chart.priceScale('mcShade').applyOptions({scaleMargins: {top: 0, bottom: 0}});
+  // priceScaleId 'right' is required: with the right scale hidden, Lightweight Charts 4.1.3 puts a
+  // series with no id on the LEFT scale, which ignores rightPriceScale's top-band margins and drew
+  // SPY over the VIX band (final review, 2026-11-21).
+  const spy = chart.addLineSeries(line('#3987e5', {priceScaleId: 'right'}));
+  const sma = chart.addLineSeries(line(_lwcColor('--yellow'), {priceScaleId: 'right', lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed}));
+  // VIX on its own scale in the bottom part; its autoscale always includes the pause level, so the
+  // dashed level line stays on screen even when VIX is far from it.
+  const vix = chart.addLineSeries(line(_lwcColor('--red'), {priceScaleId: 'mcVix',
+    autoscaleInfoProvider: original => {
+      const r = original();
+      const level = _mcData ? _mcData.vix_level : null;
+      if (!r || !Number.isFinite(level)) return r;
+      return {priceRange: {minValue: Math.min(r.priceRange.minValue, level),
+        maxValue: Math.max(r.priceRange.maxValue, level)}, margins: r.margins};
+    }}));
+  chart.priceScale('mcVix').applyOptions({scaleMargins: {top: 0.62, bottom: 0.06}});
+  _mc = {chart, spy, sma, vix, shade, vixLine: null};
+  chart.subscribeCrosshairMove(param => {
+    const hover = param && param.time
+      ? marketChartHoverText(marketChartPoints((_mcData && _mcData.points) || [], _mcReadings), param.time,
+          (_mcData && _mcData.sma_days) || 50)
+      : null;
+    _mcHovering = !!hover;
+    _mcRenderHeader(hover);
+  });
+  // A phone long-press leaves the crosshair (and the header) on that day with no mouse-leave to
+  // clear it; lifting the finger puts the header back on today's numbers.
+  el.addEventListener('touchend', () => {
+    try { chart.clearCrosshairPosition(); } catch (e) { /* older library: nothing to clear */ }
+    _mcHovering = false;
+    _mcRenderHeader(null);
+  }, {passive: true});
+  renderMarketChart();
+  fetchMarketChart();
+}
+
+// Called from updatePortfolio on every portfolio broadcast (~10s). Display-only, so a failure here
+// must never stop the rest of the portfolio update.
+function updateMarketChart(p) {
+  try {
+    const r = p && p.market_pause ? (p.market_pause.readings || null) : null;
+    const changed = JSON.stringify(r) !== JSON.stringify(_mcReadings);
+    _mcReadings = r;
+    if (!_mcHovering) _mcRenderHeader(null);
+    if (changed) renderMarketChart();
+    if (marketChartNeedsRefetch(_mcData, r) && Date.now() - _mcLastFetch > 60000) fetchMarketChart();
+  } catch (e) {
+    console.error('market chart update failed:', e);
+  }
+}
+// Guarded: this runs at top level, so a throw here would stop the rest of the main script
+// (WebSocket, clock, On Deck), not just the graph.
+try { initMarketChart(); } catch (e) { console.error('market chart init failed:', e); _mcSetEmpty('Chart unavailable'); }
 
 function updateMarketPauseBanner(p) {
   const banner = document.getElementById('marketPauseBanner');
@@ -2041,7 +2266,7 @@ function updatePortfolio(p) {
   _latestPortfolio = p;
   updateDrawdownHaltBanner(p);
   updateMarketPauseBanner(p);
-  updateMarketReadingsBox(p);
+  updateMarketChart(p);
   document.getElementById('totalValue').textContent = fmt$(p.total_value);
 
   const dayEl = document.getElementById('dayPnl');
@@ -5300,8 +5525,8 @@ async function initTickerTape() {
 
   // SPY is labeled "SPY" (2026-11-21, owner request). VXX was dropped the same day: it's a
   // VIX-futures fund the owner misread as VIX (its +14.6% day read as "VIX 14"). The real VIX is
-  // in the fixed #marketReadingsBox beside this strip -- TradingView's free strip refuses
-  // TVC:VIX and CBOE:VIX (rechecked 2026-11-21), and its VIX CFDs track futures, not the index.
+  // in the top row's market graph (#marketChart) -- TradingView's free strip refuses TVC:VIX and
+  // CBOE:VIX (rechecked 2026-11-21), and its VIX CFDs track futures, not the index.
   const symbols = [
     {"proName": "NASDAQ:QQQ",  "title": "Nasdaq 100"},
     {"proName": "AMEX:DIA",    "title": "Dow 30"},

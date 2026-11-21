@@ -113,6 +113,7 @@ from src.decision.market_pause import (
     MarketPauseState,
     MarketReadings,
     close_check_slot,
+    chart_series,
     close_readings,
     coerce_sma_days,
     coerce_vix_level,
@@ -2013,11 +2014,14 @@ class DashboardState:
         self._market_pause_spy_closes: list[float] = []
         self._market_pause_slots_done: set[str] = set()
         self._market_pause_fetch_failing: bool = False
-        # The dashboard's market readings box (2026-11-21): the newest close and the newest live
+        # The dashboard market graph's header and live point (2026-11-21): the newest close and the newest live
         # reading, from the same Yahoo fetches. In-memory only -- the loop's first-tick close
         # check refills the close reading within a minute of a restart.
         self._market_close_readings: MarketReadings | None = None
         self._market_live_readings: MarketReadings | None = None
+        # The dashboard market graph's source (2026-11-21): the close check's own finished
+        # (date, close) lists for SPY and ^VIX, served by GET /api/market-chart -- no new fetch.
+        self._market_chart_closes: tuple[list, list] = ([], [])
 
         # Shared SMA50/SMA200 cache, ticker -> (sma_50, sma_200) (2026-08-25, owner
         # concern: "why cant it do both track 1 and 2 withe the same scan... does it
@@ -6618,10 +6622,22 @@ class DashboardState:
             "last_close_date": s.last_close_date,
             "stale": _market_pause_is_stale(s, self._now_et()),
             "never_checked": s.source == "none",
-            # The ticker bar's readings box (2026-11-21): real VIX + SPY vs its average.
+            # The market graph's header + today's live point (2026-11-21): real VIX + SPY vs its average.
             "readings": readings_to_dict(current_readings(self._market_close_readings,
                                                           self._market_live_readings),
                                          self._market_pause_cfg().vix_level),
+        }
+
+    def _market_chart_payload(self) -> dict:
+        """GET /api/market-chart: the dashboard graph's daily points over the pause's own close
+        history (chart_series), plus the rule values they were judged with. vix_level goes out
+        only when it's a real number -- a NaN would make the JSON response raise."""
+        cfg = self._market_pause_cfg()
+        spy, vix = self._market_chart_closes
+        return {
+            "points": chart_series(spy, vix, cfg.sma_days, cfg.vix_level),
+            "sma_days": cfg.sma_days,
+            "vix_level": cfg.vix_level if is_usable_price(cfg.vix_level) else None,
         }
 
     async def _market_pause_close_check(self, force: bool = False) -> bool:
@@ -6651,6 +6667,7 @@ class DashboardState:
         self._market_pause_fetch_failing = False
         self._market_pause_spy_closes = [c for d, c in spy if d < today]
         self._market_close_readings = close_readings(spy, vix, cfg.sma_days)
+        self._market_chart_closes = (spy, vix)
         if not force:
             new = evaluate_close(
                 spy, vix, self.market_pause, cfg.sma_days, cfg.vix_level, now.isoformat())
@@ -6682,7 +6699,7 @@ class DashboardState:
 
     async def _market_pause_live_check(self) -> None:
         """Intraday watch: can only turn the pause ON (evaluate_live never turns it off). The
-        same fetch keeps the dashboard's market readings box live, so it runs every market-hours
+        same fetch keeps the dashboard market graph's live point current, so it runs every market-hours
         tick even with the pause or its live watch switched off -- but the pause itself is judged
         only when both are on."""
         if not self._market_pause_spy_closes:
@@ -6731,7 +6748,7 @@ class DashboardState:
         """60s ticks. A close-check on the first tick, then at the morning and evening slots
         (close_check_slot; a slot is marked done only after a successful fetch, so a failed
         one retries next tick). Otherwise, during regular hours, a live fetch -- every tick,
-        since it also feeds the dashboard's readings box; it judges the pause only when the
+        since it also feeds the dashboard's market graph; it judges the pause only when the
         pause and its live watch are on. Deliberately ignores the Pause/Stop run state: it costs nothing (Yahoo
         only) and the banner should be right the moment the owner presses Start."""
         first = True
@@ -6745,7 +6762,7 @@ class DashboardState:
                         if slot:
                             self._market_pause_slots_done.add(f"{now.strftime('%Y-%m-%d')}:{slot}")
                 elif not self._is_holiday and self._is_market_open():
-                    # Every market-hours tick: the fetch also feeds the readings box, so it runs
+                    # Every market-hours tick: the fetch also feeds the market graph, so it runs
                     # with the pause off too; _market_pause_live_check judges only when enabled.
                     await self._market_pause_live_check()
             except Exception as e:
@@ -10561,6 +10578,15 @@ async def get_ticker_tape_config():
     so the dashboard picks up a changed count on its next page load or periodic refresh."""
     count = state.config.get("dashboard", {}).get("ticker_tape_crypto_count", 5)
     return {"crypto_count": max(0, min(5, int(count)))}
+
+
+@app.get("/api/market-chart")
+async def market_chart():
+    """The dashboard's SPY/VIX graph (2026-11-21, owner request: "a graph instead with both on
+    it"): about a year of daily SPY, its N-day average, VIX, and the days both pause conditions
+    held at the close -- from the market pause's own close check, so it costs no extra fetch.
+    Spec: docs/superpowers/specs/2026-11-21-market-chart-panel-design.md."""
+    return state._market_chart_payload()
 
 
 @app.get("/api/chart-display-config")

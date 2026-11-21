@@ -264,7 +264,7 @@ def rejudge(spy: list[tuple[str, float]], vix: list[tuple[str, float]], prev: Ma
 
 @dataclass(frozen=True)
 class MarketReadings:
-    """The numbers in the dashboard's market readings box (2026-11-21, owner request: "can the right vix be put
+    """The numbers in the dashboard market graph's header and live point (2026-11-21, owner request: "can the right vix be put
     on the ticker?" -- TradingView's free strip refuses the real VIX index). The real VIX and SPY against its
     N-day average, from the same Yahoo fetches the pause decides on. Display only: the rule never reads it.
     Spec: docs/superpowers/specs/2026-11-21-market-readings-box-design.md."""
@@ -326,6 +326,35 @@ def current_readings(close: MarketReadings | None, live: MarketReadings | None) 
 
 def readings_to_dict(r: MarketReadings | None, vix_level: float) -> dict | None:
     return None if r is None else {**dataclasses.asdict(r), "vix_level": vix_level}
+
+
+CHART_DAYS = 252   # about a year of sessions: the dashboard graph's longest range (1Y)
+
+
+def chart_series(spy: list[tuple[str, float]], vix: list[tuple[str, float]], sma_days: int, vix_level: float,
+                 days: int = CHART_DAYS) -> list[dict]:
+    """The dashboard market graph's daily points (2026-11-21, owner request: "a graph instead with both on it"),
+    oldest first: {date, spy, sma, vix, paused} for the last `days` dates both series share -- the same date
+    matching and N-close window evaluate_close uses, and `paused` is the rule at that close (strict, like
+    _rule). Dates without a full window or a usable VIX close are skipped; a junk vix_level shades nothing.
+    Spec: docs/superpowers/specs/2026-11-21-market-chart-panel-design.md."""
+    spy_map, vix_map = _as_map(spy), _as_map(vix)
+    if spy_map is None or vix_map is None or not isinstance(sma_days, int) or sma_days < 1:
+        return []
+    level_ok = _ok(vix_level)
+    spy_dates = sorted(spy_map)
+    points = []
+    for index, day in enumerate(spy_dates):
+        if day not in vix_map:
+            continue
+        window = _window(spy_dates, spy_map, index, sma_days)
+        vix_close = vix_map[day]
+        if window is None or not _ok(vix_close):
+            continue
+        spy_close, sma = float(window[-1]), sum(window) / sma_days
+        points.append({"date": day, "spy": spy_close, "sma": sma, "vix": float(vix_close),
+                       "paused": level_ok and _rule(spy_close, sma, vix_close, vix_level)})
+    return points[-days:] if days > 0 else []
 
 
 def to_dict(state: MarketPauseState) -> dict:
