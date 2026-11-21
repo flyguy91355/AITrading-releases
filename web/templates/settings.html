@@ -603,6 +603,59 @@ input[type=time].setting-input { font-family: monospace; }
     </div>
   </div>
 
+  <!-- MARKET PAUSE (2026-11-21, owner request) -- no automatic buys while SPY closes below its
+       N-day average AND VIX closes above the level. Spec:
+       docs/superpowers/specs/2026-11-21-market-buy-pause-design.md. The template's cfg values
+       here are never missing: settings_page() fills in the code defaults first. -->
+  <div class="section">
+    <div class="section-title">Market Pause</div>
+    <div class="setting-desc" style="margin:0 0 12px;">
+      Status: <strong>{{ market_pause_status }}</strong>
+    </div>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Market Pause <button type="button" class="info-btn" onclick="showInfo(event,'Pauses automatic buys while SPY closes below its N-day average and VIX closes above the level. Backtested 2005-now: much smaller crash losses; costs some dip-buys in choppy years. Stops, take-profits, scans and manual buys are unaffected.')">i</button></div>
+          <div class="setting-desc">Pause automatic buys during a falling, fearful market</div>
+        </div>
+        <select class="setting-input" name="risk_management.market_pause_enabled">
+          <option value="true" {% if cfg.risk_management.market_pause_enabled %}selected{% endif %}>Enabled</option>
+          <option value="false" {% if not cfg.risk_management.market_pause_enabled %}selected{% endif %}>Disabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">On</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Live Watch <button type="button" class="info-btn" onclick="showInfo(event,'Also checks live during market hours. It can only turn the pause on; only a market close turns it off.')">i</button></div>
+          <div class="setting-desc">Also watch SPY and VIX live during market hours (turns the pause on only)</div>
+        </div>
+        <select class="setting-input" name="risk_management.market_pause_live_watch">
+          <option value="true" {% if cfg.risk_management.market_pause_live_watch %}selected{% endif %}>Enabled</option>
+          <option value="false" {% if not cfg.risk_management.market_pause_live_watch %}selected{% endif %}>Disabled</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">On</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">VIX Level <button type="button" class="info-btn" onclick="showInfo(event,'VIX closing above this counts as a fearful market. 20 is what was backtested. Changing it re-checks the latest close right away.')">i</button></div>
+          <div class="setting-desc">VIX above this counts as fearful</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.market_pause_vix_level"
+               value="{{ cfg.risk_management.market_pause_vix_level }}" min="1" step="0.5">
+        <div class="default-label">default<br><span class="default-val">20</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">SPY Average (days) <button type="button" class="info-btn" onclick="showInfo(event,'How many days of SPY closes the average covers. 50 was backtested best; 200 reacts later. Changing it re-checks the latest close right away.')">i</button></div>
+          <div class="setting-desc">SPY closing below its average of this many days counts as falling</div>
+        </div>
+        <input type="number" class="setting-input" name="risk_management.market_pause_spy_sma_days"
+               value="{{ cfg.risk_management.market_pause_spy_sma_days }}" min="10" max="250" step="1">
+        <div class="default-label">default<br><span class="default-val">50</span></div>
+      </div>
+    </div>
+  </div>
+
   <!-- TAKE PROFIT / STOP LOSS -->
   <div class="section">
     <div class="section-title">Take Profit &amp; Stop Loss</div>
@@ -1528,6 +1581,11 @@ const DEFAULTS = {
   'risk_management.drawdown_halt_pct': 5.0,
   'risk_management.drawdown_defensive_pct': 10.0,
   'risk_management.drawdown_exit_review_pct': 15.0,
+  // Market buy pause (2026-11-21) -- the code defaults (src/decision/market_pause.py).
+  'risk_management.market_pause_enabled': 'true',
+  'risk_management.market_pause_live_watch': 'true',
+  'risk_management.market_pause_vix_level': 20.0,
+  'risk_management.market_pause_spy_sma_days': 50,
   'risk_management.trailing_stop_enabled': 'true',
   'risk_management.trailing_stop_follow_tp_targets': 'false',
   'risk_management.protection_gap_alert_delay_seconds': 30,

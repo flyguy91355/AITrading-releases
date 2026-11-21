@@ -104,6 +104,27 @@ from src.decision.risk_tier import (
     risk_tier_label,
     RISK_TIER_DOTKEYS,
 )
+from src.decision.market_pause import (
+    EVENING_CHECK_TIME,
+    HISTORY_PERIOD,
+    MARKET_PAUSE_DEFAULTS,
+    NEVER_EVALUATED,
+    MarketPauseConfig,
+    MarketPauseState,
+    close_check_slot,
+    coerce_sma_days,
+    coerce_vix_level,
+    evaluate_close,
+    evaluate_live,
+    finished_closes,
+    from_dict as _market_pause_from_dict,
+    is_usable_quote,
+    is_stale as _market_pause_is_stale,
+    market_pause_config,
+    rejudge,
+    status_text,
+    to_dict as _market_pause_to_dict,
+)
 from src.execution.order_manager import OrderManager, _is_regular_trading_hours
 from src.execution.broker import OrderStatus
 from src.reporting.trade_logger import TradeLogger
@@ -333,6 +354,9 @@ _MIDDAY_SCAN_FIRED_CACHE_PATH = Path("data/midday_scan_fired_cache.json")
 _ON_DECK_STALE_DIP_LOW_CACHE_PATH = Path("data/on_deck_stale_dip_low_cache.json")
 # Track 2 approaching-cross declines (2026-10-30) -- see _track2_decline_cooling.
 _TRACK2_DECLINE_CACHE_PATH = Path("data/track2_decline_cache.json")
+# Market buy pause state (2026-11-21) -- see src/decision/market_pause.py. Persisted so a restart
+# mid-pause stays paused without waiting for a Yahoo fetch.
+_MARKET_PAUSE_STATE_PATH = Path("data/market_pause_state.json")
 # Log of every real promotion ATTEMPT (2026-07-21) -- repurposes the old "Candidates" tab,
 # whose original data source (run_deep_dives -> _collect_buy_candidates) had zero live
 # callers left anywhere in this file, a dead leftover from the pre-2026-07-17 Watchlist-era
@@ -1428,6 +1452,22 @@ def _load_track2_declines() -> dict:
     return {}
 
 
+def _save_market_pause_state(d: dict) -> None:
+    """The market buy pause state (2026-11-21) -- src/decision/market_pause.py's to_dict()."""
+    _atomic_write_json(_MARKET_PAUSE_STATE_PATH, d, "market pause state")
+
+
+def _load_market_pause_state() -> MarketPauseState:
+    """The saved state, or NEVER_EVALUATED when missing/corrupt (from_dict validates every field)."""
+    try:
+        if _MARKET_PAUSE_STATE_PATH.exists():
+            return _market_pause_from_dict(
+                json.loads(_MARKET_PAUSE_STATE_PATH.read_text(encoding="utf-8")))
+    except Exception as e:
+        logger.warning("Failed to load market pause state: %s", e)
+    return NEVER_EVALUATED
+
+
 def _track2_decline_cooling(declined: dict | None, today: date, cooldown_days: int) -> bool:
     """True while a Track 2 approaching-cross candidate whose fresh analysis rejected it
     is still inside its retry cooldown (2026-10-30). _run_sma_trend_scan re-sent the same
@@ -1961,6 +2001,13 @@ class DashboardState:
         # persisted (_save_track2_declines) and restored in startup() -- see
         # _track2_decline_cooling.
         self._track2_declines: dict[str, dict] = {}
+        # Market buy pause (2026-11-21) -- see src/decision/market_pause.py and market_pause_loop.
+        # market_pause is loaded in startup(). _market_pause_slots_done is deliberately in-memory:
+        # re-running a close-check after a restart is a harmless no-op (a close counts once).
+        self.market_pause: MarketPauseState = NEVER_EVALUATED
+        self._market_pause_spy_closes: list[float] = []
+        self._market_pause_slots_done: set[str] = set()
+        self._market_pause_fetch_failing: bool = False
 
         # Shared SMA50/SMA200 cache, ticker -> (sma_50, sma_200) (2026-08-25, owner
         # concern: "why cant it do both track 1 and 2 withe the same scan... does it
@@ -2332,6 +2379,9 @@ class DashboardState:
             "drawdown_state": self.risk_manager.check_drawdown(p),
             "drawdown_pct": round((p.peak_value - p.total_value) / p.peak_value * 100, 2) if p.peak_value else 0.0,
             "peak_value": round(p.peak_value, 2),
+            # Market buy pause (2026-11-21) -- drives dashboard.html's #marketPauseBanner, live on
+            # every portfolio broadcast exactly like drawdown_state above.
+            "market_pause": self._market_pause_snapshot(),
         }
 
     async def get_init_payload(self) -> dict:
@@ -5896,6 +5946,7 @@ class DashboardState:
                         # waiting out a stale cooldown window).
                         due = not (
                             self._no_buying_capacity()
+                            or self._market_pause_active()
                             or _on_deck_cooldown_active(self._on_deck_above_gate_cooldown, ticker, now_et)
                             or _on_deck_cooldown_active(
                                 self._on_deck_backfill_above_gate_cooldown, ticker, now_et))
@@ -6064,7 +6115,8 @@ class DashboardState:
                                 and not nm.get("ai_entry_pending")
                                 and low_changed
                                 and not self._past_auto_buy_cutoff()
-                                and not self._no_buying_capacity()):
+                                and not self._no_buying_capacity()
+                                and not self._market_pause_active()):
                             # 2026-08-27, owner request -- same reasoning as the cutoff
                             # gate just above: no cash above the reserve floor means
                             # there's nothing to buy into regardless of what price this
@@ -6111,6 +6163,12 @@ class DashboardState:
                             continue  # hasn't retraced enough of the dip yet
 
                     to_promote.append((ticker, dip["low"]))
+
+                # Market buy pause (2026-11-21) -- nothing is popped and no attempt starts, so
+                # no card gets dedup markers: a dip that forms during a pause is still there
+                # to buy when the pause clears (see _market_pause_active).
+                if to_promote and self._market_pause_active():
+                    to_promote = []
 
                 for ticker, dip_low in to_promote:
                     nm_snapshot = self.near_miss_candidates.pop(ticker, None)
@@ -6193,6 +6251,11 @@ class DashboardState:
         if nm is None:
             return
         try:
+            # Market buy pause (2026-11-21) -- in case this was spawned the tick before the
+            # pause turned on. Inside the try on purpose: the finally below clears the
+            # ai_entry_pending flag the spawner set, so the card can get a fresh call later.
+            if self._market_pause_active():
+                return
             retracement_pct = self.config["research"].get("on_deck_retracement_pct", 20.0)
             # Same windowed slice near_miss_monitor_loop's trigger check uses (not the full,
             # now-permanent price_history) — this call only ever fires because that check
@@ -6512,6 +6575,159 @@ class DashboardState:
                                OrderStatus.EXPIRED):
                 return
 
+    # ── Market buy pause (2026-11-21, owner request) ──────────────────────────────────────
+    # No automatic buys while SPY closes below its N-day average AND VIX closes above the
+    # level (backtested crash insurance -- docs/research/2026-11-21-vix-spy/). The rule and
+    # state live in src/decision/market_pause.py; this section only fetches, saves and
+    # announces. Spec: docs/superpowers/specs/2026-11-21-market-buy-pause-design.md.
+
+    def _market_pause_cfg(self) -> MarketPauseConfig:
+        """Read live from config, so a Settings change applies on the next tick. A malformed
+        hand-edited value falls back to the code defaults rather than breaking every
+        portfolio broadcast that calls this."""
+        try:
+            return market_pause_config(self.config.get("risk_management", {}))
+        except (TypeError, ValueError):
+            return market_pause_config({})
+
+    def _market_pause_active(self) -> bool:
+        """THE shared check every automatic buy gate reads (CLAUDE.md "Shared Guards &
+        Helpers") -- never re-test the rule at a call site."""
+        return self._market_pause_cfg().enabled and self.market_pause.active
+
+    def _market_pause_snapshot(self) -> dict:
+        s = self.market_pause
+        return {
+            "active": s.active,
+            "enabled": self._market_pause_cfg().enabled,
+            "reason": s.reason,
+            "since": s.since,
+            "source": s.source,
+            "checked_at": s.checked_at,
+            "last_close_check_at": s.last_close_check_at,
+            "last_close_date": s.last_close_date,
+            "stale": _market_pause_is_stale(s, self._now_et()),
+            "never_checked": s.source == "none",
+        }
+
+    async def _market_pause_close_check(self, force: bool = False) -> bool:
+        """Apply the newest finished close. True on a successful fetch (even when the close
+        was already applied); False when the fetch failed, leaving the state untouched and
+        logging only the first failure of a run. force=True re-judges the newest close under
+        changed Settings -- the one way the pause can turn off without a new close."""
+        cfg = self._market_pause_cfg()
+        now = self._now_et()
+        today = now.strftime("%Y-%m-%d")
+        after_evening = now.time() >= EVENING_CHECK_TIME
+        try:
+            # HISTORY_PERIOD covers the longest average Settings allows (a 6mo fetch froze
+            # any average over ~128 days -- final review, 2026-11-21).
+            spy_bars, vix_bars = await asyncio.gather(
+                self.market_data.get_historical("SPY", period=HISTORY_PERIOD),
+                self.market_data.get_historical("^VIX", period=HISTORY_PERIOD))
+            spy = finished_closes(spy_bars, today, after_evening)
+            vix = finished_closes(vix_bars, today, after_evening)
+            if len(spy) < cfg.sma_days or not vix:
+                raise ValueError(f"too little history (SPY {len(spy)} closes, VIX {len(vix)})")
+        except Exception as e:
+            if not self._market_pause_fetch_failing:
+                logger.warning("Market pause: close-check fetch failed, state unchanged: %s", e)
+            self._market_pause_fetch_failing = True
+            return False
+        self._market_pause_fetch_failing = False
+        self._market_pause_spy_closes = [c for d, c in spy if d < today]
+        if not force:
+            new = evaluate_close(
+                spy, vix, self.market_pause, cfg.sma_days, cfg.vix_level, now.isoformat())
+        else:
+            # Settings changed the rule. During market hours with the live watch on, fold a
+            # fresh live check into the SAME re-judge, so a change that still flags today's
+            # market never briefly lifts a same-day live pause (see rejudge()).
+            live = None
+            if cfg.enabled and cfg.live_watch and not self._is_holiday and self._is_market_open():
+                try:
+                    spy_live, vix_live = await self._market_pause_live_quotes()
+                    live = (self._market_pause_spy_closes, spy_live, vix_live)
+                except Exception as e:
+                    logger.warning("Market pause: live quote for the Settings re-judge failed: %s", e)
+            new = rejudge(spy, vix, self.market_pause, cfg.sma_days, cfg.vix_level,
+                          now.isoformat(), live=live)
+        await self._apply_market_pause_state(new)
+        return True
+
+    async def _market_pause_live_quotes(self) -> tuple[float, float]:
+        """Live SPY and ^VIX prices. Raises on a failed fetch AND on junk values (0/NaN --
+        e.g. a fallback feed that doesn't carry ^VIX answers 0), so callers count both as a
+        failure that is logged once per run instead of silently disabling the live watch."""
+        spy_q, vix_q = await asyncio.gather(
+            self.market_data.get_quote("SPY"), self.market_data.get_quote("^VIX"))
+        if not (is_usable_quote(spy_q.price) and is_usable_quote(vix_q.price)):
+            raise ValueError(f"unusable live quote (SPY {spy_q.price!r}, VIX {vix_q.price!r})")
+        return spy_q.price, vix_q.price
+
+    async def _market_pause_live_check(self) -> None:
+        """Intraday watch: can only turn the pause ON (evaluate_live never turns it off)."""
+        if not self._market_pause_spy_closes:
+            return
+        cfg = self._market_pause_cfg()
+        try:
+            spy_live, vix_live = await self._market_pause_live_quotes()
+        except Exception as e:
+            if not self._market_pause_fetch_failing:
+                logger.warning("Market pause: live-check fetch failed, state unchanged: %s", e)
+            self._market_pause_fetch_failing = True
+            return
+        self._market_pause_fetch_failing = False
+        await self._apply_market_pause_state(evaluate_live(
+            self._market_pause_spy_closes, spy_live, vix_live, self.market_pause,
+            cfg.sma_days, cfg.vix_level, self._now_et().isoformat()))
+
+    async def _apply_market_pause_state(self, new: MarketPauseState) -> None:
+        """Save any change; announce only an ON/OFF flip, and only while the feature is
+        enabled (one AI-log line + one phone notice per flip, never per tick/candidate)."""
+        old = self.market_pause
+        if new == old:
+            return
+        self.market_pause = new
+        await asyncio.to_thread(_save_market_pause_state, _market_pause_to_dict(new))
+        if new.active == old.active or not self._market_pause_cfg().enabled:
+            return
+        if new.active:
+            text = (f"Market pause ON — auto-buys paused: {new.reason}. "
+                    "Clears at a market close when either recovers.")
+        else:
+            text = f"Market pause OFF — {new.reason} at the {new.last_close_date} close; auto-buys resume."
+        entry = self.add_ai_log("SYSTEM", "MARKET", text, "warning" if new.active else "success")
+        await self.broadcast({"type": "ai_log", "entry": entry})
+        asyncio.create_task(_notify(
+            "Market pause ON" if new.active else "Market pause OFF", text, priority="default"))
+        await self.broadcast({"type": "portfolio", "portfolio": self.get_portfolio_snapshot()})
+
+    async def market_pause_loop(self) -> None:
+        """60s ticks. A close-check on the first tick, then at the morning and evening slots
+        (close_check_slot; a slot is marked done only after a successful fetch, so a failed
+        one retries next tick). Otherwise, during regular hours with the live watch on, a
+        live check. Deliberately ignores the Pause/Stop run state: it costs nothing (Yahoo
+        only) and the banner should be right the moment the owner presses Start."""
+        first = True
+        while True:
+            try:
+                now = self._now_et()
+                slot = close_check_slot(now, self.pre_open_batch_time, self._market_pause_slots_done)
+                if first or slot:
+                    if await self._market_pause_close_check():
+                        first = False
+                        if slot:
+                            self._market_pause_slots_done.add(f"{now.strftime('%Y-%m-%d')}:{slot}")
+                else:
+                    cfg = self._market_pause_cfg()
+                    if (cfg.enabled and cfg.live_watch and not self._is_holiday
+                            and self._is_market_open()):
+                        await self._market_pause_live_check()
+            except Exception as e:
+                logger.exception("Market pause loop tick failed: %s", e)
+            await asyncio.sleep(60)
+
     def _no_buying_capacity(self) -> bool:
         """True when there isn't enough cash above the reserve floor to fund even
         one realistically-sized new position (2026-08-27, owner request: "when
@@ -6597,6 +6813,9 @@ class DashboardState:
         reserved_amount = 0.0
         evicted = False
         marked_in_flight = False
+        # Market buy pause (2026-11-21): set by the two pause gates below so the finally
+        # restores the card untouched -- no dedup markers, which would burn the dip.
+        pause_skipped = False
         try:
             # 2026-08-30, GitHub #100 -- see _promotion_in_flight's own docstring
             # at __init__ for the full incident: this is the single shared choke
@@ -6612,6 +6831,12 @@ class DashboardState:
                 return
             self._promotion_in_flight.add(ticker)
             marked_in_flight = True
+            # Market buy pause (2026-11-21) -- free, before any Claude call. The backstop for
+            # the two Track 2 callers (the monitor loop never calls in while paused). Silent
+            # and unrecorded by design: a pause can last weeks.
+            if self._market_pause_active():
+                pause_skipped = True
+                return
             if not self.config["trading"].get("auto_execute", False) or not self.broker_connected:
                 return
             # Not-yet-open gate (2026-08-28, JNJ/RRC premarket-fill incident) -- the
@@ -6779,6 +7004,15 @@ class DashboardState:
                     "System paused/stopped during re-analysis — buy not executed", "warning")
                 await self.broadcast({"type": "ai_log", "entry": entry})
                 self._record_promotion_attempt(ticker, dip_low, "System paused/stopped")
+                return
+            # Market buy pause re-check (2026-11-21) -- the live watch can turn the pause on
+            # during the multi-second re-analysis above. Not recorded as an attempt, and the
+            # finally restores the card without dedup markers.
+            if self._market_pause_active():
+                entry = self.add_ai_log(ticker, "ON_DECK",
+                    "Market pause turned on during re-analysis — buy not executed", "warning")
+                await self.broadcast({"type": "ai_log", "entry": entry})
+                pause_skipped = True
                 return
 
             min_conviction = self.config["research"]["min_conviction_score"]
@@ -7124,6 +7358,14 @@ class DashboardState:
                 }
                 asyncio.create_task(
                     asyncio.to_thread(_save_buy_reasoning, dict(self.buy_reasoning)))
+            elif pause_skipped:
+                # Market buy pause (2026-11-21) -- put the card back exactly as it was (only the
+                # pending flag cleared), never the failed-attempt dedup markers below.
+                if nm_snapshot is not None and ticker not in self.portfolio.positions:
+                    nm_snapshot["ai_entry_pending"] = False
+                    # Same "first-to-land wins" guard as the failed-attempt branch below.
+                    if ticker not in self.near_miss_candidates:
+                        self.near_miss_candidates[ticker] = nm_snapshot
             elif (not bought and not evicted and nm_snapshot is not None
                     and ticker not in self.portfolio.positions):
                 nm_snapshot["ai_entry_pending"] = False
@@ -7931,7 +8173,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         max_size = self.config["research"].get("on_deck_max_size", 0)
         if not max_size:
             return
-        if self._no_buying_capacity():
+        if self._no_buying_capacity() or self._market_pause_active():
             # 2026-08-27, owner request -- this whole function exists purely to keep
             # On Deck full/best-ranked for buying; with zero cash above the reserve
             # floor there's structurally no chance of acting on anything it would
@@ -8279,7 +8521,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             return
         if not buy_eligible:
             return
-        if self._no_buying_capacity():
+        if self._no_buying_capacity() or self._market_pause_active():
             # 2026-08-27, owner request -- this is display polish for a candidate that
             # might get bought soon; with no cash above the reserve floor there's
             # nothing for it to prepare for, so skip the extra Claude spend.
@@ -9207,6 +9449,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             near_crossover = 0
             attempted = 0
             cooling = 0
+            paused_skips = 0
 
             entry = self.add_ai_log("SYSTEM", source_label,
                 "SMA trend-confirmation scan (Track 2, approaching-cross only) starting...", "info")
@@ -9248,6 +9491,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
 
                 if self._no_buying_capacity():
                     continue
+                # Market buy pause (2026-11-21) -- no attempt, so no Track 2 decline is written.
+                if self._market_pause_active():
+                    paused_skips += 1
+                    continue
 
                 try:
                     financials = await self.market_data.get_financials(ticker)
@@ -9274,10 +9521,11 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             _cooling_note = (
                 f", {cooling} skipped (a fresh analysis declined them within the last "
                 f"{decline_cooldown_days} days)" if cooling else "")
+            _paused_note = f", {paused_skips} skipped (market pause)" if paused_skips else ""
             entry = self.add_ai_log("SYSTEM", source_label,
                 f"SMA trend-confirmation scan complete — {checked:,} tickers checked, "
                 f"{near_crossover} approaching a cross, {attempted} sent for analysis"
-                f"{_cooling_note}.",
+                f"{_cooling_note}{_paused_note}.",
                 "success")
             await self.broadcast({"type": "ai_log", "entry": entry})
         finally:
@@ -9609,6 +9857,13 @@ async def settings_page():
         for k, v in cfg.get(section, {}).items():
             setattr(sub, k, v)
         setattr(ns, section, sub)
+    # Market buy pause (2026-11-21) -- cfg here is an attribute namespace, so a key missing
+    # from settings.yaml (the live box never gets new keys from Apply Update) would be
+    # Jinja-falsy: the on/off selects would render "Disabled" and the first unrelated
+    # Settings save would silently write market_pause_enabled: false. Show the code default.
+    for _mp_key, _mp_default in MARKET_PAUSE_DEFAULTS.items():
+        if not hasattr(ns.risk_management, _mp_key):
+            setattr(ns.risk_management, _mp_key, _mp_default)
 
     # Load API key status for server-side rendering (avoids JS-fetch dependency on fresh install)
     env_path = Path(__file__).parent.parent / ".env"
@@ -9641,7 +9896,11 @@ async def settings_page():
             {**opt, "selected": opt["id"] == current}
             for opt in build_model_options(_models, current, default)
         ]
-    rendered = Template(template).render(cfg=ns, api_keys=api_keys, model_options=model_options)
+    _mp_snapshot = state._market_pause_snapshot()
+    rendered = Template(template).render(
+        cfg=ns, api_keys=api_keys, model_options=model_options,
+        market_pause=_mp_snapshot,
+        market_pause_status=status_text(state.market_pause, stale=_mp_snapshot["stale"]))
     return Response(
         content=rendered,
         media_type="text/html",
@@ -9779,6 +10038,12 @@ async def save_settings(payload: dict):
         "risk_management.drawdown_halt_pct": float,
         "risk_management.drawdown_defensive_pct": float,
         "risk_management.drawdown_exit_review_pct": float,
+        # Market buy pause (2026-11-21). The two validators raise ValueError on an
+        # out-of-range value, which aborts the whole save (_coerce_settings_payload).
+        "risk_management.market_pause_enabled": lambda v: v == "true",
+        "risk_management.market_pause_live_watch": lambda v: v == "true",
+        "risk_management.market_pause_vix_level": coerce_vix_level,
+        "risk_management.market_pause_spy_sma_days": coerce_sma_days,
         "risk_management.trailing_stop_enabled": lambda v: v == "true",
         "risk_management.trailing_stop_follow_tp_targets": lambda v: v == "true",
         "risk_management.protection_gap_alert_delay_seconds": int,
@@ -9935,10 +10200,26 @@ async def save_settings(payload: dict):
         if _dotkey in coerced_values:
             payload[_dotkey] = str(coerced_values[_dotkey])
 
+    _mp_cfg_before = state._market_pause_cfg()
     for dotkey, value in coerced_values.items():
         section, key = dotkey.split(".", 1)
         raw.setdefault(section, {})[key] = value
         state.config.setdefault(section, {})[key] = value
+
+    # Market buy pause (2026-11-21). A change to the rule itself (VIX level or SPY average
+    # length) re-judges the newest close right away -- the one deliberate way the pause can
+    # turn off without a new close, so the banner never describes a rule that no longer
+    # exists. Re-enabling while the state is ON gets one log line (the flip itself was
+    # silent while disabled). Any change re-broadcasts so the banner updates at once.
+    _mp_cfg_after = state._market_pause_cfg()
+    if (_mp_cfg_after.vix_level, _mp_cfg_after.sma_days) != (_mp_cfg_before.vix_level, _mp_cfg_before.sma_days):
+        asyncio.create_task(state._market_pause_close_check(force=True))
+    if _mp_cfg_after.enabled and not _mp_cfg_before.enabled and state.market_pause.active:
+        _mp_entry = state.add_ai_log("SYSTEM", "MARKET",
+            f"Market pause re-enabled — auto-buys paused: {state.market_pause.reason}", "warning")
+        await state.broadcast({"type": "ai_log", "entry": _mp_entry})
+    if _mp_cfg_after != _mp_cfg_before:
+        await state.broadcast({"type": "portfolio", "portfolio": state.get_portfolio_snapshot()})
 
     # Handle universe_indexes list (sent as JSON array from the frontend)
     if "research.universe_indexes" in payload:
@@ -12172,6 +12453,9 @@ async def manual_buy(payload: dict):
         "targets": targets,
         "capped": position_dollars < dollars,
         "earnings_warning": f"Earnings on {earnings_date}" if earnings_soon else None,
+        # Market buy pause (2026-11-21) -- advisory only, like the earnings warning: the
+        # pause blocks automatic buys, never a manual one.
+        "market_pause_warning": state.market_pause.reason if state._market_pause_active() else None,
     }
 
 
@@ -12524,6 +12808,10 @@ async def startup():
     if state._track2_declines:
         logger.info("Restored %d Track 2 decline(s)", len(state._track2_declines))
 
+    state.market_pause = _load_market_pause_state()
+    if state.market_pause.active:
+        logger.info("Restored market pause: ON since %s", state.market_pause.since)
+
     state.on_deck_stale_dip_low = _load_on_deck_stale_dip_low()
     if state.on_deck_stale_dip_low:
         logger.info("Restored %d known-stale dip low(s)", len(state.on_deck_stale_dip_low))
@@ -12633,6 +12921,7 @@ async def startup():
     asyncio.create_task(state.position_update_loop())
     asyncio.create_task(state.position_monitor_loop())
     asyncio.create_task(state.position_deep_dive_loop())
+    asyncio.create_task(state.market_pause_loop())
     logger.info("Dashboard started — auto-scan running, position monitor active")
 
     # First-run bootstrap removed 2026-07-17 — it triggered on watchlist_manager.size() == 0,

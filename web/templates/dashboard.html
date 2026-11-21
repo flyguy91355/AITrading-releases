@@ -149,7 +149,12 @@ body {
      body has overflow:hidden (this app fits one screen by design, panels scroll
      internally), so that unaccounted 56px pushed the bottom of the page off-screen with
      no way to scroll to it. Now subtracts both fixed-height siblings' heights. */
-  height: calc(100vh - 56px - 56px);
+  height: calc(100vh - 56px - 56px - var(--buy-block-h, 0px));
+  /* --buy-block-h (2026-11-21, market buy pause) is the live height of #buyBlockBanners,
+     kept current by a ResizeObserver next to updateMarketPauseBanner(). A market pause can
+     last weeks, so its banner (and the drawdown banner sharing the container) pushes the
+     page down instead of sitting over the panel headers. 0px when no banner shows. */
+  margin-top: var(--buy-block-h, 0px);
 }
 .main-layout-resize {
   cursor: ew-resize;
@@ -845,9 +850,14 @@ tbody tr:hover { background: var(--bg-card-hover); }
      those two already make. The button calls the SAME /api/recalibrate-drawdown-baseline
      endpoint Settings > System already exposed -- this doesn't add a new un-halt
      mechanism, it just makes the existing self-service one visible from the page the
-     owner is actually looking at. -->
-<div id="drawdownHaltBanner" style="display:none;position:fixed;top:112px;left:0;right:0;z-index:550;
-     background:#3a2a14;border-bottom:2px solid #f59e0b;padding:10px 20px;
+     owner is actually looking at.
+     Market buy pause (2026-11-21): both "buying is blocked" banners now live in the one fixed
+     #buyBlockBanners column (same top offset and z-index the drawdown banner used to set on
+     itself), so a market pause during a drawdown halt shows both, stacked, never one hiding
+     the other. An empty container has no height and blocks nothing. -->
+<div id="buyBlockBanners" style="position:fixed;top:112px;left:0;right:0;z-index:550;display:flex;flex-direction:column;">
+<div id="drawdownHaltBanner" style="display:none;
+     background:#3a2a14;border-bottom:2px solid #f59e0b;padding:10px 20px;flex-wrap:wrap;
      align-items:center;justify-content:space-between;gap:16px;box-shadow:0 2px 8px rgba(0,0,0,0.4);">
   <div style="font-size:13px;color:#fff;">
     <b id="drawdownHaltTitle">⚠ Auto-buying halted</b> — <span id="drawdownHaltDetail">--</span>
@@ -856,6 +866,21 @@ tbody tr:hover { background: var(--bg-card-hover); }
     <span style="font-size:11px;color:#d1a85a;max-width:360px;">Positions are still being managed (stops/take-profits unaffected). Only new buys are blocked.</span>
     <button class="pause-btn" onclick="recalibrateDrawdownFromBanner()" style="background:#b45309;color:#fff;border:none;white-space:nowrap;">⟳ Recalibrate Baseline</button>
   </div>
+</div>
+<!-- Market buy pause banner (2026-11-21, owner request: "Needs a visual indication on the
+     dashboard if it's in that state"). Filled by updateMarketPauseBanner() from the
+     market_pause object on every 'portfolio' broadcast. Blue, not amber, so it reads as a
+     different condition from the drawdown halt. Deliberately no override button: the
+     switch lives in Settings > Market Pause. -->
+<div id="marketPauseBanner" style="display:none;
+     background:#14233a;border-bottom:2px solid #3b82f6;padding:10px 20px;flex-wrap:wrap;
+     align-items:center;justify-content:space-between;gap:16px;box-shadow:0 2px 8px rgba(0,0,0,0.4);">
+  <div style="font-size:13px;color:#fff;min-width:0;">
+    <b id="marketPauseTitle">⏸ Market pause — auto-buys paused</b><br>
+    <span id="marketPauseDetail" style="color:#cbd5e1;">--</span>
+  </div>
+  <span style="font-size:11px;color:#93c5fd;max-width:360px;">Positions are still managed. Manual buys allowed.</span>
+</div>
 </div>
 
 <!-- Fresh-install banner (2026-07-21) -- fixed/overlay positioned so it never disturbs
@@ -1881,9 +1906,66 @@ async function recalibrateDrawdownFromBanner() {
   }
 }
 
+// ── Market pause banner: pure helpers (no DOM) ──
+// Market buy pause (2026-11-21). DOM-free so tests/test_market_pause_banner.py can run it in
+// Node. mp is the market_pause object from get_portfolio_snapshot(); times are shown in ET.
+function _marketPauseEtParts(date) {
+  const fmt = new Intl.DateTimeFormat('en-US', {timeZone: 'America/New_York', month: '2-digit',
+    day: '2-digit', hour: 'numeric', minute: '2-digit', hour12: true});
+  return Object.fromEntries(fmt.formatToParts(date).map(part => [part.type, part.value]));
+}
+function marketPauseBannerText(mp) {
+  if (!(mp && mp.enabled && mp.active)) return {show: false, title: '', detail: ''};
+  let title = '⏸ Market pause — auto-buys paused';
+  const since = mp.since || '';
+  if (since.includes('T')) {
+    const p = _marketPauseEtParts(new Date(since));
+    title += ` since ${p.hour}:${p.minute} ${p.dayPeriod} on ${p.month}-${p.day} (live)`;
+  } else if (since) {
+    const [y, m, d] = since.split('-').map(Number);
+    const weekday = new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString('en-US',
+      {weekday: 'short', timeZone: 'UTC'});
+    title += ` since the ${weekday} ${since.slice(5)} close`;
+  }
+  let detail = (mp.reason || '') + '. Clears at a market close when either recovers.';
+  const checked = mp.last_close_check_at || mp.checked_at;
+  if (mp.stale && checked) {
+    const p = _marketPauseEtParts(new Date(checked));
+    detail += ` (market data last checked ${p.month}-${p.day})`;
+  }
+  return {show: true, title, detail};
+}
+// ── end Market pause banner helpers ──
+
+function updateMarketPauseBanner(p) {
+  const banner = document.getElementById('marketPauseBanner');
+  if (!banner) return;
+  const text = marketPauseBannerText(p.market_pause);
+  if (!text.show) {
+    banner.style.display = 'none';
+    return;
+  }
+  document.getElementById('marketPauseTitle').textContent = text.title;
+  document.getElementById('marketPauseDetail').textContent = text.detail;
+  banner.style.display = 'flex';
+}
+
+// Reserve room under the header for whichever buy-block banners are showing (market pause,
+// drawdown halt): .main-layout's margin-top and height read --buy-block-h. A ResizeObserver
+// catches every path that shows/hides/re-wraps a banner (portfolio broadcasts, the
+// recalibrate button, window resizes) without each one having to remember to call in.
+(function trackBuyBlockBannerHeight() {
+  const box = document.getElementById('buyBlockBanners');
+  if (!box || typeof ResizeObserver === 'undefined') return;
+  new ResizeObserver(() => {
+    document.documentElement.style.setProperty('--buy-block-h', box.offsetHeight + 'px');
+  }).observe(box);
+})();
+
 function updatePortfolio(p) {
   _latestPortfolio = p;
   updateDrawdownHaltBanner(p);
+  updateMarketPauseBanner(p);
   document.getElementById('totalValue').textContent = fmt$(p.total_value);
 
   const dayEl = document.getElementById('dayPnl');
@@ -6486,8 +6568,14 @@ async function submitManualBuy() {
       ? `<div style="margin-top:8px;padding:8px 10px;background:#78350f;border:1px solid #d97706;border-radius:6px;color:#fde68a;">`
         + `⚠️ <strong>${data.earnings_warning}</strong> — gap risk is high around earnings. Buy anyway?</div>`
       : '';
+    // Market buy pause (2026-11-21) -- advisory only, same box as the earnings warning: the
+    // pause blocks automatic buys, never a manual one, so Confirm still works.
+    const pauseNote = data.market_pause_warning
+      ? `<div style="margin-top:8px;padding:8px 10px;background:#78350f;border:1px solid #d97706;border-radius:6px;color:#fde68a;">`
+        + `⏸ <strong>Market pause is on</strong> — ${data.market_pause_warning}. Buy anyway?</div>`
+      : '';
     resultEl.style.color = 'var(--text-primary)';
-    resultEl.innerHTML = `<strong>${data.ticker}</strong> @ $${data.price?.toFixed(2)} &nbsp;|&nbsp; ${data.shares} shares &nbsp;|&nbsp; $${data.dollars?.toFixed(2)}${cappedNote}<br>Stop: $${data.stop_loss?.toFixed(2)} &nbsp;|&nbsp; T1: $${data.targets?.[0]?.toFixed(2)} &nbsp;T2: $${data.targets?.[1]?.toFixed(2)} &nbsp;T3: $${data.targets?.[2]?.toFixed(2)}${earningsNote}`;
+    resultEl.innerHTML = `<strong>${data.ticker}</strong> @ $${data.price?.toFixed(2)} &nbsp;|&nbsp; ${data.shares} shares &nbsp;|&nbsp; $${data.dollars?.toFixed(2)}${cappedNote}<br>Stop: $${data.stop_loss?.toFixed(2)} &nbsp;|&nbsp; T1: $${data.targets?.[0]?.toFixed(2)} &nbsp;T2: $${data.targets?.[1]?.toFixed(2)} &nbsp;T3: $${data.targets?.[2]?.toFixed(2)}${earningsNote}${pauseNote}`;
     confirmBtn.style.display = '';
   } catch(e) {
     resultEl.style.color = 'var(--red)';
