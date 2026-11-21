@@ -5222,10 +5222,12 @@ async function initTickerTape() {
     if (resp.ok) cryptoCount = (await resp.json()).crypto_count;
   } catch (e) { console.error('ticker tape config fetch failed, defaulting to 5:', e); }
 
+  // SPY sits right before VXX (2026-11-21, owner request) -- the market buy pause watches
+  // SPY vs its 50-day and VIX, so the two read side by side.
   const symbols = [
-    {"proName": "AMEX:SPY",    "title": "S&P 500"},
     {"proName": "NASDAQ:QQQ",  "title": "Nasdaq 100"},
     {"proName": "AMEX:DIA",    "title": "Dow 30"},
+    {"proName": "AMEX:SPY",    "title": "SPY (S&P 500)"},
     {"proName": "AMEX:VXX",    "title": "VXX (VIX proxy)"},
     {"proName": "NASDAQ:TLT",  "title": "10Y Yield"},
     {"proName": "TVC:GOLD",    "title": "Gold"},
