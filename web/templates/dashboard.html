@@ -251,15 +251,21 @@ body {
   justify-content: center;
 }
 /* Market graph + smaller logo sharing the old logo cell (2026-11-21, owner request). */
-.brand-chart-row { display: flex; gap: 10px; min-width: 0; container-type: inline-size; }
+.brand-chart-row { display: flex; gap: 10px; min-width: 0; container: brandrow / inline-size; }
 /* 2026-11-21 evening, owner: "its too long and too small" -- the graph is narrower and taller (the
    top row grows to fit it), and the logo gets its room and tagline back. */
 .brand-mark-small { flex: 1 1 0; min-width: 0; flex-direction: column; gap: 3px; text-align: center; white-space: nowrap; overflow: hidden; }
+/* Fixed sizes that fill the logo's spot (2026-11-21, owner: "make the logo bigger to better fit the space
+   it has" ... "dont think you have to have an automatic scale ... just make it fit"). Sized for the
+   ~156x136px spot at 1920px wide; narrower windows still drop the words, then the logo (below). */
+.brand-mark-small .brand-icon { width: 72px; max-width: 100%; height: auto; flex-shrink: 0; }
+.brand-mark-small .logo { font-size: 18px; line-height: 1.15; }
+.brand-by { font-size: 13px; color: var(--text-muted); letter-spacing: 0.3px; margin-top: 2px; }
 /* On narrower screens the logo gives way first -- its words, then the whole logo -- so the graph
    keeps its width and its header never cuts off a number (final review, 2026-11-21). */
-@container (max-width: 405px) { .brand-mark-small .brand-text { display: none; } }
-@container (max-width: 315px) { .brand-mark-small { display: none; } }
-.brand-tagline { font-size: 10.5px; color: var(--text-muted); letter-spacing: 0.3px; white-space: normal; line-height: 1.25; }
+@container brandrow (max-width: 405px) { .brand-mark-small .brand-text { display: none; } }
+@container brandrow (max-width: 315px) { .brand-mark-small { display: none; } }
+.brand-tagline { font-size: 11px; color: var(--text-muted); letter-spacing: 0.3px; white-space: normal; line-height: 1.25; }
 .market-chart-card {
   flex: 0 0 250px; max-width: 100%; display: flex; flex-direction: column; gap: 2px; overflow: hidden; cursor: pointer;
   background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px;
@@ -992,7 +998,7 @@ tbody tr:hover { background: var(--bg-card-hover); }
         </div>
        </div>
       <div class="brand-mark brand-mark-small">
-        <svg viewBox="0 0 64 48" width="52" height="39" style="flex-shrink:0;">
+        <svg viewBox="0 0 64 48" class="brand-icon">
           <defs>
             <linearGradient id="brandBarGrad" x1="0" y1="1" x2="0" y2="0">
               <stop offset="0%" stop-color="var(--accent)"/>
@@ -1010,9 +1016,9 @@ tbody tr:hover { background: var(--bg-card-hover); }
           <circle cx="51" cy="2"  r="2.75" fill="var(--cyan)"/>
         </svg>
         <div class="brand-text">
-          <div class="logo" style="font-size:17px;line-height:1.2;">Hilton's AITrading</div>
+          <div class="logo">Hilton's AITrading</div>
           <div class="brand-tagline">AI Powered Research &amp; Automatic Trading</div>
-          <div style="font-size:12px;color:var(--text-muted);letter-spacing:0.3px;margin-top:2px;">by the <span style="color:var(--cyan);font-weight:700;">Hilton Group</span></div>
+          <div class="brand-by">by the <span style="color:var(--cyan);font-weight:700;">Hilton Group</span></div>
         </div>
       </div>
       </div>
