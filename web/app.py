@@ -2393,7 +2393,7 @@ class DashboardState:
             "drawdown_state": self.risk_manager.check_drawdown(p),
             "drawdown_pct": round((p.peak_value - p.total_value) / p.peak_value * 100, 2) if p.peak_value else 0.0,
             "peak_value": round(p.peak_value, 2),
-            # Market buy pause (2026-11-21) -- drives dashboard.html's #marketPauseBanner, live on
+            # Market buy pause (2026-11-21) -- drives dashboard.html's #marketPausePill and graph, live on
             # every portfolio broadcast exactly like drawdown_state above.
             "market_pause": self._market_pause_snapshot(),
         }

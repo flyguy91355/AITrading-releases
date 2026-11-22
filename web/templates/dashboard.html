@@ -107,7 +107,11 @@ body {
   border-bottom: 1px solid var(--border);
   height: 56px;
 }
-.header-left { display: flex; align-items: center; gap: 16px; }
+.header-left { display: flex; align-items: center; gap: 16px; min-width: 0; flex: 1 1 auto; }
+/* With the market pause pill in the header (2026-11-21), every item keeps one line and only the
+   pill shortens (ellipsis) on a narrow screen -- final review measured the header wrapping at 1366px. */
+.header-left > * { white-space: nowrap; flex-shrink: 0; }
+.header-left > .pause-pill { flex-shrink: 1; min-width: 0; }
 .logo {
   font-size: 20px;
   font-weight: 700;
@@ -126,7 +130,7 @@ body {
 }
 .mode-paper { background: var(--yellow-bg); color: var(--yellow); border: 1px solid rgba(245,158,11,0.3); }
 .mode-live  { background: var(--red-bg);    color: var(--red);    border: 1px solid var(--red-border); }
-.header-right { display: flex; align-items: center; gap: 16px; }
+.header-right { display: flex; align-items: center; gap: 16px; flex-shrink: 0; margin-left: 16px; }
 .connection-status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
 .status-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
@@ -151,9 +155,9 @@ body {
      no way to scroll to it. Now subtracts both fixed-height siblings' heights. */
   height: calc(100vh - 56px - 56px - var(--buy-block-h, 0px));
   /* --buy-block-h (2026-11-21, market buy pause) is the live height of #buyBlockBanners,
-     kept current by a ResizeObserver next to updateMarketPauseBanner(). A market pause can
-     last weeks, so its banner (and the drawdown banner sharing the container) pushes the
-     page down instead of sitting over the panel headers. 0px when no banner shows. */
+     kept current by a ResizeObserver next to updateMarketPauseBanner(). The drawdown banner
+     there pushes the page down instead of sitting over the panel headers (the market pause
+     moved into the header as a pill, 2026-11-21 evening). 0px when no banner shows. */
   margin-top: var(--buy-block-h, 0px);
 }
 .main-layout-resize {
@@ -247,10 +251,17 @@ body {
   justify-content: center;
 }
 /* Market graph + smaller logo sharing the old logo cell (2026-11-21, owner request). */
-.brand-chart-row { display: flex; gap: 10px; min-width: 0; }
-.brand-mark-small { flex: 0 0 108px; flex-direction: column; gap: 4px; text-align: center; white-space: nowrap; }
+.brand-chart-row { display: flex; gap: 10px; min-width: 0; container-type: inline-size; }
+/* 2026-11-21 evening, owner: "its too long and too small" -- the graph is narrower and taller (the
+   top row grows to fit it), and the logo gets its room and tagline back. */
+.brand-mark-small { flex: 1 1 0; min-width: 0; flex-direction: column; gap: 3px; text-align: center; white-space: nowrap; overflow: hidden; }
+/* On narrower screens the logo gives way first -- its words, then the whole logo -- so the graph
+   keeps its width and its header never cuts off a number (final review, 2026-11-21). */
+@container (max-width: 405px) { .brand-mark-small .brand-text { display: none; } }
+@container (max-width: 315px) { .brand-mark-small { display: none; } }
+.brand-tagline { font-size: 10.5px; color: var(--text-muted); letter-spacing: 0.3px; white-space: normal; line-height: 1.25; }
 .market-chart-card {
-  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; overflow: hidden;
+  flex: 0 0 250px; max-width: 100%; display: flex; flex-direction: column; gap: 2px; overflow: hidden; cursor: pointer;
   background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px;
 }
 .mc-head, .mc-foot {
@@ -263,7 +274,8 @@ body {
   background: rgba(59,130,246,0.35); border-radius: 1px;
 }
 .mc-values { overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
-.mc-date { color: var(--text-primary); font-weight: 600; margin-right: 4px; }
+.mc-date { color: var(--text-primary); font-weight: 600; }
+.market-chart-card .mc-chg { display: none; }   /* the change % is in the full-size window */
 .mc-spy { color: #3987e5; }
 .mc-sma { color: var(--yellow); }
 .mc-vix { color: var(--red); }
@@ -273,10 +285,23 @@ body {
   color: var(--text-muted); font-size: 10px; font-family: inherit;
 }
 .mc-ranges button.active { color: var(--accent); font-weight: 700; }
-/* No fixed height: the graph takes whatever the top row's existing height leaves, so adding it
-   never pushes the P/L tiles down. contain: size stops the chart's own pixel sizing from holding
-   the row open after something briefly makes it taller (e.g. a window resize). */
-.mc-chart { flex: 1; min-height: 0; position: relative; contain: size; }
+.mc-ranges-big button { font-size: 13px; padding: 2px 6px; }
+.mc-big-values { font-size: 13px; color: var(--text-secondary); margin-bottom: 6px; font-variant-numeric: tabular-nums; white-space: pre-wrap; }
+.mc-big-legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 8px; font-size: 12px; color: var(--text-muted); }
+/* A fixed 92px graph (owner, 2026-11-21: "too long and too small"); the top row grows to fit it.
+   contain: size stops the chart's own pixel sizing from holding the row open after something
+   briefly makes it taller (e.g. a window resize). */
+.mc-chart { flex: 0 0 auto; height: 92px; position: relative; contain: size; }
+.market-chart-card:hover { border-color: var(--accent); }
+/* The header's market pause pill (replaces the full-width banner). */
+.pause-pill {
+  display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 12px;
+  font-size: 12px; font-weight: 600; color: var(--accent); cursor: pointer;
+  background: rgba(59,130,246,0.14); border: 1px solid rgba(59,130,246,0.55);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42vw;
+}
+.pause-pill:hover { background: rgba(59,130,246,0.24); }
+.pause-pill.stale { border-color: var(--yellow); }
 .mc-empty {
   position: absolute; inset: 0; z-index: 2; pointer-events: none; display: none;
   align-items: center; justify-content: center; font-size: 11px; color: var(--text-muted);
@@ -819,6 +844,10 @@ tbody tr:hover { background: var(--bg-card-hover); }
     <div class="logo">Hilton's AITrading</div>
     <span class="mode-badge mode-paper" id="modeBadge">PAPER</span>
     <span class="mode-badge broker-badge" id="brokerBadge">NO BROKER</span>
+    <!-- Market pause pill (2026-11-21 evening, owner request: "move the market pause line that goes
+         all the way across the sceen to between the alpaca paper button and the info button").
+         Filled by updateMarketPauseBanner(); the full reason is on hover; a click opens the graph. -->
+    <span id="marketPausePill" class="pause-pill" style="display:none;" onclick="openMarketChartWindow()">⏸ Market pause</span>
   </div>
   <div class="header-right">
     <div id="aboutButton"
@@ -886,10 +915,10 @@ tbody tr:hover { background: var(--bg-card-hover); }
      endpoint Settings > System already exposed -- this doesn't add a new un-halt
      mechanism, it just makes the existing self-service one visible from the page the
      owner is actually looking at.
-     Market buy pause (2026-11-21): both "buying is blocked" banners now live in the one fixed
-     #buyBlockBanners column (same top offset and z-index the drawdown banner used to set on
-     itself), so a market pause during a drawdown halt shows both, stacked, never one hiding
-     the other. An empty container has no height and blocks nothing. -->
+     The fixed #buyBlockBanners column (same top offset and z-index the drawdown banner used to
+     set on itself) now holds only the drawdown banner: the market buy pause shows as a pill in
+     the header (#marketPausePill, 2026-11-21 evening). An empty container has no height and
+     blocks nothing. -->
 <div id="buyBlockBanners" style="position:fixed;top:112px;left:0;right:0;z-index:550;display:flex;flex-direction:column;">
 <div id="drawdownHaltBanner" style="display:none;
      background:#3a2a14;border-bottom:2px solid #f59e0b;padding:10px 20px;flex-wrap:wrap;
@@ -901,20 +930,6 @@ tbody tr:hover { background: var(--bg-card-hover); }
     <span style="font-size:11px;color:#d1a85a;max-width:360px;">Positions are still being managed (stops/take-profits unaffected). Only new buys are blocked.</span>
     <button class="pause-btn" onclick="recalibrateDrawdownFromBanner()" style="background:#b45309;color:#fff;border:none;white-space:nowrap;">⟳ Recalibrate Baseline</button>
   </div>
-</div>
-<!-- Market buy pause banner (2026-11-21, owner request: "Needs a visual indication on the
-     dashboard if it's in that state"). Filled by updateMarketPauseBanner() from the
-     market_pause object on every 'portfolio' broadcast. Blue, not amber, so it reads as a
-     different condition from the drawdown halt. Deliberately no override button: the
-     switch lives in Settings > Market Pause. -->
-<div id="marketPauseBanner" style="display:none;
-     background:#14233a;border-bottom:2px solid #3b82f6;padding:10px 20px;flex-wrap:wrap;
-     align-items:center;justify-content:space-between;gap:16px;box-shadow:0 2px 8px rgba(0,0,0,0.4);">
-  <div style="font-size:13px;color:#fff;min-width:0;">
-    <b id="marketPauseTitle">⏸ Market pause — auto-buys paused</b><br>
-    <span id="marketPauseDetail" style="color:#cbd5e1;">--</span>
-  </div>
-  <span style="font-size:11px;color:#93c5fd;max-width:360px;">Positions are still managed. Manual buys allowed.</span>
 </div>
 </div>
 
@@ -966,18 +981,18 @@ tbody tr:hover { background: var(--bg-card-hover); }
            data (GET /api/market-chart + market_pause.readings). Shares the old logo cell with a
            smaller logo; Portfolio Value and Cash are untouched. Drawn by initMarketChart(). -->
       <div class="brand-chart-row" style="grid-column: span 2;">
-       <div class="market-chart-card" id="marketChartCard">
+       <div class="market-chart-card" id="marketChartCard" onclick="openMarketChartWindow()">
         <div class="mc-head">
-          <span class="mc-values"><span id="mcDate" class="mc-date"></span><b class="mc-spy">SPY <span id="mcSpy">--</span></b> &middot; <span class="mc-sma"><span id="mcSmaLabel">50-day</span> <span id="mcSma">--</span></span> &middot; <b class="mc-vix">VIX <span id="mcVix">--</span></b> <span id="mcVixChange" class="mc-chg"></span></span>
+          <span class="mc-values"><b class="mc-spy">SPY <span id="mcSpy">--</span></b> &middot; <span class="mc-sma"><span id="mcSmaLabel">50-day</span> <span id="mcSma">--</span></span> &middot; <b class="mc-vix">VIX <span id="mcVix">--</span></b> <span id="mcVixChange" class="mc-chg"></span></span>
         </div>
         <div class="mc-chart" id="marketChart"><div class="mc-empty" id="mcEmpty">Loading market data</div></div>
         <div class="mc-foot">
-          <span class="mc-legend"><i></i>pause days</span>
+          <span class="mc-legend" id="mcLegend"><i></i>pause days</span><span class="mc-date" id="mcDate"></span>
           <span class="mc-ranges"><button type="button" data-mc-range="1M">1M</button><button type="button" data-mc-range="3M">3M</button><button type="button" data-mc-range="6M">6M</button><button type="button" data-mc-range="1Y">1Y</button></span>
         </div>
        </div>
       <div class="brand-mark brand-mark-small">
-        <svg viewBox="0 0 64 48" width="40" height="30" style="flex-shrink:0;">
+        <svg viewBox="0 0 64 48" width="52" height="39" style="flex-shrink:0;">
           <defs>
             <linearGradient id="brandBarGrad" x1="0" y1="1" x2="0" y2="0">
               <stop offset="0%" stop-color="var(--accent)"/>
@@ -994,9 +1009,10 @@ tbody tr:hover { background: var(--bg-card-hover); }
           <circle cx="37" cy="8"  r="2.25" fill="var(--bg-card)" stroke="var(--cyan)" stroke-width="1.5"/>
           <circle cx="51" cy="2"  r="2.75" fill="var(--cyan)"/>
         </svg>
-        <div>
-          <div class="logo" style="font-size:13px;line-height:1.2;">Hilton's AITrading</div>
-          <div style="font-size:10.5px;color:var(--text-muted);letter-spacing:0.3px;margin-top:2px;">by the <span style="color:var(--cyan);font-weight:700;">Hilton Group</span></div>
+        <div class="brand-text">
+          <div class="logo" style="font-size:17px;line-height:1.2;">Hilton's AITrading</div>
+          <div class="brand-tagline">AI Powered Research &amp; Automatic Trading</div>
+          <div style="font-size:12px;color:var(--text-muted);letter-spacing:0.3px;margin-top:2px;">by the <span style="color:var(--cyan);font-weight:700;">Hilton Group</span></div>
         </div>
       </div>
       </div>
@@ -1388,6 +1404,30 @@ tbody tr:hover { background: var(--bg-card-hover); }
       <button class="cancel-btn" onclick="closePortfolioSummary()" style="padding:4px 12px;">✕</button>
     </div>
     <div id="portfolioSummaryBody">Loading...</div>
+  </div>
+</div>
+
+<!-- SPY/VIX graph window (2026-11-21 evening, owner request: "when i click on it it should bring up
+     a full sized graph well in a window"). The top-row graph's data as two stacked charts
+     (SPY above, VIX below), each with its own price axis, one shared date axis, scroll and zoom. Opened by clicking the small graph or the header's market
+     pause pill; Esc, the Close button or a click outside closes it. -->
+<div class="trade-modal-overlay" id="marketChartModal" onmousedown="this._downOnSelf=(event.target===this)" onclick="if(event.target===this&&this._downOnSelf)closeMarketChartWindow()" style="display:none;">
+  <div class="trade-modal" style="max-width:96vw;width:1400px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px;">
+      <h3 style="margin:0;">SPY vs its <span id="mcBigSmaTitle">50</span>-day average · VIX vs <span id="mcBigLevelTitle">20</span></h3>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <span class="mc-ranges mc-ranges-big"><button type="button" data-mc-range="1M">1M</button><button type="button" data-mc-range="3M">3M</button><button type="button" data-mc-range="6M">6M</button><button type="button" data-mc-range="1Y">1Y</button></span>
+        <button class="cancel-btn" onclick="closeMarketChartWindow()" style="padding:4px 12px;">✕ Close</button>
+      </div>
+    </div>
+    <div class="mc-big-values" id="mcBigValues">--</div>
+    <div id="marketChartBig" style="height:min(66vh,620px);display:flex;flex-direction:column;">
+      <div id="marketChartBigTop" style="flex:58 1 0;min-height:0;position:relative;"></div>
+      <div id="marketChartBigBottom" style="flex:42 1 0;min-height:0;position:relative;border-top:1px solid var(--border);"></div>
+    </div>
+    <div class="mc-big-legend">
+      <span class="mc-spy">━ SPY</span><span class="mc-sma">┅ SPY average</span><span class="mc-vix">━ VIX</span><span class="mc-sma">┅ VIX pause level</span><span class="mc-legend"><i></i>both pause conditions held at the close</span>
+    </div>
   </div>
 </div>
 
@@ -2084,7 +2124,8 @@ function marketChartNeedsRefetch(chartData, readings) {
 // ── end Market chart helpers ──
 
 // ── Market chart: DOM ──
-let _mc = null;           // {chart, spy, sma, vix, shade, vixLine}
+let _mc = null;           // the top-row graph: {charts, shades, spy, sma, vix, vixLine, big}
+let _mcBig = null;        // the full-size window's graph, while it's open
 let _mcData = null;       // last /api/market-chart payload
 let _mcReadings = null;   // latest market_pause.readings
 let _mcRange = '3M';
@@ -2105,7 +2146,9 @@ function _mcSetEmpty(text) {
 function _mcRenderHeader(hover) {
   const t = hover || marketReadingsText(_mcReadings);
   const set = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
-  set('mcDate', hover ? hover.date + ':' : '');
+  set('mcDate', hover ? hover.date : '');
+  const legend = document.getElementById('mcLegend');
+  if (legend) legend.style.display = hover ? 'none' : '';
   set('mcSpy', t.spy);
   set('mcSmaLabel', t.smaLabel.replace('-day', 'd'));   // "50d": the header is tight at this size
   set('mcSma', t.sma);
@@ -2113,27 +2156,150 @@ function _mcRenderHeader(hover) {
   set('mcVixChange', t.vixChange);
   const card = document.getElementById('marketChartCard');
   if (card && !hover) {
-    card.title = t.tooltip + ' Shaded days: both pause conditions held at the close.';
+    card.title = t.tooltip + ' Shaded days: both pause conditions held at the close. Click for a full-size graph.';
   }
+}
+
+// The window's header line: today's numbers, or the hovered day's.
+function _mcRenderBigHeader(hover) {
+  const el = document.getElementById('mcBigValues');
+  if (!el) return;
+  const t = hover || marketReadingsText(_mcReadings);
+  const when = hover ? hover.date + ':  ' : (_mcReadings ? 'Latest:  ' : '');
+  el.textContent = `${when}SPY ${t.spy}  ·  ${t.smaLabel} average ${t.sma}  ·  VIX ${t.vix} ${t.vixChange}`;
+  const sma = document.getElementById('mcBigSmaTitle');
+  if (sma) sma.textContent = String((_mcData && _mcData.sma_days) || (_mcReadings && _mcReadings.sma_days) || 50);
+  const lvl = document.getElementById('mcBigLevelTitle');
+  const level = _mcData ? _mcData.vix_level : null;
+  if (lvl) lvl.textContent = Number.isFinite(level) ? String(level) : '--';
+}
+
+function _mcShadeSeries(chart) {
+  // A full-height bar on each paused day, drawn first so the lines sit on top of it.
+  const shade = chart.addHistogramSeries({priceScaleId: 'mcShade', color: 'rgba(59,130,246,0.16)',
+    priceLineVisible: false, lastValueVisible: false,
+    autoscaleInfoProvider: () => ({priceRange: {minValue: 0, maxValue: 1}})});
+  chart.priceScale('mcShade').applyOptions({scaleMargins: {top: 0, bottom: 0}});
+  return shade;
+}
+function _mcLineOpts(color, big, extra) {
+  return Object.assign({color, lineWidth: big ? 2 : 1.5, priceLineVisible: false, lastValueVisible: big,
+    crosshairMarkerRadius: big ? 3 : 2}, extra || {});
+}
+// VIX's autoscale always includes the pause level, so the dashed level line stays on screen even
+// when VIX is far from it.
+function _mcVixAutoscale(original) {
+  const r = original();
+  const level = _mcData ? _mcData.vix_level : null;
+  if (!r || !Number.isFinite(level)) return r;
+  return {priceRange: {minValue: Math.min(r.priceRange.minValue, level),
+    maxValue: Math.max(r.priceRange.maxValue, level)}, margins: r.margins};
+}
+
+// The top row's small graph: one chart, no axes, no scroll or zoom -- SPY and its average in the top
+// band, VIX in the bottom band.
+function _mcBuild(el) {
+  const chart = LightweightCharts.createChart(el, {
+    autoSize: true,
+    layout: {background: {color: 'transparent'}, textColor: _lwcColor('--text-muted'), fontSize: 10},
+    grid: {vertLines: {visible: false}, horzLines: {visible: false}},
+    rightPriceScale: {visible: false, scaleMargins: {top: 0.06, bottom: 0.44}},
+    leftPriceScale: {visible: false, scaleMargins: {top: 0.62, bottom: 0.06}},
+    timeScale: {visible: false},
+    crosshair: {mode: LightweightCharts.CrosshairMode.Normal,
+      horzLine: {visible: false, labelVisible: false}, vertLine: {labelVisible: false}},
+    handleScroll: false,
+    handleScale: false,
+  });
+  el._lwcChart = chart;
+  const shade = _mcShadeSeries(chart);
+  // Every series names its scale: with a scale hidden, Lightweight Charts 4.1.3 moves a series with no
+  // id to the other one, which ignored the band margins and drew SPY over VIX (final review, 2026-11-21).
+  const spy = chart.addLineSeries(_mcLineOpts('#3987e5', false, {priceScaleId: 'right'}));
+  const sma = chart.addLineSeries(_mcLineOpts(_lwcColor('--yellow'), false, {priceScaleId: 'right', lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed}));
+  const vix = chart.addLineSeries(_mcLineOpts(_lwcColor('--red'), false, {priceScaleId: 'left',
+    autoscaleInfoProvider: _mcVixAutoscale}));
+  return {charts: [chart], shades: [shade], spy, sma, vix, vixLine: null, big: false};
+}
+
+// The full-size window: two stacked charts -- SPY and its average on top, VIX below -- each with its
+// own price axis (a single chart's axes would run the full height and mix the two scales), sharing
+// one date axis: scrolling, zooming and the hover line stay in step across both.
+function _mcBuildWindow(topEl, bottomEl) {
+  const border = _lwcColor('--border');
+  const opts = showTime => ({
+    autoSize: true,
+    layout: {background: {color: 'transparent'}, textColor: _lwcColor('--text-muted'), fontSize: 11},
+    grid: {vertLines: {visible: false}, horzLines: {visible: true, color: border}},
+    rightPriceScale: {visible: true, borderColor: border, minimumWidth: 72, scaleMargins: {top: 0.08, bottom: 0.08}},
+    leftPriceScale: {visible: false},
+    timeScale: {visible: showTime, borderColor: border},
+    crosshair: {mode: LightweightCharts.CrosshairMode.Normal},
+    handleScroll: true,
+    handleScale: true,
+  });
+  const top = LightweightCharts.createChart(topEl, opts(false));
+  const bottom = LightweightCharts.createChart(bottomEl, opts(true));
+  topEl._lwcChart = top;
+  bottomEl._lwcChart = bottom;
+  const shades = [_mcShadeSeries(top), _mcShadeSeries(bottom)];
+  const spy = top.addLineSeries(_mcLineOpts('#3987e5', true, {priceScaleId: 'right', title: 'SPY'}));
+  const sma = top.addLineSeries(_mcLineOpts(_lwcColor('--yellow'), true, {priceScaleId: 'right', lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed, title: 'avg'}));
+  const vix = bottom.addLineSeries(_mcLineOpts(_lwcColor('--red'), true, {priceScaleId: 'right', title: 'VIX',
+    autoscaleInfoProvider: _mcVixAutoscale}));
+  // Keep the two date axes and hover lines together.
+  let syncing = false;
+  const pair = [[top, bottom, vix], [bottom, top, spy]];
+  pair.forEach(([from, to, toSeries]) => {
+    from.timeScale().subscribeVisibleLogicalRangeChange(range => {
+      if (syncing || !range) return;
+      syncing = true;
+      try { to.timeScale().setVisibleLogicalRange(range); } finally { syncing = false; }
+    });
+    from.subscribeCrosshairMove(param => {
+      _mcRenderBigHeader(_mcHoverAt(param && param.time));
+      try {
+        if (param && param.time) {
+          const d = toSeries.dataByIndex(param.logical, LightweightCharts.MismatchDirection.NearestLeft);
+          if (d) to.setCrosshairPosition(d.value, param.time, toSeries);
+        } else {
+          to.clearCrosshairPosition();
+        }
+      } catch (e) { /* older library: hover stays on the one chart */ }
+    });
+  });
+  return {charts: [top, bottom], shades, spy, sma, vix, vixLine: null, big: true};
+}
+
+function _mcRenderInto(c, points) {
+  const s = marketChartSeries(points, _mcRange);
+  c.shades.forEach(shade => shade.setData(s.shade));
+  c.spy.setData(s.spy);
+  c.sma.setData(s.sma);
+  c.vix.setData(s.vix);
+  const level = _mcData ? _mcData.vix_level : null;
+  if (c.vixLine) { c.vix.removePriceLine(c.vixLine); c.vixLine = null; }
+  if (Number.isFinite(level)) {
+    c.vixLine = c.vix.createPriceLine({price: level, color: _lwcColor('--yellow'), lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: c.big, title: c.big ? 'pause level' : ''});
+  }
+  // Re-fit only when the range or the presence of data changes: a live reading re-renders every minute,
+  // and re-fitting each time snapped a zoomed or scrolled window back (final review, 2026-11-21).
+  const fitKey = _mcRange + '|' + (points.length ? 'data' : 'empty');
+  if (!c.big || c.fitKey !== fitKey) c.charts.forEach(chart => chart.timeScale().fitContent());
+  c.fitKey = fitKey;
 }
 
 function renderMarketChart() {
   document.querySelectorAll('[data-mc-range]').forEach(b => b.classList.toggle('active', b.dataset.mcRange === _mcRange));
-  if (!_mc) return;
   const points = marketChartPoints((_mcData && _mcData.points) || [], _mcReadings);
-  _mcSetEmpty(points.length ? '' : (_mcData ? 'Waiting for market data' : 'Loading market data'));
-  const s = marketChartSeries(points, _mcRange);
-  _mc.shade.setData(s.shade);
-  _mc.spy.setData(s.spy);
-  _mc.sma.setData(s.sma);
-  _mc.vix.setData(s.vix);
-  const level = _mcData ? _mcData.vix_level : null;
-  if (_mc.vixLine) { _mc.vix.removePriceLine(_mc.vixLine); _mc.vixLine = null; }
-  if (Number.isFinite(level)) {
-    _mc.vixLine = _mc.vix.createPriceLine({price: level, color: _lwcColor('--yellow'), lineWidth: 1,
-      lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: false});
-  }
-  _mc.chart.timeScale().fitContent();
+  _mcSetEmpty(!_mc ? 'Chart unavailable'
+    : points.length ? '' : (_mcData ? 'Waiting for market data' : 'Loading market data'));
+  if (_mc) _mcRenderInto(_mc, points);
+  if (_mcBig) _mcRenderInto(_mcBig, points);
+  _mcRenderBigHeader(null);
 }
 
 async function fetchMarketChart() {
@@ -2148,11 +2314,17 @@ async function fetchMarketChart() {
   renderMarketChart();
 }
 
+function _mcHoverAt(time) {
+  return time ? marketChartHoverText(marketChartPoints((_mcData && _mcData.points) || [], _mcReadings), time,
+    (_mcData && _mcData.sma_days) || 50) : null;
+}
+
 function initMarketChart() {
   const el = document.getElementById('marketChart');
   if (!el) return;
   document.querySelectorAll('[data-mc-range]').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', ev => {
+      ev.stopPropagation();   // a range click on the small graph must not also open the window
       _mcRange = btn.dataset.mcRange;
       try { localStorage.setItem('marketChartRange', _mcRange); } catch (e) { /* not remembered */ }
       renderMarketChart();
@@ -2162,61 +2334,51 @@ function initMarketChart() {
     _mcSetEmpty('Chart unavailable');
     return;
   }
-  const chart = LightweightCharts.createChart(el, {
-    autoSize: true,
-    layout: {background: {color: 'transparent'}, textColor: _lwcColor('--text-muted'), fontSize: 10},
-    grid: {vertLines: {visible: false}, horzLines: {visible: false}},
-    rightPriceScale: {visible: false, scaleMargins: {top: 0.06, bottom: 0.46}},
-    leftPriceScale: {visible: false},
-    timeScale: {visible: false},
-    crosshair: {mode: LightweightCharts.CrosshairMode.Normal,
-      horzLine: {visible: false, labelVisible: false}, vertLine: {labelVisible: false}},
-    handleScroll: false,
-    handleScale: false,
-  });
-  el._lwcChart = chart;
-  const line = (color, extra) => Object.assign({color, lineWidth: 1.5, priceLineVisible: false,
-    lastValueVisible: false, crosshairMarkerRadius: 2}, extra || {});
-  // Shading first, so the lines draw over it: a full-height bar on each paused day.
-  const shade = chart.addHistogramSeries({priceScaleId: 'mcShade', color: 'rgba(59,130,246,0.16)',
-    priceLineVisible: false, lastValueVisible: false,
-    autoscaleInfoProvider: () => ({priceRange: {minValue: 0, maxValue: 1}})});
-  chart.priceScale('mcShade').applyOptions({scaleMargins: {top: 0, bottom: 0}});
-  // priceScaleId 'right' is required: with the right scale hidden, Lightweight Charts 4.1.3 puts a
-  // series with no id on the LEFT scale, which ignores rightPriceScale's top-band margins and drew
-  // SPY over the VIX band (final review, 2026-11-21).
-  const spy = chart.addLineSeries(line('#3987e5', {priceScaleId: 'right'}));
-  const sma = chart.addLineSeries(line(_lwcColor('--yellow'), {priceScaleId: 'right', lineWidth: 1,
-    lineStyle: LightweightCharts.LineStyle.Dashed}));
-  // VIX on its own scale in the bottom part; its autoscale always includes the pause level, so the
-  // dashed level line stays on screen even when VIX is far from it.
-  const vix = chart.addLineSeries(line(_lwcColor('--red'), {priceScaleId: 'mcVix',
-    autoscaleInfoProvider: original => {
-      const r = original();
-      const level = _mcData ? _mcData.vix_level : null;
-      if (!r || !Number.isFinite(level)) return r;
-      return {priceRange: {minValue: Math.min(r.priceRange.minValue, level),
-        maxValue: Math.max(r.priceRange.maxValue, level)}, margins: r.margins};
-    }}));
-  chart.priceScale('mcVix').applyOptions({scaleMargins: {top: 0.62, bottom: 0.06}});
-  _mc = {chart, spy, sma, vix, shade, vixLine: null};
-  chart.subscribeCrosshairMove(param => {
-    const hover = param && param.time
-      ? marketChartHoverText(marketChartPoints((_mcData && _mcData.points) || [], _mcReadings), param.time,
-          (_mcData && _mcData.sma_days) || 50)
-      : null;
+  _mc = _mcBuild(el);
+  _mc.charts[0].subscribeCrosshairMove(param => {
+    const hover = _mcHoverAt(param && param.time);
     _mcHovering = !!hover;
     _mcRenderHeader(hover);
   });
   // A phone long-press leaves the crosshair (and the header) on that day with no mouse-leave to
   // clear it; lifting the finger puts the header back on today's numbers.
   el.addEventListener('touchend', () => {
-    try { chart.clearCrosshairPosition(); } catch (e) { /* older library: nothing to clear */ }
+    try { _mc.charts[0].clearCrosshairPosition(); } catch (e) { /* older library: nothing to clear */ }
     _mcHovering = false;
     _mcRenderHeader(null);
   }, {passive: true});
   renderMarketChart();
   fetchMarketChart();
+}
+
+// The full-size window (2026-11-21 evening, owner request: "when i click on it it should bring up a
+// full sized graph well in a window"). Opened from the small graph or the header's pause pill; the
+// window's graph is built on open and disposed on close.
+function openMarketChartWindow() {
+  const modal = document.getElementById('marketChartModal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  const el = document.getElementById('marketChartBig');
+  disposeChartsIn(el);
+  _mcBig = null;
+  try {
+    if (typeof LightweightCharts !== 'undefined') {
+      _mcBig = _mcBuildWindow(document.getElementById('marketChartBigTop'),
+        document.getElementById('marketChartBigBottom'));
+    }
+    renderMarketChart();
+    if (marketChartNeedsRefetch(_mcData, _mcReadings) && Date.now() - _mcLastFetch > 60000) fetchMarketChart();
+  } catch (e) {
+    console.error('market chart window failed:', e);
+  }
+}
+
+function closeMarketChartWindow() {
+  const modal = document.getElementById('marketChartModal');
+  if (!modal || modal.style.display === 'none') return;
+  modal.style.display = 'none';
+  disposeChartsIn(document.getElementById('marketChartBig'));
+  _mcBig = null;
 }
 
 // Called from updatePortfolio on every portfolio broadcast (~10s). Display-only, so a failure here
@@ -2237,21 +2399,27 @@ function updateMarketChart(p) {
 // (WebSocket, clock, On Deck), not just the graph.
 try { initMarketChart(); } catch (e) { console.error('market chart init failed:', e); _mcSetEmpty('Chart unavailable'); }
 
+// The market pause shows as a compact pill in the header (2026-11-21 evening, owner request: "move
+// the market pause line that goes all the way across the sceen to between the alpaca paper button
+// and the info button"). The full reason is on hover; a click opens the SPY/VIX graph window.
 function updateMarketPauseBanner(p) {
-  const banner = document.getElementById('marketPauseBanner');
-  if (!banner) return;
+  const pill = document.getElementById('marketPausePill');
+  if (!pill) return;
   const text = marketPauseBannerText(p.market_pause);
   if (!text.show) {
-    banner.style.display = 'none';
+    pill.style.display = 'none';
     return;
   }
-  document.getElementById('marketPauseTitle').textContent = text.title;
-  document.getElementById('marketPauseDetail').textContent = text.detail;
-  banner.style.display = 'flex';
+  // A stale reading stays visible, as it was on the old banner, not only in the hover text.
+  const stale = !!(p.market_pause && p.market_pause.stale);
+  pill.textContent = text.title + (stale ? ' · market data stale' : '');
+  pill.classList.toggle('stale', stale);
+  pill.title = text.detail + ' Positions are still managed; manual buys are allowed. Click for the SPY/VIX graph.';
+  pill.style.display = 'inline-flex';
 }
 
-// Reserve room under the header for whichever buy-block banners are showing (market pause,
-// drawdown halt): .main-layout's margin-top and height read --buy-block-h. A ResizeObserver
+// Reserve room under the header for the drawdown-halt banner when it shows (the market pause is
+// a header pill now): .main-layout's margin-top and height read --buy-block-h. A ResizeObserver
 // catches every path that shows/hides/re-wraps a banner (portfolio broadcasts, the
 // recalibrate button, window resizes) without each one having to remember to call in.
 (function trackBuyBlockBannerHeight() {
@@ -5472,6 +5640,7 @@ document.addEventListener('keydown', (e) => {
   closeTradeModal();
   closeManualTradeModal();
   closeChartExpand();
+  closeMarketChartWindow();
   closePortfolioSummary();
   closeDDConfirm();
   closeOnDeckRemoveModal();
