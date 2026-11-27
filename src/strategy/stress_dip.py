@@ -10,8 +10,16 @@ Research: docs/research/2026-11-26-swing-strategy-review/README.md. Rule, in pla
   * Next session, right after the open: fill free slots (10 slots, each ~1/10 of equity net of
     the cash reserve) in rank order, after a Claude veto check and the hard safety gates.
   * Hard stop at entry - 3 x ATR(14) (clipped to 3%-15%), resting at the broker as usual.
-  * Exit near the close on the first session whose close is above the 5-day average (judged
-    with the live price standing in for today's close), or on the 10th session held.
+  * Exit (exit_mode "trail", the default since 2026-11-26, owner: "Let winners run"): a stepped
+    trailing stop replaces the old sell-on-a-close-over-the-5-day-average rule. It starts at the
+    stock's own stop % and narrows (through +4.7% and +6.6%) to 0.5% under the high at +8.4%,
+    the same curve as the old bot's graduated trail (web/app.py _graduated_trail_pct). It is
+    raised once per session from the completed daily highs since the buy, never lowered, and
+    the broker's resting stop moves to it. Sell at the close of the 20th session held if
+    nothing else has. Backtest of this exact rule: 11.7%/yr and 11.5%/yr in 2016-2026 (all
+    stocks / point-in-time S&P 500) vs 9.0%/7.6% for the old exit, but 4.6%/3.0% vs 5.7%/4.6%
+    in 2005-2015 with deeper drawdowns (-44% vs -30%). exit_mode "average" restores the old
+    exit: the first close above the 5-day average, or the 10th session.
 
 Backtest (both 2005-2015 and 2016-2026, all-universe and point-in-time S&P 500): every signal
 averaged +0.40% to +0.71% per ~3-day trade, 68-73% winners. A per-day buy cap HURT it in
@@ -36,7 +44,13 @@ STRESS_DIP_DEFAULTS = {
     "stop_atr_mult": 3.0,
     "stop_min_pct": 3.0,
     "stop_max_pct": 15.0,
-    "max_hold_sessions": 10,
+    "max_hold_sessions": 10,          # exit_mode "average"
+    "exit_mode": "trail",             # "trail" (stepped trailing stop) or "average" (5-day average)
+    "trail_max_hold_sessions": 20,    # exit_mode "trail"
+    "trail_final_pct": 0.5,           # the trail's width at +trail_t3_pct
+    "trail_t1_pct": 4.7,              # the curve's checkpoints (the old bot's T1/T2/T3)
+    "trail_t2_pct": 6.6,
+    "trail_t3_pct": 8.4,
     # Entries start this many minutes after the open and stop being attempted after
     # entry_window_minutes (a restart late in the morning must not buy at a stale price).
     "entry_delay_minutes": 1,
@@ -67,6 +81,12 @@ class StressDipConfig:
     stop_min_pct: float
     stop_max_pct: float
     max_hold_sessions: int
+    exit_mode: str
+    trail_max_hold_sessions: int
+    trail_final_pct: float
+    trail_t1_pct: float
+    trail_t2_pct: float
+    trail_t3_pct: float
     entry_delay_minutes: int
     entry_window_minutes: int
     exit_minutes_before_close: int
@@ -91,11 +111,29 @@ def stress_dip_cfg(raw: dict | None) -> StressDipConfig:
         stop_min_pct=float(merged["stop_min_pct"]),
         stop_max_pct=float(merged["stop_max_pct"]),
         max_hold_sessions=int(merged["max_hold_sessions"]),
+        exit_mode=_exit_mode(merged["exit_mode"]),
+        trail_max_hold_sessions=int(merged["trail_max_hold_sessions"]),
+        trail_final_pct=float(merged["trail_final_pct"]),
+        trail_t1_pct=float(merged["trail_t1_pct"]),
+        trail_t2_pct=float(merged["trail_t2_pct"]),
+        trail_t3_pct=float(merged["trail_t3_pct"]),
         entry_delay_minutes=int(merged["entry_delay_minutes"]),
         entry_window_minutes=int(merged["entry_window_minutes"]),
         exit_minutes_before_close=int(merged["exit_minutes_before_close"]),
         drawdown_halt_pct=float(merged["drawdown_halt_pct"]),
     )
+
+
+def _exit_mode(v) -> str:
+    m = str(v).strip().lower()
+    if m not in ("trail", "average"):
+        raise ValueError(f"exit_mode must be 'trail' or 'average', not {v!r}")
+    return m
+
+
+def max_hold(cfg: "StressDipConfig") -> int:
+    """Sessions until the time exit, for the configured exit mode."""
+    return cfg.trail_max_hold_sessions if cfg.exit_mode == "trail" else cfg.max_hold_sessions
 
 
 def _as_bool(v) -> bool:
@@ -287,13 +325,46 @@ def sma5_with_live(last4_closes: list[float], live_price: float) -> float | None
 def exit_reason(live_price: float, last4_closes: list[float], sessions_held: int,
                 cfg: StressDipConfig) -> str | None:
     """Why to sell now (near the close), or None to keep holding. sessions_held counts the
-    entry session as 1, so the 10th session held is the time exit (same as the backtest)."""
-    avg = sma5_with_live(last4_closes, live_price)
-    if avg is not None and live_price > avg:
-        return f"closed above its 5-day average (${live_price:.2f} > ${avg:.2f})"
-    if sessions_held >= cfg.max_hold_sessions:
-        return f"{cfg.max_hold_sessions}-session time limit reached"
+    entry session as 1, so the 10th (20th in trail mode) session held is the time exit (same as
+    the backtest). In trail mode the trailing stop does the rest, at the broker."""
+    if cfg.exit_mode == "average":
+        avg = sma5_with_live(last4_closes, live_price)
+        if avg is not None and live_price > avg:
+            return f"closed above its 5-day average (${live_price:.2f} > ${avg:.2f})"
+    limit = max_hold(cfg)
+    if sessions_held >= limit:
+        return f"{limit}-session time limit reached"
     return None
+
+
+def stepped_trail_width(entry: float, high: float, start_pct: float, cfg: StressDipConfig) -> float:
+    """The trail's width in % at `high`: start_pct at the buy, then a straight line through
+    the T1/T2 checkpoints (each one step narrower) to trail_final_pct at T3 and above.
+    Same curve as web/app.py _graduated_trail_pct with follow_tp_targets on."""
+    final = cfg.trail_final_pct
+    step = (start_pct - final) / 3.0
+    ap = [entry, entry * (1 + cfg.trail_t1_pct / 100), entry * (1 + cfg.trail_t2_pct / 100),
+          entry * (1 + cfg.trail_t3_pct / 100)]
+    av = [start_pct, start_pct - step, start_pct - 2 * step, final]
+    if high <= ap[0]:
+        return av[0]
+    if high >= ap[3]:
+        return av[3]
+    for k in range(3):
+        if high <= ap[k + 1]:
+            return av[k] - (high - ap[k]) / (ap[k + 1] - ap[k]) * (av[k] - av[k + 1])
+    return final
+
+
+def trail_price(entry: float, highest_high: float, start_pct: float, cfg: StressDipConfig) -> float:
+    """The trailing stop for the next session from the highest completed daily high since the
+    buy (the buy day included), or 0.0 while the price hasn't traded over the buy (not armed)."""
+    if not (_finite(entry) and _finite(highest_high) and _finite(start_pct)) or entry <= 0:
+        return 0.0
+    if highest_high <= entry:
+        return 0.0
+    w = stepped_trail_width(entry, highest_high, start_pct, cfg)
+    return round(highest_high * (1 - w / 100.0), 2)
 
 
 def sessions_held(entry_date: str, completed_dates: list[str], today: str) -> int:

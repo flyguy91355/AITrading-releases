@@ -1591,6 +1591,13 @@ def _sd_recent_closes(tickers: list[str]) -> dict[str, list[tuple[str, float]]]:
             for t, rows in _sd_download_rows(list(tickers), "1mo")}
 
 
+def _sd_recent_highs(tickers: list[str]) -> dict[str, list[tuple[str, float]]]:
+    """Thread body for the nightly trail raise: about two months of (date, high) per held ticker
+    (the trail's longest hold is 20 sessions)."""
+    return {t: [(r["date"], r["high"]) for r in rows]
+            for t, rows in _sd_download_rows(list(tickers), "2mo")}
+
+
 def _sd_ticker_facts(ticker: str) -> dict:
     """Sector, company name and next earnings date (YYYY-MM-DD, or "") from Yahoo, for the
     sector-concentration gate and the Claude veto prompt. Never raises."""
@@ -2171,6 +2178,7 @@ class DashboardState:
         self._stress_dip_refresh_in_progress: bool = False
         self._stress_dip_refresh_retry_at: datetime | None = None
         self._stress_dip_exit_closes: dict = {}
+        self._stress_dip_trail_retry_at: datetime | None = None
         self._stress_dip_logged: set[str] = set()
         self._market_live_readings: MarketReadings | None = None
         # The dashboard market graph's source (2026-11-21): the close check's own finished
@@ -7079,7 +7087,8 @@ class DashboardState:
                                     or (self.research_reports.get(c["ticker"]) or {}).get("company_name", ""))
                       for c in (st.get("candidates") or [])[:25]},
             "stop_atr_mult": cfg.stop_atr_mult, "stop_min_pct": cfg.stop_min_pct,
-            "stop_max_pct": cfg.stop_max_pct, "max_hold_sessions": cfg.max_hold_sessions,
+            "stop_max_pct": cfg.stop_max_pct, "max_hold_sessions": sdip.max_hold(cfg),
+            "exit_mode": cfg.exit_mode, "trail_final_pct": cfg.trail_final_pct, "trail_t3_pct": cfg.trail_t3_pct,
             "on_deck_pipeline_enabled": self._on_deck_pipeline_enabled(),
         }
 
@@ -7129,7 +7138,13 @@ class DashboardState:
                             f"{self._stress_dip_state.get('signal_date') or 'none'}) -- waiting",
                             "warning", once_key=f"nosig-{today}")
 
-                # 3) Exits near the real close.
+                # 3) The trailing stop (exit_mode "trail"): raise it once each session's daily
+                # high is final; sell at market if the price is already under it (a gap down
+                # leaves the broker unable to hold a sell stop above the price).
+                await self._stress_dip_update_trails(sessions, today, hhmm)
+                await self._stress_dip_trail_breach(sessions, today, hhmm)
+
+                # 4) Exits near the real close.
                 if sdip.exit_window_open(sessions, today, hhmm, cfg):
                     await self._stress_dip_exits(today, sessions)
             except Exception as e:
@@ -7345,8 +7360,12 @@ class DashboardState:
             above200 = 100.0 * (snap.close / snap.sma200 - 1) if snap.sma200 else 0.0
             why = (f"Stress dip-buyer -- RSI(2) {snap.rsi2:.1f}, "
                    f"{(snap.change_3d_pct or 0):+.1f}% in 3 days, {above200:+.1f}% above 200d, "
-                   f"VIX {float(vix):.2f}; stop {stop_pct:.1f}% (3xATR); sells on the first close above "
-                   f"its 5-day average or after {cfg.max_hold_sessions} sessions. Claude check: {reason}")
+                   f"VIX {float(vix):.2f}; stop {stop_pct:.1f}% (3xATR); "
+                   + (f"a stepped trailing stop from {stop_pct:.1f}% down to {cfg.trail_final_pct}% at "
+                      f"+{cfg.trail_t3_pct}% does the selling, or the close of session {cfg.trail_max_hold_sessions}"
+                      if cfg.exit_mode == "trail" else
+                      f"sells on the first close above its 5-day average or after {cfg.max_hold_sessions} sessions")
+                   + f". Claude check: {reason}")
             # Only OrderManager._buy_snapshot_fields reads research_report on a buy -- this
             # fills "Why AI Bought This" with the real rule numbers and Claude's verdict.
             rationale = SimpleNamespace(
@@ -7398,6 +7417,89 @@ class DashboardState:
             async with self._promotion_cash_lock:
                 self._reserved_cash -= reserved
 
+    async def _stress_dip_update_trails(self, sessions: list[dict], today: str, hhmm: str) -> None:
+        """exit_mode "trail" (owner 2026-11-26: "Let winners run"): once the newest session's
+        daily bars are final, raise each dip position's trailing stop from the highest high
+        since its buy (the buy day included) -- the stepped curve from its own stop % down to
+        0.5% at +8.4% (sdip.trail_price). Ratchets up only. It lives in pos.trailing_stop, and
+        the existing exit-order machinery keeps the broker's resting stop at
+        max(stop_loss, trailing_stop) (sync_exit_orders / the 10s protection-gap check), so
+        the broker itself sells the moment the price touches it. Same timing as the backtest:
+        a day's high moves the trail from the next session on."""
+        cfg = self._stress_dip_cfg()
+        if cfg.exit_mode != "trail":
+            return
+        want = sdip.last_completed_session(sessions, today, hhmm)
+        if not want:
+            return
+        todo = [t for t, b in self._stress_dip_book.items()
+                if t in self.portfolio.positions and b.get("trail_session") != want
+                and str(b.get("entry_date", "9999")) <= want]
+        if not todo:
+            return
+        if self._stress_dip_trail_retry_at and datetime.now() < self._stress_dip_trail_retry_at:
+            return
+        data = await asyncio.to_thread(_sd_recent_highs, todo)
+        raised, missing = False, False
+        for t in todo:
+            pos = self.portfolio.positions.get(t)
+            b = self._stress_dip_book.get(t)
+            if pos is None or b is None:
+                continue
+            rows = [(d, h) for d, h in data.get(t, []) if str(b["entry_date"]) <= d <= want]
+            if not rows or rows[-1][0] != want:
+                missing = True          # Yahoo doesn't have that session yet: try again later
+                continue
+            hi = max(h for _, h in rows)
+            start = b.get("stop_pct") or sdip.stop_distance_pct(b.get("atr") or 0, b.get("ref_close") or 0, cfg)
+            new = sdip.trail_price(pos.entry_price, hi, float(start), cfg)
+            b["trail_session"], b["trail_high"] = want, hi
+            if new > 0 and new > (pos.trailing_stop or 0) + 0.005:
+                old = pos.trailing_stop
+                pos.trailing_stop = new
+                b["trail"] = new
+                await self.portfolio._save_position(pos)
+                raised = True
+                gain = 100.0 * (hi / pos.entry_price - 1)
+                await self._sd_log(
+                    f"Trail raised to ${new:.2f}{'' if not old else f' (was ${old:.2f})'} -- high since the "
+                    f"buy ${hi:.2f} ({gain:+.1f}%)", "success", ticker=t)
+        self._stress_dip_trail_retry_at = datetime.now() + timedelta(minutes=10) if missing else None
+        await asyncio.to_thread(_save_stress_dip_book, dict(self._stress_dip_book))
+        if raised and self.order_manager and self._exit_order_maintenance_window_open():
+            asyncio.create_task(self.order_manager.sync_exit_orders())
+
+    async def _stress_dip_trail_breach(self, sessions: list[dict], today: str, hhmm: str) -> None:
+        """Market-hours safety net for the trail, mirroring the stop-loss fallback in
+        position_update_loop (which reads only pos.stop_loss): if a dip position's price is
+        already at or under its trailing stop -- e.g. it opened under it, where the broker
+        can't hold a sell stop -- sell at market. Deferred one tick inside the post-reconnect
+        confirm window, and on the shared auto-close cooldown."""
+        if not self._stress_dip_book or not self.broker_connected or self.stopped:
+            return
+        if not self.config["trading"].get("auto_execute", False) or not self._is_market_open():
+            return
+        # The real session from Alpaca's calendar (half-days close at 13:00; _is_market_open
+        # assumes 16:00), so a stale after-close price can never send a sell.
+        sess = sdip.session_for(sessions, today)
+        if not sess or not (sess["open"] <= hhmm < sess["close"]):
+            return
+        for t in list(self._stress_dip_book):
+            pos = self.portfolio.positions.get(t)
+            if pos is None or not pos.trailing_stop:
+                continue
+            if not is_usable_price(pos.current_price) or pos.current_price > pos.trailing_stop:
+                continue
+            until = self._auto_close_cooldown.get(t)
+            if until is not None and datetime.now() < until:
+                continue
+            if self._within_reconnect_confirm_window():
+                continue
+            self._auto_close_cooldown[t] = datetime.now() + timedelta(minutes=5)
+            await self._sd_log(f"Selling -- price ${pos.current_price:.2f} is under the trail "
+                               f"${pos.trailing_stop:.2f}", "sell", ticker=t)
+            await self._auto_close_position(t, pos, f"Dip-buyer trail hit (${pos.trailing_stop:.2f})")
+
     async def _stress_dip_exits(self, today: str, sessions: list[dict]) -> None:
         cfg = self._stress_dip_cfg()
         held = [t for t in self._stress_dip_book if t in self.portfolio.positions]
@@ -7406,7 +7508,8 @@ class DashboardState:
         if not self.config["trading"].get("auto_execute", False) or not self._is_market_open():
             return
         cache = self._stress_dip_exit_closes
-        if cache.get("date") != today or any(t not in cache.get("data", {}) for t in held):
+        if cfg.exit_mode == "average" and (cache.get("date") != today
+                                           or any(t not in cache.get("data", {}) for t in held)):
             data = await asyncio.to_thread(_sd_recent_closes, held)
             self._stress_dip_exit_closes = cache = {"date": today, "data": data}
         for t in held:
@@ -7416,7 +7519,7 @@ class DashboardState:
             until = self._auto_close_cooldown.get(t)
             if until is not None and datetime.now() < until:
                 continue
-            rows = [(d, c) for d, c in cache["data"].get(t, []) if d < today]
+            rows = [(d, c) for d, c in (cache.get("data") or {}).get(t, []) if d < today]
             last4 = [c for _, c in rows][-4:]
             # Counted from the market calendar, so a failed price download can't stall
             # the time exit.
@@ -7424,14 +7527,17 @@ class DashboardState:
             live = pos.current_price
             if not is_usable_price(live) or live <= 0:
                 continue
-            if len(last4) < 4 and n < cfg.max_hold_sessions:
+            if cfg.exit_mode == "average" and len(last4) < 4 and n < sdip.max_hold(cfg):
                 await self._sd_log("Can't judge the 5-day average (missing closes) -- holding",
                                    "warning", ticker=t, once_key=f"noclose-{t}-{today}")
                 continue
             reason = sdip.exit_reason(live, last4, n, cfg)
             if reason is None:
-                await self._sd_log(f"Holding (session {n}/{cfg.max_hold_sessions}, ${live:.2f} not above "
-                                   f"its 5-day average)", ticker=t, once_key=f"hold-{t}-{today}")
+                why = (f"trail ${pos.trailing_stop:.2f}" if cfg.exit_mode == "trail" and pos.trailing_stop
+                       else "trail not on yet (price hasn't traded over the buy)" if cfg.exit_mode == "trail"
+                       else f"${live:.2f} not above its 5-day average")
+                await self._sd_log(f"Holding (session {n}/{sdip.max_hold(cfg)}, {why})",
+                                   ticker=t, once_key=f"hold-{t}-{today}")
                 continue
             self._auto_close_cooldown[t] = datetime.now() + timedelta(minutes=5)
             await self._sd_log(f"Selling -- {reason}", "sell", ticker=t)
