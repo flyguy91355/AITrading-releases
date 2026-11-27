@@ -133,6 +133,7 @@ from src.decision.market_pause import (
 )
 import src.strategy.stress_dip as sdip
 import src.strategy.short_mirror as smir
+import src.execution.broker_match as bmatch
 from src.execution.order_manager import OrderManager, _is_regular_trading_hours
 from src.execution.broker import OrderStatus
 from src.execution.broker import Order as _BrokerOrder, OrderSide as _OrderSide, OrderType as _OrderType
@@ -2232,6 +2233,7 @@ class DashboardState:
         self._short_covering: set = set()
         self._short_unknown_seen: dict = {}
         self._short_logged: set = set()
+        self._broker_check_logged_hour: str | None = None
         self._stress_dip_logged: set[str] = set()
         self._market_live_readings: MarketReadings | None = None
         # The dashboard market graph's source (2026-11-21): the close check's own finished
@@ -7063,6 +7065,86 @@ class DashboardState:
     # "Build it in AITrading", "make this happen for todays open". Shorts NEVER enter
     # self.portfolio.positions: OrderManager drops negative-share positions from both of its
     # syncs and sets portfolio.short_liability, so no long-side code can touch them.
+
+    # ── Bot vs Alpaca match check (2026-11-27) ─────────────────────────────────────
+    # Owner: "it should check after every trade that the bot and alpaca matches". ~20s after
+    # every fill on the trade_updates stream (OrderManager.on_fill), and every 15 minutes in
+    # market hours as a backstop, compare every long, short and stop with Alpaca
+    # (src/execution/broker_match.py). ✓ / ✗ line in the AI log (phase CHECK); a mismatch is
+    # re-checked once 45s later and only then alerts. Read-only: never places or changes an order.
+
+    def _on_broker_fill(self, symbol) -> None:
+        if symbol:
+            asyncio.create_task(self._broker_match_check(str(symbol), delay_s=20.0))
+
+    def _broker_in_flight(self) -> set:
+        om = self.order_manager
+        return (set(self._short_opening) | set(self._short_covering) | set(self._pending_buy_reservations)
+                | {t for t, b in self._stress_dip_book.items() if b.get("pending")}
+                | set(getattr(om, "_pending_stops", {}) or {}))
+
+    async def _broker_match_check(self, symbol: str | None = None, delay_s: float = 0.0,
+                                  recheck: bool = True, source: str = "fill") -> list[str] | None:
+        if delay_s:
+            await asyncio.sleep(delay_s)
+        if not self.broker_connected or not self.order_manager:
+            return None
+        # A trade still settling on our side: give it up to a minute more before judging.
+        for _ in range(3):
+            if not symbol or symbol not in self._broker_in_flight():
+                break
+            await asyncio.sleep(20)
+        broker = self.order_manager.broker
+        try:
+            positions = await broker.get_positions()
+            orders = await broker.get_open_orders()
+        except Exception as e:
+            logger.warning("Broker match check: Alpaca read failed: %s", e)
+            return None
+        longs = {t: float(p.shares) for t, p in self.portfolio.positions.items()}
+        problems = bmatch.compare_with_broker(
+            longs, dict(self._short_book), positions, orders, self._broker_in_flight(),
+            check_long_stops=self._is_market_open() and self._exit_order_maintenance_window_open())
+        if problems and recheck:
+            await asyncio.sleep(45)
+            return await self._broker_match_check(symbol, 0.0, recheck=False, source=source)
+        n = len(positions)
+        rec = {"at": datetime.now().isoformat(timespec="seconds"), "source": source, "symbol": symbol,
+               "positions": n, "problems": problems}
+        asyncio.create_task(asyncio.to_thread(_append_short_mirror_jsonl, Path("data/broker_checks.jsonl"), rec))
+        if problems:
+            text = (f"✗ Bot vs Alpaca MISMATCH (after {'the ' + symbol + ' fill' if symbol else source}, "
+                    f"still there 45s later): " + "; ".join(problems))
+            entry = self.add_ai_log(symbol or "SYSTEM", "CHECK", text, "error")
+            await self.broadcast({"type": "ai_log", "entry": entry})
+            asyncio.create_task(_notify("Bot vs Alpaca mismatch", "; ".join(problems)[:900],
+                                        priority="high", tags="warning"))
+        elif symbol:
+            text = (f"✓ Checked with Alpaca after the fill: "
+                    f"{bmatch.describe(symbol, longs, self._short_book, positions, orders)}. "
+                    f"All {n} position(s) match.")
+            entry = self.add_ai_log(symbol, "CHECK", text, "success")
+            await self.broadcast({"type": "ai_log", "entry": entry})
+        else:
+            hour = self._now_et().strftime("%Y-%m-%d %H")
+            if n and self._broker_check_logged_hour != hour:   # the periodic ✓ at most hourly
+                self._broker_check_logged_hour = hour
+                entry = self.add_ai_log("SYSTEM", "CHECK", f"✓ Periodic check: all {n} position(s) and their "
+                                        f"stops match Alpaca.", "success")
+                await self.broadcast({"type": "ai_log", "entry": entry})
+        return problems
+
+    async def broker_match_loop(self) -> None:
+        """The backstop: every 15 minutes in market hours (the fill stream can drop)."""
+        logger.info("Broker match loop started")
+        while True:
+            await asyncio.sleep(900)
+            try:
+                if self.stopped or not self._is_market_open():
+                    continue
+                await self._broker_match_check(None, source="15-minute check")
+            except Exception as e:
+                logger.warning("Broker match loop tick failed: %s", e)
 
     def _short_cfg(self) -> "smir.ShortMirrorConfig":
         return smir.short_mirror_cfg(self.config.get("short_mirror"))
@@ -14465,6 +14547,9 @@ async def startup():
     asyncio.create_task(state.market_pause_loop())
     asyncio.create_task(state.stress_dip_loop())
     asyncio.create_task(state.short_mirror_loop())
+    if state.order_manager:
+        state.order_manager.on_fill = state._on_broker_fill
+    asyncio.create_task(state.broker_match_loop())
     logger.info("Dashboard started — auto-scan running, position monitor active")
 
     # First-run bootstrap removed 2026-07-17 — it triggered on watchlist_manager.size() == 0,

@@ -222,6 +222,9 @@ class OrderManager:
         # successfully sets it up. See docs/superpowers/specs/
         # 2026-07-24-alpaca-trade-updates-stream-design.md.
         self._trade_updates_stream = None
+        # Bot vs Alpaca match check (2026-11-27): web/app.py sets this to a plain callable(symbol)
+        # that schedules a read-only check after every fill. Called from _handle_trade_update.
+        self.on_fill = None
         # Closes detected via the stream, queued for web/app.py's position_update_loop to
         # drain and report through the SAME _report_alpaca_detected_close path
         # update_positions()'s poll-detected closes already use -- keeps the dashboard
@@ -420,6 +423,15 @@ class OrderManager:
             # handle both shapes rather than assuming .id is always present.
             _order = tu.order
             order_id = _order.get("id") if isinstance(_order, dict) else _order.id
+            # Every terminal fill -- buys, sells, shorts, covers, stops firing, manual trades --
+            # schedules the read-only bot-vs-Alpaca match check (it waits for this handler's own
+            # bookkeeping to settle). Never allowed to affect the fill handling below.
+            if self.on_fill is not None:
+                try:
+                    self.on_fill(_order.get("symbol") if isinstance(_order, dict)
+                                 else getattr(_order, "symbol", None))
+                except Exception as _e:
+                    logger.warning("on_fill hook failed: %s", _e)
 
             # Pending notional buy resolving for real (2026-07-24, SCHW incident fix) --
             # authoritative position_qty replaces the risky "whatever the next 10s poll
