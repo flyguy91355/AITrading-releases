@@ -6987,7 +6987,8 @@ class DashboardState:
     # 20 slots of ~1/20 since 2026-11-27, owner: "make it 20"),
     # and the strategy's OWN 20% drawdown halt instead of the 1.9% daily-loss limit and the
     # risk-tier drawdown halt (those would block it on exactly the stress days it is for).
-    # The market buy pause never applies to it (owner: "turn market pause off"). Hard
+    # The market buy pause didn't apply to it at first (owner: "turn market pause off"); since
+    # 2026-11-27 it does -- the pause is the long/short mode switch (no dip buys while it is on). Hard
     # safety gates kept: run state, auto_execute, market open, wash-sale, earnings within 2
     # days, sector concentration, real cash above the reserve floor, and a fail-closed
     # Claude veto on every buy.
@@ -7231,6 +7232,23 @@ class DashboardState:
             vix_txt = "n/a" if vix is None else f"{vix:.2f}"
             await self._sd_log(f"Dip-buyer: nothing to buy today (VIX {vix_txt}, signals from "
                                f"{self._stress_dip_state.get('signal_date')})")
+            return
+        # Long/short mode (owner 2026-11-27: "turn the pause back on and use it to decide if
+        # were in a long or short mode"): while the market buy pause is on, the dip-buyer
+        # makes no new buys -- held ones keep their stops and trail. Backtest (exp15): worst
+        # drop -47% -> -19% (2005-15) and -26% -> -9% (2016-26); 2.1 -> 2.3%/yr and
+        # 9.1 -> 7.5%/yr. _market_pause_active() is False whenever the pause is switched off.
+        if self._market_pause_active():
+            why = self.market_pause.reason or "the market pause is on"
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            statuses = self._stress_dip_state.setdefault("status", {})
+            for c in cands:
+                if c["ticker"] not in self.portfolio.positions:
+                    statuses[c["ticker"]] = {"status": "skipped", "at": now_iso,
+                                             "reason": f"Short mode -- no dip buys while the market pause is on ({why})"}
+            await asyncio.to_thread(_save_stress_dip_state, dict(self._stress_dip_state))
+            await self._sd_log(f"Dip-buyer: short mode -- market pause is on ({why}); no buys today, "
+                               f"{len(cands)} candidate(s) skipped", "warning")
             return
         if sdip.drawdown_halted(self.portfolio.total_value, self.portfolio.peak_value, cfg.drawdown_halt_pct):
             await self._sd_log(
