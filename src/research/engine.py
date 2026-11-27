@@ -1086,6 +1086,23 @@ Respond with ONLY a JSON object:
             logger.warning("%s: dip-entry recommendation failed: %s", ticker, e)
             return None
 
+    async def ask_stress_dip_veto(self, ticker: str, prompt: str) -> str | None:
+        """The Stress Dip-Buyer's pre-buy risk check (2026-11-26) -- the prompt is built by
+        src/strategy/stress_dip.build_veto_prompt and the answer parsed by
+        parse_veto_response. Returns the raw response text, or None on any failure; the
+        caller treats None (and anything unparseable) as "do not buy" -- a failed
+        buy-trigger check never buys (AI Data Integrity). Own dial:
+        research.model_stress_dip_veto."""
+        model = self.config.get("research", {}).get("model_stress_dip_veto", "claude-haiku-5-5")
+        try:
+            return await self._call_claude_with_retry(
+                model=model, max_tokens=200, messages=[{"role": "user", "content": prompt}],
+                max_retries=2,
+            )
+        except Exception as e:
+            logger.warning("%s: stress dip veto check failed: %s", ticker, e)
+            return None
+
     async def explain_buy_decision(
         self, ticker: str, company_name: str, entry_price: float, stop_loss: float,
         take_profit_targets: list[float], fair_value_estimate: float | None,

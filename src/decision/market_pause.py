@@ -26,9 +26,11 @@ from datetime import datetime, time, timedelta
 from src.analytics.composition_benchmark import is_usable_price
 
 # Code defaults for every config key (risk_management.*). Apply Update never touches config/settings.yaml,
-# so the live box runs on these until the owner saves Settings.
+# so the live box runs on these until the owner saves Settings. OFF by default since 2026-11-26 (owner:
+# "turn market pause off so it can trade tomorrow"): the Stress Dip-Buyer is built to buy exactly when
+# SPY is weak and VIX is high, and it never reads this pause anyway. The loop still runs for the graph.
 MARKET_PAUSE_DEFAULTS = {
-    "market_pause_enabled": True,
+    "market_pause_enabled": False,
     "market_pause_live_watch": True,
     "market_pause_vix_level": 20.0,
     "market_pause_spy_sma_days": 50,

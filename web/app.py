@@ -131,6 +131,7 @@ from src.decision.market_pause import (
     status_text,
     to_dict as _market_pause_to_dict,
 )
+import src.strategy.stress_dip as sdip
 from src.execution.order_manager import OrderManager, _is_regular_trading_hours
 from src.execution.broker import OrderStatus
 from src.reporting.trade_logger import TradeLogger
@@ -1474,6 +1475,150 @@ def _load_market_pause_state() -> MarketPauseState:
     return NEVER_EVALUATED
 
 
+# ── Stress Dip-Buyer persistence + data helpers (2026-11-26) ──────────────────────
+# The buy strategy since 2026-11-26 -- rules in src/strategy/stress_dip.py, research in
+# docs/research/2026-11-26-swing-strategy-review/. state = the latest evening's ranked
+# candidates; book = which held positions belong to this strategy (their own exits replace
+# the old take-profit tranches / graduated trailing stop / conviction-drop sell); the veto
+# log records every Claude pre-buy check so its value can be measured later.
+_STRESS_DIP_STATE_PATH = Path("data/stress_dip_state.json")
+_STRESS_DIP_BOOK_PATH = Path("data/stress_dip_book.json")
+_STRESS_DIP_VETO_LOG_PATH = Path("data/stress_dip_veto_log.jsonl")
+
+
+def _save_stress_dip_state(d: dict) -> None:
+    _atomic_write_json(_STRESS_DIP_STATE_PATH, d, "stress dip state", default=str)
+
+
+def _load_stress_dip_state() -> dict:
+    try:
+        if _STRESS_DIP_STATE_PATH.exists():
+            d = json.loads(_STRESS_DIP_STATE_PATH.read_text(encoding="utf-8"))
+            return d if isinstance(d, dict) else {}
+    except Exception as e:
+        logger.warning("Failed to load stress dip state: %s", e)
+    return {}
+
+
+def _save_stress_dip_book(d: dict) -> None:
+    _atomic_write_json(_STRESS_DIP_BOOK_PATH, d, "stress dip book", default=str)
+
+
+def _load_stress_dip_book() -> dict:
+    try:
+        if _STRESS_DIP_BOOK_PATH.exists():
+            d = json.loads(_STRESS_DIP_BOOK_PATH.read_text(encoding="utf-8"))
+            return d if isinstance(d, dict) else {}
+    except Exception as e:
+        logger.warning("Failed to load stress dip book: %s", e)
+    return {}
+
+
+def _append_stress_dip_veto_log(rec: dict) -> None:
+    """Append-only JSONL (one small line per check), so no atomic-replace needed."""
+    try:
+        _STRESS_DIP_VETO_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_STRESS_DIP_VETO_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except Exception as e:
+        logger.warning("Failed to append stress dip veto log: %s", e)
+
+
+def _sd_download_rows(tickers: list[str], period: str, chunk: int = 100):
+    """Yields (ticker, rows) from Yahoo daily bars (split/dividend adjusted, the same basis
+    as the research), rows oldest first as {date, open, high, low, close, volume}.
+    Synchronous -- run it in a thread. A failed chunk is retried twice, then skipped."""
+    import pandas as pd
+    import yfinance as yf
+    for i in range(0, len(tickers), chunk):
+        part = tickers[i:i + chunk]
+        ysyms = [t.replace(".", "-") for t in part]
+        df = None
+        for attempt in range(3):
+            try:
+                df = yf.download(ysyms, period=period, interval="1d", auto_adjust=True,
+                                 group_by="ticker", threads=True, progress=False)
+                break
+            except Exception as e:
+                logger.warning("Dip-buyer daily-bar download failed (chunk %d, try %d): %s",
+                               i, attempt + 1, e)
+                time.sleep(5 * (attempt + 1))
+        if df is None or df.empty:
+            continue
+        multi = isinstance(df.columns, pd.MultiIndex)
+        level0 = set(df.columns.get_level_values(0)) if multi else set()
+        for t, y in zip(part, ysyms):
+            try:
+                if multi:
+                    if y not in level0:
+                        continue
+                    sub = df[y]
+                else:
+                    sub = df
+                sub = sub.dropna(subset=["Close"])
+                rows = [{"date": idx.strftime("%Y-%m-%d"), "open": float(o), "high": float(h),
+                         "low": float(lo), "close": float(c), "volume": float(v)}
+                        for idx, o, h, lo, c, v in zip(sub.index, sub["Open"], sub["High"],
+                                                       sub["Low"], sub["Close"], sub["Volume"])]
+            except Exception:
+                continue
+            if rows:
+                yield t, rows
+
+
+def _sd_compute_signals(tickers: list[str], session_date: str) -> tuple[dict, float | None]:
+    """Thread body for the evening refresh: snapshots as of `session_date` for every ticker
+    whose newest bar IS that session (stale/missing data never qualifies), plus that
+    session's VIX close (None if Yahoo doesn't have it yet)."""
+    snaps: dict = {}
+    vix_close = None
+    for t, rows in _sd_download_rows(list(tickers) + ["^VIX"], "14mo"):
+        rows = [r for r in rows if r["date"] <= session_date]
+        if not rows or rows[-1]["date"] != session_date:
+            continue
+        if t == "^VIX":
+            vix_close = rows[-1]["close"]
+            continue
+        snap = sdip.snapshot_from_bars(t, rows)
+        if snap is not None:
+            snaps[t] = snap
+    return snaps, vix_close
+
+
+def _sd_recent_closes(tickers: list[str]) -> dict[str, list[tuple[str, float]]]:
+    """Thread body for the exit check: about a month of (date, close) per held ticker."""
+    return {t: [(r["date"], r["close"]) for r in rows]
+            for t, rows in _sd_download_rows(list(tickers), "1mo")}
+
+
+def _sd_ticker_facts(ticker: str) -> dict:
+    """Sector, company name and next earnings date (YYYY-MM-DD, or "") from Yahoo, for the
+    sector-concentration gate and the Claude veto prompt. Never raises."""
+    out = {"sector": "", "company": ticker, "earnings_date": ""}
+    try:
+        import yfinance as yf
+        tk = yf.Ticker(ticker.replace(".", "-"))
+        try:
+            info = tk.info or {}
+            out["sector"] = info.get("sector") or ""
+            out["company"] = info.get("longName") or info.get("shortName") or ticker
+        except Exception:
+            pass
+        try:
+            cal = tk.calendar
+            dates = cal.get("Earnings Date", []) if isinstance(cal, dict) else []
+            today = date.today()
+            future = sorted(d for d in (x.date() if hasattr(x, "date") else x for x in dates)
+                            if isinstance(d, date) and d >= today)
+            if future:
+                out["earnings_date"] = future[0].isoformat()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return out
+
+
 def _track2_decline_cooling(declined: dict | None, today: date, cooldown_days: int) -> bool:
     """True while a Track 2 approaching-cross candidate whose fresh analysis rejected it
     is still inside its retry cooldown (2026-10-30). _run_sma_trend_scan re-sent the same
@@ -2018,6 +2163,15 @@ class DashboardState:
         # reading, from the same Yahoo fetches. In-memory only -- the loop's first-tick close
         # check refills the close reading within a minute of a restart.
         self._market_close_readings: MarketReadings | None = None
+        # Stress Dip-Buyer (2026-11-26) -- src/strategy/stress_dip.py + stress_dip_loop. State and
+        # book are persisted and restored in startup(); the calendar is cached per ET day.
+        self._stress_dip_state: dict = {}
+        self._stress_dip_book: dict[str, dict] = {}
+        self._stress_dip_calendar: dict = {}
+        self._stress_dip_refresh_in_progress: bool = False
+        self._stress_dip_refresh_retry_at: datetime | None = None
+        self._stress_dip_exit_closes: dict = {}
+        self._stress_dip_logged: set[str] = set()
         self._market_live_readings: MarketReadings | None = None
         # The dashboard market graph's source (2026-11-21): the close check's own finished
         # (date, close) lists for SPY and ^VIX, served by GET /api/market-chart -- no new fetch.
@@ -3277,7 +3431,11 @@ class DashboardState:
                         await self.broadcast({"type": "ai_log", "entry": entry})
 
                     # ── Trailing stop ──
-                    if self.config["risk_management"].get("trailing_stop_enabled", True):
+                    # Stress dip-buyer positions (2026-11-26) have their own exits (close
+                    # above the 5-day average / 10 sessions) plus the hard stop above --
+                    # the graduated trail would cut them on the first bounce.
+                    if (self.config["risk_management"].get("trailing_stop_enabled", True)
+                            and ticker not in self._stress_dip_book):
                         # Dollar profit-target latch (2026-07-24) -- checked before the
                         # graduated curve below, arms regardless of market hours (it's not
                         # a trade action, just a permanent tightening of the trail used
@@ -3488,6 +3646,7 @@ class DashboardState:
                     if (self.config["trading"].get("auto_execute", False)
                             and market_open and not _on_cooldown
                             and ticker in self.portfolio.positions
+                            and ticker not in self._stress_dip_book
                             and not self._is_position_profitable_enough_to_skip(pos)):
                         report = self.research_engine.reports.get(ticker)
                         # AI Data Integrity (GitHub #97): analyze_stock() writes its report
@@ -3544,6 +3703,10 @@ class DashboardState:
         # each call (not cached), so re-enabling via the Settings page takes effect
         # immediately with no restart needed.
         if not self.config["research"].get("position_monitor_enabled", False):
+            return
+        # Stress dip-buyer positions (2026-11-26) are judged only by their own mechanical
+        # exits -- an AI re-analysis could tighten their stop or drive a conviction sell.
+        if ticker in self._stress_dip_book:
             return
         # 2026-08-30, GitHub #103 -- see _position_reanalysis_in_flight's own
         # docstring at __init__. This function's 3 callers (the periodic sweep,
@@ -4346,6 +4509,7 @@ class DashboardState:
                 # firing check below; the date is deliberately NOT stamped on a skip,
                 # so a later tick retries once the other scan finishes.
                 if (self._pre_open_batch_date != today_str
+                        and self._on_deck_pipeline_enabled()
                         and not self._is_holiday
                         and now_et.weekday() < 5
                         and now_et.time() >= self.pre_open_batch_time
@@ -4416,6 +4580,7 @@ class DashboardState:
             # reason is simply picked up on a later tick, since it isn't marked fired
             # until it actually starts.
             if (self.config.get("research", {}).get("midday_scan_enabled", True)
+                    and self._on_deck_pipeline_enabled()
                     and self._scan_conflict() is None):
                 _now_et_midday = self._now_et()
                 _today_str_midday = _now_et_midday.strftime("%Y-%m-%d")
@@ -4464,7 +4629,7 @@ class DashboardState:
             if scan_times_today:
                 closest = min(scan_times_today, key=lambda t:
                     abs((now_et.hour * 60 + now_et.minute) - (t.hour * 60 + t.minute)))
-                if closest == scan_times_today[-1]:
+                if closest == scan_times_today[-1] and self._on_deck_pipeline_enabled():
                     asyncio.create_task(self._run_midday_reanalysis())
 
             await self.broadcast({"type": "portfolio", "portfolio": self.get_portfolio_snapshot()})
@@ -5762,6 +5927,11 @@ class DashboardState:
 
                 if self.paused or self.stopped or not self._is_market_open():
                     continue
+                # The On Deck pipeline is off by default since 2026-11-26 (the Stress
+                # Dip-Buyer replaced it) -- no monitoring, backfill, AI dip pricing or
+                # promotions. The win-rate refresh and sell post-mortems above still run.
+                if not self._on_deck_pipeline_enabled():
+                    continue
 
                 # Free price-based On Deck re-eligibility check (2026-07-29) -- runs before
                 # backfill so a ticker that clears its breakout this same tick can
@@ -6801,6 +6971,441 @@ class DashboardState:
         max_position_pct = self.config["risk_management"].get("max_position_pct", 7.0) / 100
         assumed_position_size = self.portfolio.total_value * max_position_pct
         return self._cash_reserve_insufficient(assumed_position_size, self._available_cash())
+
+    # ── Stress Dip-Buyer (2026-11-26) ─────────────────────────────────────────────
+    # The buy strategy since 2026-11-26 (owner: "do all phases.. build this strategy, turn
+    # off all other strategies that dont need to be on"). Rules: src/strategy/stress_dip.py.
+    # Owner choices the same night: 10 slots of ~1/10 equity each (net of the cash reserve),
+    # and the strategy's OWN 20% drawdown halt instead of the 1.9% daily-loss limit and the
+    # risk-tier drawdown halt (those would block it on exactly the stress days it is for).
+    # The market buy pause never applies to it (owner: "turn market pause off"). Hard
+    # safety gates kept: run state, auto_execute, market open, wash-sale, earnings within 2
+    # days, sector concentration, real cash above the reserve floor, and a fail-closed
+    # Claude veto on every buy.
+
+    def _stress_dip_cfg(self) -> "sdip.StressDipConfig":
+        return sdip.stress_dip_cfg(self.config.get("stress_dip"))
+
+    def _on_deck_pipeline_enabled(self) -> bool:
+        """The old Claude-picked buy pipeline -- pre-open universe batch, mid-day universe
+        scans, the 12:30 On Deck re-analysis, On Deck monitoring/backfill/promotions and
+        Track 2. OFF unless research.on_deck_pipeline_enabled is explicitly true (2026-11-26:
+        its picks underperformed its own HOLD calls at every horizon -- see
+        docs/research/2026-11-26-swing-strategy-review/). Manual scans still work."""
+        v = self.config.get("research", {}).get("on_deck_pipeline_enabled", False)
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes", "on")
+        return v is True
+
+    async def _sd_log(self, msg: str, level: str = "info", ticker: str = "SYSTEM",
+                      once_key: str | None = None) -> None:
+        """AI-feed line under the DIP phase; once_key makes it one-shot per key."""
+        if once_key is not None:
+            if once_key in self._stress_dip_logged:
+                return
+            self._stress_dip_logged.add(once_key)
+            if len(self._stress_dip_logged) > 500:
+                self._stress_dip_logged.clear()
+        entry = self.add_ai_log(ticker, "DIP", msg, level)
+        await self.broadcast({"type": "ai_log", "entry": entry})
+
+    async def _stress_dip_sessions(self) -> list[dict]:
+        """Alpaca's market calendar, three weeks back to a week ahead, as
+        [{date, open, close}] strings (ET), cached per ET day. Half-days carry their real
+        close, so the exit window lands before a 13:00 close. [] when the broker can't
+        answer (the loop just tries again next tick)."""
+        key = self._now_et().date().isoformat()
+        cached = self._stress_dip_calendar
+        if cached.get("key") == key and cached.get("sessions"):
+            return cached["sessions"]
+        api = getattr(getattr(self.order_manager, "broker", None), "api", None)
+        if api is None:
+            return []
+        today = self._now_et().date()
+        cal = await asyncio.to_thread(api.get_calendar, (today - timedelta(days=21)).isoformat(),
+                                      (today + timedelta(days=7)).isoformat())
+        sessions = []
+        for c in cal or []:
+            raw = c if isinstance(c, dict) else (getattr(c, "_raw", None) or {})
+            d, o, cl = str(raw.get("date", ""))[:10], str(raw.get("open", ""))[:5], str(raw.get("close", ""))[:5]
+            if len(d) == 10 and len(o) == 5 and len(cl) == 5:
+                sessions.append({"date": d, "open": o, "close": cl})
+        if sessions:
+            self._stress_dip_calendar = {"key": key, "sessions": sessions}
+        return sessions
+
+    def _stress_dip_prune_book(self) -> bool:
+        """Settle pending entries once the position exists; drop entries whose position is
+        gone (stop fired, sold, or a buy that never filled within 30 minutes)."""
+        changed = False
+        now = datetime.now()
+        for t, b in list(self._stress_dip_book.items()):
+            if t in self.portfolio.positions:
+                if b.get("pending"):
+                    b["pending"] = False
+                    changed = True
+                continue
+            try:
+                age = (now - datetime.fromisoformat(str(b.get("at")))).total_seconds()
+            except Exception:
+                age = 1e9
+            if not b.get("pending") or age > 1800:
+                self._stress_dip_book.pop(t, None)
+                changed = True
+        return changed
+
+    def stress_dip_snapshot(self) -> dict:
+        cfg = self._stress_dip_cfg()
+        st = self._stress_dip_state
+        return {
+            "enabled": cfg.enabled, "slots": cfg.slots, "vix_min": cfg.vix_min,
+            "rsi2_max": cfg.rsi2_max, "signal_date": st.get("signal_date"),
+            "vix_close": st.get("vix_close"), "computed_at": st.get("computed_at"),
+            "with_data": st.get("with_data"), "universe": st.get("universe"),
+            "candidates": (st.get("candidates") or [])[:25],
+            "entries_done_date": st.get("entries_done_date"),
+            "last_error": st.get("last_error"),
+            "book": self._stress_dip_book,
+            "on_deck_pipeline_enabled": self._on_deck_pipeline_enabled(),
+        }
+
+    async def stress_dip_loop(self) -> None:
+        """30s tick: refresh signals once the latest session's bars are final, buy right
+        after the open, sell in the last minutes before the real close. Runs while Paused
+        too for EXITS only (exits are position protection, not AI spend); entries and the
+        veto need the system running."""
+        logger.info("Stress dip-buyer loop started")
+        while True:
+            await asyncio.sleep(30)
+            try:
+                cfg = self._stress_dip_cfg()
+                if not cfg.enabled or self.stopped:
+                    continue
+                if self._stress_dip_prune_book():
+                    await asyncio.to_thread(_save_stress_dip_book, dict(self._stress_dip_book))
+                try:
+                    sessions = await self._stress_dip_sessions()
+                except Exception as e:
+                    await self._sd_log(f"Dip-buyer: market calendar unavailable ({e}) -- retrying",
+                                       "warning", once_key=f"cal-{self._now_et():%Y-%m-%d}")
+                    continue
+                if not sessions:
+                    continue
+                now = self._now_et()
+                today, hhmm = now.date().isoformat(), now.strftime("%H:%M")
+
+                # 1) Signals for the newest final session.
+                want = sdip.last_completed_session(sessions, today, hhmm)
+                if (want and self._stress_dip_state.get("signal_date") != want
+                        and not self._stress_dip_refresh_in_progress
+                        and (self._stress_dip_refresh_retry_at is None
+                             or datetime.now() >= self._stress_dip_refresh_retry_at)):
+                    asyncio.create_task(self._stress_dip_refresh_signals(want))
+
+                # 2) Entries right after the open, once per session.
+                if (sdip.entry_window_open(sessions, today, hhmm, cfg)
+                        and self._stress_dip_state.get("entries_done_date") != today
+                        and not self.paused):
+                    prev = sdip.prior_session_date(sessions, today)
+                    if self._stress_dip_state.get("signal_date") == prev:
+                        await self._stress_dip_entries(today)
+                    else:
+                        await self._sd_log(
+                            f"Dip-buyer: no signals for {prev} yet (have "
+                            f"{self._stress_dip_state.get('signal_date') or 'none'}) -- waiting",
+                            "warning", once_key=f"nosig-{today}")
+
+                # 3) Exits near the real close.
+                if sdip.exit_window_open(sessions, today, hhmm, cfg):
+                    await self._stress_dip_exits(today, sessions)
+            except Exception as e:
+                logger.warning("Stress dip loop tick failed: %s", e)
+
+    async def _stress_dip_refresh_signals(self, session_date: str) -> None:
+        if self._stress_dip_refresh_in_progress:
+            return
+        self._stress_dip_refresh_in_progress = True
+        try:
+            cfg = self._stress_dip_cfg()
+            tickers = list(STOCK_UNIVERSE)
+            if not tickers:
+                return
+            await self._sd_log(f"Dip-buyer: downloading daily bars for {len(tickers)} stocks + VIX "
+                               f"(session {session_date})...")
+            snaps, vix_close = await asyncio.to_thread(_sd_compute_signals, tickers, session_date)
+            if vix_close is None or len(snaps) < 0.5 * len(tickers):
+                self._stress_dip_refresh_retry_at = datetime.now() + timedelta(minutes=15)
+                await self._sd_log(
+                    f"Dip-buyer: Yahoo data for {session_date} not complete yet "
+                    f"({len(snaps)}/{len(tickers)} stocks, VIX {'missing' if vix_close is None else 'ok'})"
+                    f" -- retrying in 15 min", "warning")
+                return
+            ranked = sdip.rank_candidates(snaps, vix_close, cfg)
+            cands = []
+            for c in ranked[:50]:
+                d = {k: getattr(c, k) for k in ("ticker", "date", "close", "sma5", "sma200", "rsi2", "atr",
+                                                 "dollar_volume", "last4_closes", "change_3d_pct")}
+                d["atr_pct"] = c.atr_pct
+                cands.append(d)
+            self._stress_dip_state = {
+                "signal_date": session_date, "vix_close": vix_close,
+                "computed_at": datetime.now().isoformat(timespec="seconds"),
+                "universe": len(tickers), "with_data": len(snaps), "candidates": cands,
+                "entries_done_date": self._stress_dip_state.get("entries_done_date"),
+                "last_error": None,
+            }
+            self._stress_dip_refresh_retry_at = None
+            await asyncio.to_thread(_save_stress_dip_state, dict(self._stress_dip_state))
+            if vix_close < cfg.vix_min:
+                msg = (f"Dip-buyer signals for {session_date}: VIX closed {vix_close:.2f} "
+                       f"(below {cfg.vix_min:.0f}) -- no buys next session")
+            elif not cands:
+                msg = f"Dip-buyer signals for {session_date}: VIX {vix_close:.2f}, no stock qualified"
+            else:
+                top = ", ".join(f"{c['ticker']} (RSI2 {c['rsi2']:.1f})" for c in cands[:10])
+                msg = (f"Dip-buyer signals for {session_date}: VIX {vix_close:.2f} -- {len(cands)} "
+                       f"qualifier(s), best first: {top}")
+            await self._sd_log(msg, "success" if cands else "info")
+        except Exception as e:
+            self._stress_dip_state["last_error"] = str(e)
+            self._stress_dip_refresh_retry_at = datetime.now() + timedelta(minutes=15)
+            await self._sd_log(f"Dip-buyer signal refresh failed: {e} -- retrying in 15 min", "error")
+        finally:
+            self._stress_dip_refresh_in_progress = False
+
+    async def _stress_dip_entries(self, today: str) -> None:
+        cfg = self._stress_dip_cfg()
+        # Not stamped yet: a broker that is still reconnecting at 9:31 gets retried on the
+        # next tick inside the entry window.
+        if not self.config["trading"].get("auto_execute", False) or not self.broker_connected:
+            await self._sd_log("Dip-buyer: auto-execute off or broker not connected -- waiting",
+                               "warning", once_key=f"nobroker-{today}")
+            return
+        if not self._is_market_open():
+            return
+        # Stamp before buying: a restart mid-way must not re-run the whole list (the
+        # held/pending checks below also stop any double buy).
+        self._stress_dip_state["entries_done_date"] = today
+        await asyncio.to_thread(_save_stress_dip_state, dict(self._stress_dip_state))
+        cands = list(self._stress_dip_state.get("candidates") or [])
+        vix = self._stress_dip_state.get("vix_close")
+        if not cands:
+            vix_txt = "n/a" if vix is None else f"{vix:.2f}"
+            await self._sd_log(f"Dip-buyer: nothing to buy today (VIX {vix_txt}, signals from "
+                               f"{self._stress_dip_state.get('signal_date')})")
+            return
+        if sdip.drawdown_halted(self.portfolio.total_value, self.portfolio.peak_value, cfg.drawdown_halt_pct):
+            await self._sd_log(
+                f"Dip-buyer: account is {cfg.drawdown_halt_pct:.0f}%+ below its peak "
+                f"(${self.portfolio.total_value:,.0f} vs ${self.portfolio.peak_value:,.0f}) -- buys halted",
+                "warning")
+            return
+        held = [t for t in self._stress_dip_book
+                if t in self.portfolio.positions or self._stress_dip_book[t].get("pending")]
+        free = cfg.slots - len(held)
+        if free <= 0:
+            await self._sd_log(f"Dip-buyer: all {cfg.slots} slots full -- no buys today")
+            return
+        await self._sd_log(f"Dip-buyer: {len(cands)} candidate(s), {free} free slot(s) -- checking in rank order")
+        bought = 0
+        for c in cands:
+            if bought >= free or self.paused or self.stopped:
+                break
+            t = c["ticker"]
+            if (t in self.portfolio.positions or t in self._stress_dip_book
+                    or t in self._pending_buy_reservations):
+                continue
+            try:
+                if await self._stress_dip_try_buy(c, vix, cfg, today):
+                    bought += 1
+            except Exception as e:
+                await self._sd_log(f"Buy attempt failed: {e}", "error", ticker=t)
+        await self._sd_log(f"Dip-buyer: done for today -- {bought} buy(s)", "success" if bought else "info")
+
+    async def _stress_dip_try_buy(self, c: dict, vix: float, cfg, today: str) -> bool:
+        t = c["ticker"]
+        if not self.risk_manager.check_wash_sale_cooldown(t, self.portfolio):
+            await self._sd_log("Skipped -- wash-sale rebuy block (recent losing sale)", "warning", ticker=t)
+            return False
+        soon, edate = await self._earnings_soon(t)
+        if soon:
+            await self._sd_log(f"Skipped -- earnings on {edate} (2-day auto-buy blackout)", "warning", ticker=t)
+            return False
+        facts = await asyncio.to_thread(_sd_ticker_facts, t)
+        sector = facts.get("sector", "")
+        # Buys still waiting on a fill aren't positions yet, so count them toward the
+        # sector limit too (several same-sector dips often qualify on the same morning).
+        pending_same = sum(1 for bt, b in self._stress_dip_book.items()
+                           if b.get("pending") and bt not in self.portfolio.positions
+                           and sector and b.get("sector") == sector)
+        if (not self.risk_manager.check_sector_concentration(self.portfolio, sector)
+                or (pending_same and self.risk_manager.sector_concentration_enabled
+                    and sum(1 for p in self.portfolio.positions.values() if p.sector == sector)
+                    + pending_same >= self.risk_manager.max_sector_positions)):
+            await self._sd_log(f"Skipped -- sector limit reached ({sector})", "warning", ticker=t)
+            return False
+        # Alpaca's live quote first (it is what the market order will meet), Yahoo second.
+        price = 0.0
+        try:
+            price = float(await self.order_manager.broker.get_quote(t) or 0.0)
+        except Exception:
+            price = 0.0
+        if not is_usable_price(price) or price <= 0:
+            try:
+                q = await self.market_data.get_quote(t)
+                price = float(getattr(q, "price", 0.0) or 0.0)
+            except Exception:
+                price = 0.0
+        if not is_usable_price(price) or price <= 0:
+            await self._sd_log("Skipped -- no usable live price", "warning", ticker=t)
+            return False
+        snap = sdip.TickerSnapshot(**{k: c.get(k) for k in (
+            "ticker", "date", "close", "sma5", "sma200", "rsi2", "atr", "dollar_volume",
+            "last4_closes", "change_3d_pct")})
+        stop_pct = sdip.stop_distance_pct(snap.atr, snap.close, cfg)
+        stop = sdip.stop_price(price, snap.atr, snap.close, cfg)
+
+        # Claude veto -- fail-closed.
+        headlines: list[str] = []
+        try:
+            news = await self.news_feed.get_company_news(t, days=7)
+            headlines = [f"{n.published:%m-%d} {n.headline}" for n in news[:12]]
+        except Exception:
+            headlines = []
+        prompt = sdip.build_veto_prompt(
+            today=today, ticker=t, company=facts.get("company") or t, price=price, snap=snap,
+            vix_close=float(vix), stop_pct=stop_pct, earnings_date=facts.get("earnings_date", ""),
+            headlines=headlines, max_hold=cfg.max_hold_sessions)
+        text = await self.research_engine.ask_stress_dip_veto(t, prompt)
+        verdict = sdip.parse_veto_response(text or "")
+        asyncio.create_task(asyncio.to_thread(_append_stress_dip_veto_log, {
+            "at": datetime.now().isoformat(timespec="seconds"), "date": today, "ticker": t,
+            "price": price, "signal_date": snap.date, "close": snap.close, "rsi2": snap.rsi2,
+            "change_3d_pct": snap.change_3d_pct, "vix": vix, "stop_pct": stop_pct,
+            "earnings_date": facts.get("earnings_date", ""),
+            "model": self.config.get("research", {}).get("model_stress_dip_veto", sdip.DEFAULT_VETO_MODEL),
+            "veto": None if verdict is None else verdict[0],
+            "reason": None if verdict is None else verdict[1],
+            "raw": None if verdict is not None else (text or "")[:500],
+        }))
+        if verdict is None:
+            await self._sd_log("Skipped -- Claude risk check failed or unreadable (no buy without it)",
+                               "warning", ticker=t)
+            return False
+        veto, reason = verdict
+        if veto:
+            await self._sd_log(f"Claude vetoed: {reason}", "warning", ticker=t)
+            return False
+        if self.paused or self.stopped or not self._is_market_open():
+            return False
+
+        reserve_pct = self.config["risk_management"].get("min_cash_reserve_pct", 2.0)
+        reserved = 0.0
+        async with self._promotion_cash_lock:
+            target = sdip.slot_dollars(self.portfolio.total_value, reserve_pct, cfg.slots)
+            floor = self.portfolio.total_value * reserve_pct / 100.0
+            size = round(min(target, self._available_cash() - floor), 2)
+            if size >= max(50.0, 0.25 * target):
+                self._reserved_cash += size
+                reserved = size
+        if reserved <= 0:
+            await self._sd_log("Skipped -- not enough cash above the reserve floor", "warning", ticker=t)
+            return False
+        try:
+            from types import SimpleNamespace
+            from src.decision.signal_generator import TradeSignal
+            from src.research.engine import Signal as Sig
+            above200 = 100.0 * (snap.close / snap.sma200 - 1) if snap.sma200 else 0.0
+            why = (f"Stress dip-buyer -- RSI(2) {snap.rsi2:.1f}, "
+                   f"{(snap.change_3d_pct or 0):+.1f}% in 3 days, {above200:+.1f}% above 200d, "
+                   f"VIX {float(vix):.2f}; stop {stop_pct:.1f}% (3xATR); sells on the first close above "
+                   f"its 5-day average or after {cfg.max_hold_sessions} sessions. Claude check: {reason}")
+            # Only OrderManager._buy_snapshot_fields reads research_report on a buy -- this
+            # fills "Why AI Bought This" with the real rule numbers and Claude's verdict.
+            rationale = SimpleNamespace(
+                thesis=(f"Mechanical dip-buy: {facts.get('company') or t} fell sharply inside a long-term "
+                        f"uptrend while VIX was {float(vix):.1f}."),
+                reasoning=why, fair_value_estimate=None)
+            signal = TradeSignal(
+                ticker=t, signal=Sig.BUY, conviction=0, entry_price=price, stop_loss=stop,
+                take_profit_targets=[],
+                position_size_pct=round(100.0 * size / max(self.portfolio.total_value, 1.0), 2),
+                position_size_dollars=size, shares=size / price,
+                reasoning=why, research_report=rationale, generated_at=datetime.now(),
+                should_execute=True, sector=sector,
+            )
+            if self.paused or self.stopped:
+                return False
+            order = await self.order_manager.execute(signal)
+            if not order or order.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
+                await self._sd_log(f"Buy order not accepted ({getattr(order, 'status', None)})", "error", ticker=t)
+                return False
+            if t not in self.portfolio.positions:
+                self._register_pending_buy(t, size)
+            self._stress_dip_book[t] = {
+                "entry_date": today, "signal_date": snap.date, "ref_close": snap.close,
+                "atr": snap.atr, "stop_pct": round(stop_pct, 2), "rsi2": snap.rsi2,
+                "vix": vix, "sector": sector, "pending": t not in self.portfolio.positions,
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
+            await asyncio.to_thread(_save_stress_dip_book, dict(self._stress_dip_book))
+            await self._log_buy_trade(signal, order)
+            _fp = order.filled_price or signal.entry_price
+            await self.broadcast({"type": "trade_executed", "trade": {
+                "ticker": t, "status": order.status.value, "filled_price": _fp, "shares": signal.shares}})
+            await self.broadcast({"type": "portfolio", "portfolio": self.get_portfolio_snapshot()})
+            entry = self.add_ai_log(t, "DIP_BUY",
+                f"BUY (dip-buyer) {signal.shares:.4g} shares @ ${_fp:.2f} (${size:,.0f}) | "
+                f"RSI(2) {snap.rsi2:.1f} | VIX {float(vix):.2f} | Stop ${stop:.2f} (-{stop_pct:.1f}%)", "buy")
+            await self.broadcast({"type": "ai_log", "entry": entry})
+            asyncio.create_task(_notify(
+                f"BUY {t} (dip-buyer)",
+                f"{signal.shares:.4g} shares @ ${_fp:.2f} | RSI(2) {snap.rsi2:.1f}, VIX {float(vix):.1f}, "
+                f"stop -{stop_pct:.1f}%", priority="high", tags="white_check_mark"))
+            logger.info("Dip-buyer buy %s -- $%.2f @ ~$%.2f, stop $%.2f", t, size, _fp, stop)
+            return True
+        finally:
+            async with self._promotion_cash_lock:
+                self._reserved_cash -= reserved
+
+    async def _stress_dip_exits(self, today: str, sessions: list[dict]) -> None:
+        cfg = self._stress_dip_cfg()
+        held = [t for t in self._stress_dip_book if t in self.portfolio.positions]
+        if not held or not self.broker_connected or self.stopped:
+            return
+        if not self.config["trading"].get("auto_execute", False) or not self._is_market_open():
+            return
+        cache = self._stress_dip_exit_closes
+        if cache.get("date") != today or any(t not in cache.get("data", {}) for t in held):
+            data = await asyncio.to_thread(_sd_recent_closes, held)
+            self._stress_dip_exit_closes = cache = {"date": today, "data": data}
+        for t in held:
+            pos = self.portfolio.positions.get(t)
+            if pos is None:
+                continue
+            until = self._auto_close_cooldown.get(t)
+            if until is not None and datetime.now() < until:
+                continue
+            rows = [(d, c) for d, c in cache["data"].get(t, []) if d < today]
+            last4 = [c for _, c in rows][-4:]
+            # Counted from the market calendar, so a failed price download can't stall
+            # the time exit.
+            n = sdip.calendar_sessions_held(sessions, self._stress_dip_book[t].get("entry_date", today), today)
+            live = pos.current_price
+            if not is_usable_price(live) or live <= 0:
+                continue
+            if len(last4) < 4 and n < cfg.max_hold_sessions:
+                await self._sd_log("Can't judge the 5-day average (missing closes) -- holding",
+                                   "warning", ticker=t, once_key=f"noclose-{t}-{today}")
+                continue
+            reason = sdip.exit_reason(live, last4, n, cfg)
+            if reason is None:
+                await self._sd_log(f"Holding (session {n}/{cfg.max_hold_sessions}, ${live:.2f} not above "
+                                   f"its 5-day average)", ticker=t, once_key=f"hold-{t}-{today}")
+                continue
+            self._auto_close_cooldown[t] = datetime.now() + timedelta(minutes=5)
+            await self._sd_log(f"Selling -- {reason}", "sell", ticker=t)
+            await self._auto_close_position(t, pos, f"Dip-buyer exit: {reason}")
 
     async def _attempt_near_miss_promotion(
         self, ticker: str, nm_snapshot: dict | None = None, dip_low: float | None = None,
@@ -10580,6 +11185,13 @@ async def get_ticker_tape_config():
     return {"crypto_count": max(0, min(5, int(count)))}
 
 
+@app.get("/api/stress-dip")
+async def stress_dip_status():
+    """The Stress Dip-Buyer's state (2026-11-26): the latest evening's ranked candidates,
+    VIX, which positions it owns, and whether the old On Deck pipeline is on."""
+    return state.stress_dip_snapshot()
+
+
 @app.get("/api/market-chart")
 async def market_chart():
     """The dashboard's SPY/VIX graph (2026-11-21, owner request: "a graph instead with both on
@@ -12857,6 +13469,10 @@ async def startup():
     state._track2_declines = _load_track2_declines()
     if state._track2_declines:
         logger.info("Restored %d Track 2 decline(s)", len(state._track2_declines))
+    state._stress_dip_state = _load_stress_dip_state()
+    state._stress_dip_book = _load_stress_dip_book()
+    if state._stress_dip_book:
+        logger.info("Restored %d stress dip-buyer position record(s)", len(state._stress_dip_book))
 
     state.market_pause = _load_market_pause_state()
     if state.market_pause.active:
@@ -12972,6 +13588,7 @@ async def startup():
     asyncio.create_task(state.position_monitor_loop())
     asyncio.create_task(state.position_deep_dive_loop())
     asyncio.create_task(state.market_pause_loop())
+    asyncio.create_task(state.stress_dip_loop())
     logger.info("Dashboard started — auto-scan running, position monitor active")
 
     # First-run bootstrap removed 2026-07-17 — it triggered on watchlist_manager.size() == 0,

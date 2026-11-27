@@ -615,14 +615,14 @@ input[type=time].setting-input { font-family: monospace; }
     <div class="settings-grid">
       <div class="setting-row">
         <div>
-          <div class="setting-label">Market Pause <button type="button" class="info-btn" onclick="showInfo(event,'Pauses automatic buys while SPY closes below its N-day average and VIX closes above the level. Backtested 2005-now: much smaller crash losses; costs some dip-buys in choppy years. Stops, take-profits, scans and manual buys are unaffected.')">i</button></div>
+          <div class="setting-label">Market Pause <button type="button" class="info-btn" onclick="showInfo(event,'Pauses automatic buys while SPY closes below its N-day average and VIX closes above the level. Backtested 2005-now: much smaller crash losses; costs some dip-buys in choppy years. Stops, take-profits, scans and manual buys are unaffected. Off by default since 2026-11-26: the dip-buyer never reads it.')">i</button></div>
           <div class="setting-desc">Pause automatic buys during a falling, fearful market</div>
         </div>
         <select class="setting-input" name="risk_management.market_pause_enabled">
           <option value="true" {% if cfg.risk_management.market_pause_enabled %}selected{% endif %}>Enabled</option>
           <option value="false" {% if not cfg.risk_management.market_pause_enabled %}selected{% endif %}>Disabled</option>
         </select>
-        <div class="default-label">default<br><span class="default-val">On</span></div>
+        <div class="default-label">default<br><span class="default-val">Off</span></div>
       </div>
       <div class="setting-row">
         <div>
@@ -1582,7 +1582,7 @@ const DEFAULTS = {
   'risk_management.drawdown_defensive_pct': 10.0,
   'risk_management.drawdown_exit_review_pct': 15.0,
   // Market buy pause (2026-11-21) -- the code defaults (src/decision/market_pause.py).
-  'risk_management.market_pause_enabled': 'true',
+  'risk_management.market_pause_enabled': 'false',
   'risk_management.market_pause_live_watch': 'true',
   'risk_management.market_pause_vix_level': 20.0,
   'risk_management.market_pause_spy_sma_days': 50,
