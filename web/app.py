@@ -1636,6 +1636,13 @@ def _sd_recent_highs(tickers: list[str]) -> dict[str, list[tuple[str, float]]]:
             for t, rows in _sd_download_rows(list(tickers), "2mo")}
 
 
+def _sd_recent_lows(tickers: list[str]) -> dict[str, list[tuple[str, float]]]:
+    """Thread body for the short mirror's nightly trail: about two months of (date, low) per held
+    short (the trail's longest hold is 20 sessions)."""
+    return {t: [(r["date"], r["low"]) for r in rows]
+            for t, rows in _sd_download_rows(list(tickers), "2mo")}
+
+
 def _sd_ticker_facts(ticker: str) -> dict:
     """Sector, company name and next earnings date (YYYY-MM-DD, or "") from Yahoo, for the
     sector-concentration gate and the Claude veto prompt. Never raises."""
@@ -2234,6 +2241,7 @@ class DashboardState:
         self._short_unknown_seen: dict = {}
         self._short_logged: set = set()
         self._broker_check_logged_hour: str | None = None
+        self._short_trail_retry_at: datetime | None = None
         self._stress_dip_logged: set[str] = set()
         self._market_live_readings: MarketReadings | None = None
         # The dashboard market graph's source (2026-11-21): the close check's own finished
@@ -7174,7 +7182,8 @@ class DashboardState:
         st = self._short_state or {}
         return {
             "enabled": cfg.enabled, "short_mode": self._market_pause_active(), "slots": cfg.slots,
-            "rsi2_min": cfg.rsi2_min, "vix_min": cfg.vix_min, "max_hold_sessions": cfg.max_hold_sessions,
+            "rsi2_min": cfg.rsi2_min, "vix_min": cfg.vix_min, "max_hold_sessions": smir.max_hold(cfg),
+            "exit_mode": cfg.exit_mode, "trail_final_pct": cfg.trail_final_pct, "trail_t3_pct": cfg.trail_t3_pct,
             "stop_min_pct": cfg.stop_min_pct, "stop_max_pct": cfg.stop_max_pct,
             "signal_date": st.get("signal_date"), "vix_close": st.get("vix_close"),
             "computed_at": st.get("computed_at"), "entries_done_date": st.get("entries_done_date"),
@@ -7226,6 +7235,8 @@ class DashboardState:
                                 f"{self._short_state.get('signal_date') or 'none'}) -- waiting",
                                 "warning", once_key=f"nosig-{today}")
 
+                if self._short_book:
+                    await self._short_update_trails(sessions, today, hhmm)
                 if self.broker_connected and self.order_manager:
                     await self._short_monitor(sessions, today, hhmm)
                     if self._short_book and smir.exit_window_open(sessions, today, hhmm, cfg):
@@ -7549,17 +7560,18 @@ class DashboardState:
             return False
         import uuid as _uuid
         try:
+            stop_px = smir.effective_stop(b)      # the hard stop or the trail, whichever is lower
             o = await self.order_manager.broker.submit_order(_BrokerOrder(
                 ticker=t, side=_OrderSide.BUY, order_type=_OrderType.STOP, quantity=int(b["qty"]),
-                stop_price=float(b["stop"]), client_order_id=f"short-stop-{t}-{_uuid.uuid4().hex[:8]}"))
+                stop_price=stop_px, client_order_id=f"short-stop-{t}-{_uuid.uuid4().hex[:8]}"))
             if o.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED, OrderStatus.EXPIRED):
                 raise RuntimeError(f"order {o.status.value}")
             b["stop_order_id"] = o.broker_order_id
             await asyncio.to_thread(_save_short_mirror_book, dict(self._short_book))
-            await self._sm_log(f"Buy stop placed: {int(b['qty'])} @ ${float(b['stop']):.2f}", ticker=t)
+            await self._sm_log(f"Buy stop placed: {int(b['qty'])} @ ${stop_px:.2f}", ticker=t)
             return True
         except Exception as e:
-            await self._sm_log(f"Buy stop ${float(b['stop']):.2f} could not be placed: {e}", "error", ticker=t)
+            await self._sm_log(f"Buy stop ${smir.effective_stop(b):.2f} could not be placed: {e}", "error", ticker=t)
             return False
 
     async def _short_record_close(self, t: str, price, qty, reason: str) -> None:
@@ -7738,7 +7750,29 @@ class DashboardState:
             if open_ids is None:
                 continue
             sid = b.get("stop_order_id")
+            want_px = smir.effective_stop(b)
             if sid and sid in open_ids:
+                resting = next((o for o in open_orders if o["order_id"] == sid), None)
+                rest_px = float((resting or {}).get("stop_price") or 0.0)
+                if (rest_px and want_px < rest_px - 0.005 and self._exit_order_maintenance_window_open()):
+                    # The trail came down: move the resting buy stop to it (in place; Alpaca gives the
+                    # replacement a new id). Price already over it in regular hours = cover now.
+                    if regular and b["last_price"] >= want_px:
+                        await self._short_cover(t, f"price ${b['last_price']:.2f} is over the trail ${want_px:.2f}")
+                        continue
+                    new_id = await broker.replace_order(sid, stop_price=want_px)
+                    if new_id:
+                        b["stop_order_id"] = new_id
+                        await self._sm_log(f"Buy stop moved down to the trail: ${rest_px:.2f} -> ${want_px:.2f}",
+                                           ticker=t)
+                    else:
+                        await broker.cancel_order(sid)
+                        st = await self._short_wait_terminal(sid, 10)
+                        if st is not None and st.status == OrderStatus.FILLED:
+                            continue          # it filled first: the position read drops it next tick
+                        b["stop_order_id"] = None
+                        if not await self._short_place_stop(t) and regular:
+                            await self._short_cover(t, "the trailing buy stop could not be placed")
                 continue
             if sid:
                 try:
@@ -7748,14 +7782,56 @@ class DashboardState:
                 except Exception:
                     pass
                 b["stop_order_id"] = None
-            if regular and b["last_price"] >= float(b["stop"]):
+            if regular and b["last_price"] >= want_px:
                 await self._short_cover(t, f"price ${b['last_price']:.2f} is at or over the stop "
-                                           f"${float(b['stop']):.2f} with no resting stop")
+                                           f"${want_px:.2f} with no resting stop")
                 continue
             if not await self._short_place_stop(t) and regular:
                 await self._short_cover(t, "the buy stop could not be re-placed")
         if changed:
             await asyncio.to_thread(_save_short_mirror_book, dict(self._short_book))
+
+    async def _short_update_trails(self, sessions: list[dict], today: str, hhmm: str) -> None:
+        """exit_mode "trail" (2026-11-27, the short side mirrors the long): once the newest
+        session's daily bars are final, lower each short's trailing buy stop from the lowest low
+        since the short (the short day included) -- the dip-buyer's stepped curve mirrored
+        (smir.short_trail_price). Never raised. It lives in book["trail"]; _short_monitor moves
+        the resting buy stop down to it when the exit-order window opens. Same timing as the
+        backtest: a day's low moves the trail from the next session on."""
+        cfg = self._short_cfg()
+        if cfg.exit_mode != "trail":
+            return
+        want = sdip.last_completed_session(sessions, today, hhmm)
+        if not want:
+            return
+        todo = [t for t, b in self._short_book.items()
+                if b.get("trail_session") != want and str(b.get("entry_date", "9999")) <= want]
+        if not todo:
+            return
+        if self._short_trail_retry_at and datetime.now() < self._short_trail_retry_at:
+            return
+        data = await asyncio.to_thread(_sd_recent_lows, todo)
+        missing = False
+        for t in todo:
+            b = self._short_book.get(t)
+            if b is None:
+                continue
+            rows = [(d, lo) for d, lo in data.get(t, []) if str(b["entry_date"]) <= d <= want]
+            if not rows or rows[-1][0] != want:
+                missing = True          # Yahoo doesn't have that session yet: try again later
+                continue
+            low = min(lo for _, lo in rows)
+            start = b.get("stop_pct") or smir.stop_distance_pct(b.get("atr") or 0, b.get("ref_close") or 0, cfg)
+            new = smir.short_trail_price(float(b["entry_price"]), low, float(start), cfg)
+            b["trail_session"], b["trail_low"] = want, low
+            if new > 0 and new < smir.effective_stop(b) - 0.005:
+                old = smir.effective_stop(b)
+                b["trail"] = new
+                drop = 100.0 * (1 - low / float(b["entry_price"]))
+                await self._sm_log(f"Trail lowered to ${new:.2f} (was ${old:.2f}) -- low since the short "
+                                   f"${low:.2f} ({drop:.1f}% under the short)", "success", ticker=t)
+        self._short_trail_retry_at = datetime.now() + timedelta(minutes=10) if missing else None
+        await asyncio.to_thread(_save_short_mirror_book, dict(self._short_book))
 
     async def _short_exits(self, today: str, sessions: list[dict]) -> None:
         cfg = self._short_cfg()
@@ -7763,7 +7839,8 @@ class DashboardState:
         if not held:
             return
         cache = self._short_exit_closes
-        if cache.get("date") != today or any(t not in cache.get("data", {}) for t in held):
+        if cfg.exit_mode == "average" and (cache.get("date") != today
+                                           or any(t not in cache.get("data", {}) for t in held)):
             data = await asyncio.to_thread(_sd_recent_closes, held)
             self._short_exit_closes = cache = {"date": today, "data": data}
         for t in held:
@@ -7776,14 +7853,17 @@ class DashboardState:
             live = float(b.get("last_price") or 0.0)
             if not is_usable_price(live) or live <= 0:
                 continue
-            if len(last4) < 4 and n < cfg.max_hold_sessions:
+            if cfg.exit_mode == "average" and len(last4) < 4 and n < smir.max_hold(cfg):
                 await self._sm_log("Holding -- not enough completed closes for the 5-day average yet",
                                    ticker=t, once_key=f"few-{t}-{today}")
                 continue
             why = smir.cover_reason(live, last4, n, cfg)
             if why is None:
-                await self._sm_log(f"Holding the short (session {n}/{cfg.max_hold_sessions}, ${live:.2f} "
-                                   f"not under its 5-day average)", ticker=t, once_key=f"hold-{t}-{today}")
+                hold_why = (f"buy stop ${smir.effective_stop(b):.2f}"
+                            + (" (trailing)" if b.get("trail") else " (trail not on yet)")
+                            if cfg.exit_mode == "trail" else f"${live:.2f} not under its 5-day average")
+                await self._sm_log(f"Holding the short (session {n}/{smir.max_hold(cfg)}, {hold_why})",
+                                   ticker=t, once_key=f"hold-{t}-{today}")
                 continue
             await self._short_cover(t, why)
 

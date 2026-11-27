@@ -12,8 +12,15 @@ docs/superpowers/specs/2026-11-27-short-mirror-design.md.
     slots (each ~1/20 of equity net of the cash reserve), whole shares (Alpaca has no
     fractional or notional shorts), easy-to-borrow only, after a Claude red-flag check.
   * Hard stop: a GTC BUY STOP at entry + 3 x ATR(14), clipped to 3%-15%.
-  * Cover near the close on the first session whose close is under the 5-day average (judged
-    with the live price standing in for today's close), or on the 10th session held.
+  * Exit (exit_mode "trail", the default since 2026-11-27 -- owner: the short side mirrors the
+    long, trailing stop included): the dip-buyer's stepped trail mirrored. It turns on once the
+    price trades under the short, starts at the stock's own stop %, narrows (through -4.7% and
+    -6.6%) to 0.5% over the lowest low at -8.4%, is lowered once per session from the completed
+    daily lows since the short (never raised), and the resting buy stop is moved down to it.
+    Cover at the close of the 20th session held if nothing else has. Backtest (exp16, short mode
+    only): 0.2%/yr (2005-15) and -7.1%/yr (2016-26) vs 0.8% / -6.1% for exit_mode "average":
+    the first close under the 5-day average (live price standing in for today's close), or the
+    10th session.
 
 Backtest (scratchpad exp16, 20 slots, dividends charged via adjusted prices, 0.5%/yr borrow):
 0.8%/yr (2005-15) and -6.1%/yr (2016-26) on its own; long mode + this short mode 3.2%/yr and
@@ -39,7 +46,13 @@ SHORT_MIRROR_DEFAULTS = {
     "stop_atr_mult": 3.0,
     "stop_min_pct": 3.0,
     "stop_max_pct": 15.0,
-    "max_hold_sessions": 10,
+    "max_hold_sessions": 10,          # exit_mode "average"
+    "exit_mode": "trail",             # "trail" (mirrored stepped trail) or "average" (5-day average)
+    "trail_max_hold_sessions": 20,    # exit_mode "trail"
+    "trail_final_pct": 0.5,           # the trail's width at -trail_t3_pct
+    "trail_t1_pct": 4.7,
+    "trail_t2_pct": 6.6,
+    "trail_t3_pct": 8.4,
     "entry_delay_minutes": 1,
     "entry_window_minutes": 60,
     "exit_minutes_before_close": 10,
@@ -63,6 +76,12 @@ class ShortMirrorConfig:
     stop_min_pct: float
     stop_max_pct: float
     max_hold_sessions: int
+    exit_mode: str
+    trail_max_hold_sessions: int
+    trail_final_pct: float
+    trail_t1_pct: float
+    trail_t2_pct: float
+    trail_t3_pct: float
     entry_delay_minutes: int
     entry_window_minutes: int
     exit_minutes_before_close: int
@@ -90,6 +109,12 @@ def short_mirror_cfg(raw: dict | None) -> ShortMirrorConfig:
         stop_min_pct=float(merged["stop_min_pct"]),
         stop_max_pct=float(merged["stop_max_pct"]),
         max_hold_sessions=int(merged["max_hold_sessions"]),
+        exit_mode=sdip._exit_mode(merged["exit_mode"]),
+        trail_max_hold_sessions=int(merged["trail_max_hold_sessions"]),
+        trail_final_pct=float(merged["trail_final_pct"]),
+        trail_t1_pct=float(merged["trail_t1_pct"]),
+        trail_t2_pct=float(merged["trail_t2_pct"]),
+        trail_t3_pct=float(merged["trail_t3_pct"]),
         entry_delay_minutes=int(merged["entry_delay_minutes"]),
         entry_window_minutes=int(merged["entry_window_minutes"]),
         exit_minutes_before_close=int(merged["exit_minutes_before_close"]),
@@ -146,16 +171,62 @@ def short_pnl(entry_price: float, cover_price: float, qty: float) -> float:
     return round((entry_price - cover_price) * abs(qty), 2)
 
 
+def max_hold(cfg: ShortMirrorConfig) -> int:
+    """Sessions until the time exit, for the configured exit mode."""
+    return cfg.trail_max_hold_sessions if cfg.exit_mode == "trail" else cfg.max_hold_sessions
+
+
 def cover_reason(live_price: float, last4_closes: list[float], sessions_held: int,
                  cfg: ShortMirrorConfig) -> str | None:
     """Why to cover now (near the close), or None to keep holding. sessions_held counts the
-    entry session as 1, so the 10th session held is the time exit (same as the backtest)."""
-    avg = sdip.sma5_with_live(last4_closes, live_price)
-    if avg is not None and live_price < avg:
-        return f"closed under its 5-day average (${live_price:.2f} < ${avg:.2f})"
-    if sessions_held >= cfg.max_hold_sessions:
-        return f"{cfg.max_hold_sessions}-session time limit reached"
+    entry session as 1, so the 10th (20th in trail mode) session held is the time exit (same as
+    the backtest). In trail mode the trailing buy stop does the rest, at the broker."""
+    if cfg.exit_mode == "average":
+        avg = sdip.sma5_with_live(last4_closes, live_price)
+        if avg is not None and live_price < avg:
+            return f"closed under its 5-day average (${live_price:.2f} < ${avg:.2f})"
+    limit = max_hold(cfg)
+    if sessions_held >= limit:
+        return f"{limit}-session time limit reached"
     return None
+
+
+def short_trail_width(entry: float, low: float, start_pct: float, cfg: ShortMirrorConfig) -> float:
+    """The trail's width in % (above the low) when the lowest low is `low`: start_pct at the
+    short, a straight line through the -T1/-T2 checkpoints (each one step narrower) to
+    trail_final_pct at -T3 and below. The dip-buyer's stepped_trail_width mirrored."""
+    final = cfg.trail_final_pct
+    step = (start_pct - final) / 3.0
+    g = (entry - low) / entry
+    ap = [0.0, cfg.trail_t1_pct / 100, cfg.trail_t2_pct / 100, cfg.trail_t3_pct / 100]
+    av = [start_pct, start_pct - step, start_pct - 2 * step, final]
+    if g <= ap[0]:
+        return av[0]
+    if g >= ap[3]:
+        return av[3]
+    for k in range(3):
+        if g <= ap[k + 1]:
+            return av[k] - (g - ap[k]) / (ap[k + 1] - ap[k]) * (av[k] - av[k + 1])
+    return final
+
+
+def short_trail_price(entry: float, lowest_low: float, start_pct: float, cfg: ShortMirrorConfig) -> float:
+    """The trailing buy stop for the next session from the lowest completed daily low since the
+    short (the short day included), rounded UP to the cent; 0.0 while the price hasn't traded
+    under the short (not armed)."""
+    if not (_finite(entry) and _finite(lowest_low) and _finite(start_pct)) or entry <= 0 or lowest_low <= 0:
+        return 0.0
+    if lowest_low >= entry:
+        return 0.0
+    w = short_trail_width(entry, lowest_low, start_pct, cfg)
+    return math.ceil(lowest_low * (1 + w / 100.0) * 100 - 1e-9) / 100.0
+
+
+def effective_stop(book_entry: dict) -> float:
+    """The buy stop in force for a short: the hard stop or the trail, whichever is LOWER."""
+    stop = float(book_entry.get("stop") or 0.0)
+    trail = float(book_entry.get("trail") or 0.0)
+    return min(stop, trail) if trail > 0 else stop
 
 
 def date_within(day_iso: str, today_iso: str, days: int) -> bool:
