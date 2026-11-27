@@ -6983,7 +6983,8 @@ class DashboardState:
     # ── Stress Dip-Buyer (2026-11-26) ─────────────────────────────────────────────
     # The buy strategy since 2026-11-26 (owner: "do all phases.. build this strategy, turn
     # off all other strategies that dont need to be on"). Rules: src/strategy/stress_dip.py.
-    # Owner choices the same night: 10 slots of ~1/10 equity each (net of the cash reserve),
+    # Owner choices the same night: 10 slots of ~1/10 equity each (net of the cash reserve;
+    # 20 slots of ~1/20 since 2026-11-27, owner: "make it 20"),
     # and the strategy's OWN 20% drawdown halt instead of the 1.9% daily-loss limit and the
     # risk-tier drawdown halt (those would block it on exactly the stress days it is for).
     # The market buy pause never applies to it (owner: "turn market pause off"). Hard

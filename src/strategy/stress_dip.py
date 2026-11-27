@@ -7,8 +7,9 @@ Research: docs/research/2026-11-26-swing-strategy-review/README.md. Rule, in pla
     200-day average, its 2-day RSI is below 10 (a sharp 2-3 day drop), it trades at least
     $20M/day on average (63 days), it closes at $5 or more, AND VIX closed at 20 or more that
     same day. Qualifiers are ranked by lowest RSI(2).
-  * Next session, right after the open: fill free slots (10 slots, each ~1/10 of equity net of
-    the cash reserve) in rank order, after a Claude veto check and the hard safety gates.
+  * Next session, right after the open: fill free slots (20 slots since 2026-11-27, each ~1/20
+    of equity net of the cash reserve; was 10) in rank order, after a Claude veto check and the
+    hard safety gates.
   * Hard stop at entry - 3 x ATR(14) (clipped to 3%-15%), resting at the broker as usual.
   * Exit (exit_mode "trail", the default since 2026-11-26, owner: "Let winners run"): a stepped
     trailing stop replaces the old sell-on-a-close-over-the-5-day-average rule. It starts at the
@@ -36,7 +37,7 @@ from dataclasses import dataclass, field
 
 STRESS_DIP_DEFAULTS = {
     "enabled": True,
-    "slots": 10,
+    "slots": 20,                      # owner 2026-11-27: "make it 20" (was 10)
     "vix_min": 20.0,
     "rsi2_max": 10.0,
     "min_dollar_volume": 20_000_000.0,
