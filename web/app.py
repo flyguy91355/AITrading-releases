@@ -2605,8 +2605,9 @@ class DashboardState:
         week_number = self._now_et().date().isocalendar()[1]
         return {
             "total_value": round(p.total_value, 2),
-            # Net of what open shorts owe (Short Mirror): Alpaca's cash holds their proceeds.
-            "cash": round(p.cash - (p.short_liability or 0.0), 2),
+            # Money not in any trade (2026-11-27): Alpaca's cash holds the shorts' sale proceeds, so
+            # free cash = account value - longs - shorts = cash - 2 x what the shorts owe.
+            "cash": round(p.cash - 2 * (p.short_liability or 0.0), 2),
             "short_liability": round(p.short_liability or 0.0, 2),
             "short_positions": self._short_positions_snapshot(),
             "cash_pct": round(p.cash_pct, 1),

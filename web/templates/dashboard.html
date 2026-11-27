@@ -2545,7 +2545,9 @@ function updatePortfolio(p) {
   }
 
   document.getElementById('cashValue').textContent = fmt$(p.cash);
-  document.getElementById('cashPct').textContent = p.cash_pct.toFixed(1) + '%';
+  // Free cash: money not in any trade; open shorts tie up their value too (2026-11-27).
+  document.getElementById('cashPct').textContent = p.cash_pct.toFixed(1) + '%'
+    + (p.short_liability > 0 ? ` · $${Math.round(p.short_liability).toLocaleString()} in shorts` : '');
 
   renderPositions(p.positions, p.short_positions);
 }

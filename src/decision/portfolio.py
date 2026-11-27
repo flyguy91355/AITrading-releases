@@ -348,7 +348,9 @@ class Portfolio:
     def cash_pct(self) -> float:
         if self.total_value == 0:
             return 0.0
-        return ((self.cash - (getattr(self, "short_liability", 0.0) or 0.0)) / self.total_value) * 100
+        # Money not in any trade, as a % of the account (2026-11-27, owner: the Cash card showed 100% with 17 shorts
+        # open). Alpaca's cash holds short-sale proceeds: free = account value - longs - shorts = cash - 2 x liability.
+        return ((self.cash - 2 * (getattr(self, "short_liability", 0.0) or 0.0)) / self.total_value) * 100
 
     @property
     def day_pnl(self) -> float:
