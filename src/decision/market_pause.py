@@ -409,9 +409,9 @@ def status_text(state: MarketPauseState, stale: bool) -> str:
                 when = since
         else:
             when = f"the {since[5:]} close"
-        head = f"ON since {when}: {state.reason}"
+        head = f"Short mode since {when}: {state.reason}"
     else:
-        head = f"OFF: {state.reason}"
+        head = f"Long mode: {state.reason}"
     text = f"{head} · last checked {_clock(state.checked_at)}"
     if stale:
         text += f" · market data is stale (last close check {_clock(state.last_close_check_at)})"

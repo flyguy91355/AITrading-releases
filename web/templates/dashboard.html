@@ -307,6 +307,11 @@ body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42vw;
 }
 .pause-pill:hover { background: rgba(59,130,246,0.24); }
+/* Long/short mode (2026-11-27): the pause rule is the mode switch. */
+.pause-pill.short { color: #f87171; background: rgba(239,68,68,0.14); border-color: rgba(239,68,68,0.6); }
+.pause-pill.short:hover { background: rgba(239,68,68,0.24); }
+.pause-pill.long { color: #4ade80; background: rgba(34,197,94,0.12); border-color: rgba(34,197,94,0.55); }
+.pause-pill.long:hover { background: rgba(34,197,94,0.22); }
 .pause-pill.stale { border-color: var(--yellow); }
 .mc-empty {
   position: absolute; inset: 0; z-index: 2; pointer-events: none; display: none;
@@ -856,7 +861,7 @@ tbody tr:hover { background: var(--bg-card-hover); }
     <!-- Market pause pill (2026-11-21 evening, owner request: "move the market pause line that goes
          all the way across the sceen to between the alpaca paper button and the info button").
          Filled by updateMarketPauseBanner(); the full reason is on hover; a click opens the graph. -->
-    <span id="marketPausePill" class="pause-pill" style="display:none;" onclick="openMarketChartWindow()">⏸ Market pause</span>
+    <span id="marketPausePill" class="pause-pill" style="display:none;" onclick="openMarketChartWindow()">Long / short mode</span>
   </div>
   <div class="header-right">
     <div id="aboutButton"
@@ -2023,8 +2028,16 @@ function _marketPauseCloseLabel(day) {
   return `${weekday} ${day.slice(5)}`;
 }
 function marketPauseBannerText(mp) {
-  if (!(mp && mp.enabled && mp.active)) return {show: false, title: '', detail: ''};
-  let title = '⏸ Market pause — auto-buys paused';
+  // Long/short mode (2026-11-27, owner: "instead of market pause,, should say like,, short mode or
+  // long mode"): the pause rule is the switch -- on = short mode, off (or switched off) = long mode.
+  if (!mp) return {show: false, title: '', detail: '', mode: ''};
+  if (!(mp.enabled && mp.active)) {
+    return {show: true, mode: 'long', title: '▲ Long mode',
+      detail: mp.enabled
+        ? 'Long mode: the dip-buyer buys and no new shorts open. Short mode starts at a market close when SPY is below its average and VIX is above the level.'
+        : 'Long mode: the long/short switch is off in Settings, so the dip-buyer buys and nothing is shorted.'};
+  }
+  let title = '▼ Short mode';
   const since = mp.since || '';
   if (since.includes('T')) {
     const p = _marketPauseEtParts(new Date(since));
@@ -2032,13 +2045,13 @@ function marketPauseBannerText(mp) {
   } else if (since) {
     title += ` since the ${_marketPauseCloseLabel(since)} close`;
   }
-  let detail = (mp.reason || '') + '. Clears at a market close when either recovers.';
+  let detail = (mp.reason || '') + '. The dip-buyer makes no new buys and the short mirror shorts. Back to long mode at a market close when either recovers.';
   const checked = mp.last_close_check_at || mp.checked_at;
   if (mp.stale && checked) {
     const p = _marketPauseEtParts(new Date(checked));
     detail += ` (market data last checked ${p.month}-${p.day})`;
   }
-  return {show: true, title, detail};
+  return {show: true, mode: 'short', title, detail};
 }
 // ── end Market pause banner helpers ──
 
@@ -2071,7 +2084,7 @@ function marketReadingsText(r) {
     vix: r.vix.toFixed(2), vixChange, vixAlert: r.vix > r.vix_level,
     spy: r.spy.toFixed(2), sma: r.spy_sma.toFixed(2), smaLabel, spyAlert: r.spy < r.spy_sma,
     tooltip: `Real VIX index and SPY from Yahoo, ${when}. `
-      + `Market pause: VIX above ${r.vix_level} and SPY below its ${smaLabel} average.`,
+      + `Short mode: VIX above ${r.vix_level} and SPY below its ${smaLabel} average.`,
   };
 }
 // ── end Market readings box helpers ──
@@ -2423,7 +2436,9 @@ function updateMarketPauseBanner(p) {
   const stale = !!(p.market_pause && p.market_pause.stale);
   pill.textContent = text.title + (stale ? ' · market data stale' : '');
   pill.classList.toggle('stale', stale);
-  pill.title = text.detail + ' Positions are still managed; manual buys are allowed. Click for the SPY/VIX graph.';
+  pill.classList.toggle('short', text.mode === 'short');
+  pill.classList.toggle('long', text.mode === 'long');
+  pill.title = text.detail + ' Positions on both sides run to their own exits; manual buys are allowed. Click for the SPY/VIX graph.';
   pill.style.display = 'inline-flex';
 }
 
@@ -4234,17 +4249,30 @@ let todayScanData = {};
 // is off (the default since that date), the On Deck view shows the dip-buyer's ranked
 // list for the next open instead -- see renderOnDeckView / renderDipGrid.
 let dipData = null;
+let shortData = null;
 
 async function fetchNearMiss() {
   try {
-    const [resp, dresp] = await Promise.all([
+    const [resp, dresp, sresp] = await Promise.all([
       fetch('/api/near-miss'),
       fetch('/api/stress-dip').catch(() => null),
+      fetch('/api/short-mirror').catch(() => null),
     ]);
     if (resp.ok) nearMissData = await resp.json();
     if (dresp && dresp.ok) dipData = await dresp.json();
+    if (sresp && sresp.ok) shortData = await sresp.json();
     if (_stockView === 'ondeck') renderOnDeckView();
+    else if (_stockView === 'todayscan' && _dipModeActive()) renderOnShoreView();
   } catch(e) { console.error('fetchNearMiss:', e); }
+}
+
+// Short mode (2026-11-27): the market pause rule is on and the short mirror is switched on.
+function _shortModeOn() {
+  return !!(shortData && shortData.enabled && shortData.short_mode);
+}
+
+function _shortListCount(sd) {
+  return Math.min(((sd && sd.candidates) || []).length, 25);
 }
 
 function _dipModeActive() {
@@ -4253,18 +4281,37 @@ function _dipModeActive() {
 
 // The one On Deck render entry point: the dip-buyer list while that strategy owns buying,
 // the old Claude-picked candidates otherwise.
+// Long/short mode (2026-11-27, owner: "the short list did not update the on shore list either"):
+// On Deck shows the list the current mode trades, On Shore the other mode's list.
 function renderOnDeckView() {
   const titleEl = document.getElementById('watchlistPanelTitle');
   if (_dipModeActive()) {
-    if (titleEl) titleEl.textContent = `On Deck — ${(dipData.candidates || []).length}`;
-    renderDipGrid(dipData);
+    if (_shortModeOn()) {
+      if (titleEl) titleEl.textContent = `On Deck — ${_shortListCount(shortData)} short`;
+      renderShortGrid(shortData, false);
+    } else {
+      if (titleEl) titleEl.textContent = `On Deck — ${(dipData.candidates || []).length}`;
+      renderDipGrid(dipData);
+    }
   } else {
     if (titleEl) titleEl.textContent = `On Deck — ${Object.keys(nearMissData).length}`;
     renderNearMissGrid(nearMissData);
   }
 }
 
+function renderOnShoreView() {
+  const titleEl = document.getElementById('watchlistPanelTitle');
+  if (_shortModeOn()) {
+    if (titleEl) titleEl.textContent = `On Shore — ${((dipData && dipData.candidates) || []).length} long`;
+    renderDipGrid(dipData || {}, true);
+  } else {
+    if (titleEl) titleEl.textContent = `On Shore — ${_shortListCount(shortData)} short`;
+    renderShortGrid(shortData || {}, true);
+  }
+}
+
 async function fetchTodayScan() {
+  if (_dipModeActive()) { if (_stockView === 'todayscan') renderOnShoreView(); return; }
   try {
     const resp = await fetch('/api/today-scan-rejects');
     if (!resp.ok) return;
@@ -4289,6 +4336,8 @@ function setStockView(view) {
   const titleEl = document.getElementById('watchlistPanelTitle');
   if (view === 'ondeck') {
     renderOnDeckView();
+  } else if (_dipModeActive()) {
+    renderOnShoreView();
   } else {
     if (titleEl) titleEl.textContent = `On Shore — ${Object.keys(todayScanData).length}`;
     // Immediate loading feedback (2026-07-19 fix) -- fetchTodayScan fetches a live quote per
@@ -4973,7 +5022,7 @@ function _dipEntriesDone(d) {
   return !!(d && d.entries_done_date && d.signal_date && d.entries_done_date > d.signal_date);
 }
 
-function _dipStatus(c, d) {
+function _dipStatus(c, d, waiting) {
   const st = ((d && d.status) || {})[c.ticker];
   if (st) {
     const map = {
@@ -4989,6 +5038,7 @@ function _dipStatus(c, d) {
     const tr = d.book[c.ticker].trail;
     return { label: 'HELD', color: 'var(--green)', reason: tr ? `Owned by the dip-buyer — trailing stop $${Number(tr).toFixed(2)}` : 'Owned by the dip-buyer' };
   }
+  if (waiting) return { label: 'WAITS', color: 'var(--text-muted)', reason: 'Buys only in long mode' };
   if (_dipEntriesDone(d)) return { label: '—', color: 'var(--text-muted)', reason: '' };
   return { label: 'QUEUED', color: 'var(--accent)', reason: 'Buys at the next open if Claude’s risk check passes' };
 }
@@ -4999,7 +5049,7 @@ function _dipDateLabel(iso) {
   return isNaN(dt) ? iso : dt.toLocaleDateString([], {month: 'numeric', day: 'numeric'});
 }
 
-function renderDipGrid(d) {
+function renderDipGrid(d, waiting) {
   const q = (document.getElementById('stockSearch').value || '').toLowerCase();
   const names = d.names || {};
   let items = (d.candidates || []).map((c, i) => Object.assign({}, c, { rank: i + 1, name: names[c.ticker] || '' }));
@@ -5007,9 +5057,9 @@ function renderDipGrid(d) {
   const vix = d.vix_close;
   const vixOk = vix != null && vix >= d.vix_min;
   const header = `<div class="dip-header">
-      <span>Dip-buyer list · ${_dipDateLabel(d.signal_date)} close</span>
+      <span>▲ Long list (dip-buyer) · ${_dipDateLabel(d.signal_date)} close</span>
       <span style="color:${vixOk ? 'var(--green)' : 'var(--text-muted)'};">VIX ${vix != null ? vix.toFixed(2) : '—'} ${vixOk ? `(≥ ${d.vix_min}, buying on)` : `(below ${d.vix_min}, no buys)`}</span>
-      <span>${_dipEntriesDone(d) ? 'Bought at the open' : 'Buys at the next open'}</span>
+      <span>${waiting ? 'Waits for long mode' : _dipEntriesDone(d) ? 'Bought at the open' : 'Buys at the next open'}</span>
     </div>`;
   if (items.length === 0) {
     const why = !d.signal_date ? 'Signals haven’t been computed yet (they run after each close).'
@@ -5022,7 +5072,7 @@ function renderDipGrid(d) {
     const stopPct = _dipStopPct(c, d);
     const above200 = c.sma200 ? 100 * (c.close / c.sma200 - 1) : null;
     const chg = c.change_3d_pct;
-    const st = _dipStatus(c, d);
+    const st = _dipStatus(c, d, waiting);
     return `<button class="stock-btn" id="${btnId(c.ticker)}" onclick="clickDipCandidate('${c.ticker}')">
       <span class="btn-header">
         <span class="btn-info">
@@ -5061,6 +5111,170 @@ function renderDipGrid(d) {
     const cap = document.getElementById('dipcap-' + c.ticker);
     if (cap && points && points.length >= 2) cap.textContent = `${_dipDateLabel(points[0].time)} → ${_dipDateLabel(points[points.length - 1].time)}`;
   });
+}
+
+// ── Short Mirror cards (2026-11-27) ──────────────────────────────────────────
+// The dip cards turned upside down: the short list (src/strategy/short_mirror.py), with what
+// happened to each at the open (shorted / vetoed / skipped / no slot / covered) and the open shorts.
+function _shortStopPct(c, sd) {
+  const lo = (sd && sd.stop_min_pct) || 3, hi = (sd && sd.stop_max_pct) || 15;
+  if (!c || !c.atr || !c.close) return hi;
+  return Math.min(Math.max(100 * 3 * c.atr / c.close, lo), hi);
+}
+
+function _shortStatus(c, sd, waiting) {
+  const b = sd && sd.book && sd.book[c.ticker];
+  if (b) {
+    const pnl = Number(b.unrealized_pnl || 0);
+    return { label: 'SHORT', color: 'var(--red)',
+      reason: `Short ${b.qty} @ $${Number(b.entry_price).toFixed(2)} — buy stop $${Number(b.stop).toFixed(2)} · P&L ${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)}` };
+  }
+  const st = ((sd && sd.status) || {})[c.ticker];
+  if (st) {
+    const map = {
+      shorted: ['SHORTED', 'var(--red)'],
+      vetoed:  ['VETOED', 'var(--amber, #f59e0b)'],
+      skipped: ['SKIPPED', 'var(--text-muted)'],
+      waiting: ['NO SLOT', 'var(--text-muted)'],
+      covered: ['COVERED', 'var(--accent)'],
+    };
+    const [label, color] = map[st.status] || [String(st.status || '').toUpperCase(), 'var(--text-muted)'];
+    return { label, color, reason: st.reason || '' };
+  }
+  if (waiting) return { label: 'WAITS', color: 'var(--text-muted)', reason: 'Shorts only in short mode' };
+  if (_dipEntriesDone(sd)) return { label: '—', color: 'var(--text-muted)', reason: '' };
+  return { label: 'QUEUED', color: 'var(--accent)', reason: 'Shorts at the next open if Claude’s risk check passes' };
+}
+
+function renderShortGrid(sd, waiting) {
+  const q = (document.getElementById('stockSearch').value || '').toLowerCase();
+  const cands = (sd.candidates || []).slice(0, 25);
+  const listed = new Set(cands.map(c => c.ticker));
+  // Open shorts from earlier days that aren't on today's list still get a card.
+  const held = Object.entries(sd.book || {}).filter(([t]) => !listed.has(t)).map(([t, b]) => ({
+    ticker: t, company: b.company || '', close: b.entry_price, rsi2: b.rsi2, atr: b.atr, held: true }));
+  let items = held.concat(cands).map((c, i) => Object.assign({}, c, { rank: i + 1, name: c.company || '' }));
+  if (q) items = items.filter(c => c.ticker.toLowerCase().includes(q) || c.name.toLowerCase().includes(q));
+  const vix = sd.vix_close;
+  const vixOk = vix != null && vix >= (sd.vix_min || 20);
+  const header = `<div class="dip-header">
+      <span style="color:#f87171;">▼ Short list (short mirror) · ${_dipDateLabel(sd.signal_date)} close</span>
+      <span style="color:${vixOk ? 'var(--green)' : 'var(--text-muted)'};">VIX ${vix != null ? vix.toFixed(2) : '—'} ${vixOk ? `(≥ ${sd.vix_min || 20})` : `(below ${sd.vix_min || 20}, no shorts)`}</span>
+      <span>${waiting ? 'Waits for short mode' : _dipEntriesDone(sd) ? 'Shorted at the open' : 'Shorts at the next open'}</span>
+    </div>`;
+  if (items.length === 0) {
+    const why = !sd.signal_date ? 'The short list hasn’t been computed yet (it runs after each close).'
+      : !vixOk ? `VIX closed below ${sd.vix_min || 20} — the short mirror only shorts in stressed markets.`
+      : `No stock met the rules at the last close: below its 200-day average, 2-day RSI over ${sd.rsi2_min || 90}, $20M+ daily volume.`;
+    setStockGridHtml(`<div class="stock-col">${header}<div style="color:var(--text-muted);padding:20px;text-align:center;font-size:12px;">${q ? 'No match for that search.' : why}</div></div>`);
+    return;
+  }
+  const card = c => {
+    const stopPct = _shortStopPct(c, sd);
+    const vs200 = c.sma200 ? 100 * (c.close / c.sma200 - 1) : null;
+    const chg = c.change_3d_pct;
+    const st = _shortStatus(c, sd, waiting);
+    const exd = c.ex_dividend_date && c.ex_dividend_date >= new Date().toISOString().slice(0, 10) ? c.ex_dividend_date : '';
+    return `<button class="stock-btn" id="${btnId(c.ticker)}" onclick="clickShortCandidate('${c.ticker}')">
+      <span class="btn-header">
+        <span class="btn-info">
+          <span class="btn-title-row">
+            <span class="btn-rank">#${c.rank}</span>
+            <span class="btn-ticker">${c.ticker}</span>
+            <span class="btn-name">${c.name}</span>
+          </span>
+          <span class="btn-conv-sig-row">
+            <span class="btn-conv-rr-stack">
+              <span style="font-size:13px;font-weight:700;color:var(--text-primary);">RSI(2) ${(c.rsi2 ?? 0).toFixed(1)}</span>
+              <span style="font-size:13px;font-weight:700;color:var(--text-primary);">3-day ${chg != null ? (chg >= 0 ? '+' : '') + chg.toFixed(1) + '%' : (c.held ? 'held' : '—')}</span>
+            </span>
+            <span class="btn-sig-stack">
+              <span class="btn-sig-code" style="color:${st.color};border-color:${st.color};">${st.label}</span>
+              <span style="font-size:9px;color:var(--text-muted);">stop ≈ +${stopPct.toFixed(1)}%</span>
+            </span>
+          </span>
+          <span class="btn-meta">${c.held ? 'Shorted' : 'Close'} $${(c.close || 0).toFixed(2)} · covers under its 5-day average</span>
+          <span class="btn-meta-wrap">${[c.sector || '', vs200 != null ? `${vs200.toFixed(1)}% vs 200-day` : '', c.dollar_volume ? `$${(c.dollar_volume / 1e6).toFixed(0)}M/day` : '', c.earnings_date ? `Earnings ${_dipDateLabel(c.earnings_date)}` : '', exd ? `Ex-div ${_dipDateLabel(exd)}` : ''].filter(Boolean).join(' · ')}</span>
+        </span>
+        <span class="btn-side-col">
+          <span class="btn-chart-box" id="rrspark-${c.ticker}"></span>
+          <span class="btn-chart-box-caption" id="dipcap-${c.ticker}"></span>
+        </span>
+      </span>
+      ${st.reason ? `<span class="btn-desc-block"><span class="btn-thesis">${st.reason}</span></span>` : ''}
+    </button>`;
+  };
+  setStockGridHtml(`<div class="stock-col">${header}${items.map(card).join('')}</div>`);
+  items.forEach(async c => {
+    const points = await _getCardCandlePoints(c.ticker);
+    const el = document.getElementById('rrspark-' + c.ticker);
+    if (!el) return;
+    renderCardCandleLWC(el, points);
+    const cap = document.getElementById('dipcap-' + c.ticker);
+    if (cap && points && points.length >= 2) cap.textContent = `${_dipDateLabel(points[0].time)} → ${_dipDateLabel(points[points.length - 1].time)}`;
+  });
+}
+
+// Chart popup for a short-list card: the same shell as the dip popup, with the buy stop ABOVE.
+async function clickShortCandidate(ticker) {
+  const sd = shortData || {};
+  let c = (sd.candidates || []).find(x => x.ticker === ticker);
+  const b = (sd.book || {})[ticker];
+  if (!c && b) c = { ticker, company: b.company || '', close: b.entry_price, rsi2: b.rsi2, atr: b.atr, date: b.entry_date };
+  if (!c) return clickStock(ticker);
+  _ddModalCurrentTicker = ticker;
+  const body = document.getElementById('ddModalBody');
+  disposeChartsIn(body);
+  document.getElementById('ddRunDiveBtn').style.display = '';
+  document.getElementById('ddRerunBtn').style.display = 'none';
+  document.getElementById('ddDiveAgainBtn').style.display = 'none';
+  document.getElementById('ddModalTicker').textContent = `▼ ${ticker}${c.company ? ' — ' + c.company : ''} · Short mirror`;
+  document.getElementById('ddModalBizSummary').innerHTML = '';
+  const stopPct = _shortStopPct(c, sd);
+  const stopPx = b ? Number(b.stop) : c.close * (1 + stopPct / 100);
+  const vs200 = c.sma200 ? 100 * (c.close / c.sma200 - 1) : null;
+  const st = _shortStatus(c, sd, !_shortModeOn());
+  const chip = (label, val, color) => `<span style="background:var(--bg-card);border:1px solid ${color || 'var(--border)'};${color ? 'color:' + color + ';' : ''}padding:4px 10px;border-radius:6px;font-size:12px;">${label} <strong>${val}</strong></span>`;
+  body.innerHTML = `
+    <div style="margin-bottom:14px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px;justify-content:space-between;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;">Price Chart</div>
+          <div id="ddCandleLegend" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+        </div>
+        <div style="font-size:10px;color:var(--accent);cursor:pointer;" onclick="openDeepDiveChartExpand('${ticker}')">⤢ Expand</div>
+      </div>
+      <div id="ddCandleChart" style="width:100%;height:280px;border-radius:6px;overflow:hidden;cursor:pointer;" onclick="openDeepDiveChartExpand('${ticker}')"></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
+      <span style="border:1px solid ${st.color};color:${st.color};padding:4px 12px;border-radius:6px;font-size:13px;font-weight:700;">${st.label}</span>
+      <span style="color:var(--text-muted);font-size:12px;">${st.reason}</span>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+      ${chip('RSI(2)', (c.rsi2 ?? 0).toFixed(1))}
+      ${chip('3-day', c.change_3d_pct != null ? (c.change_3d_pct >= 0 ? '+' : '') + c.change_3d_pct.toFixed(1) + '%' : '—')}
+      ${chip((b ? 'Shorted ' : 'Close ') + _dipDateLabel(c.date), '$' + (c.close || 0).toFixed(2))}
+      ${chip('vs 200-day', vs200 != null ? vs200.toFixed(1) + '%' : '—')}
+      ${chip('VIX', sd.vix_close != null ? sd.vix_close.toFixed(2) : '—')}
+      ${chip('Buy stop ≈', '$' + stopPx.toFixed(2) + ' (+' + stopPct.toFixed(1) + '%)', '#ef4444')}
+      ${c.ex_dividend_date && c.ex_dividend_date >= new Date().toISOString().slice(0, 10) ? chip('Ex-div', _dipDateLabel(c.ex_dividend_date)) : ''}
+    </div>
+    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;">
+      <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Why it's on the list</div>
+      <div style="font-size:13px;color:var(--text-primary);line-height:1.5;">It closed below its 200-day average (a long-term downtrend) after a sharp 2–3 day bounce (2-day RSI over ${sd.rsi2_min || 90}), on a day VIX closed at ${sd.vix_min || 20} or higher. In short mode the short mirror sells it short at the next open after Claude checks for red flags (a buyout, a squeeze setup, good news behind the bounce); stocks hard to borrow, with earnings within 2 days or an ex-dividend date within 14 days are skipped. It covers on the first close under the 5-day average or after ${sd.max_hold_sessions || 10} trading days. The buy stop is 3×ATR above the short price, kept between ${sd.stop_min_pct || 3}% and ${sd.stop_max_pct || 15}%.</div>
+    </div>`;
+  document.querySelector('#deepDiveModal .trade-modal').style.width = '760px';
+  document.getElementById('deepDiveModal').classList.add('active');
+  try {
+    const resp = await fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`);
+    const data = await resp.json();
+    if (ticker !== _ddModalCurrentTicker) return;
+    if (data.points && data.points.length >= 2) {
+      renderDetailedStockChart('ddCandleChart', 'ddCandleLegend', data.points, data.technicals,
+        { stop: stopPx, takeProfits: [] });
+    }
+  } catch (e) { console.error('clickShortCandidate chart:', ticker, e); }
+  appendTradingViewChart(ticker);
 }
 
 // Chart popup for a dip-buyer card -- the shared #deepDiveModal shell (so it gets the same
@@ -7265,7 +7479,7 @@ async function submitManualBuy() {
     // pause blocks automatic buys, never a manual one, so Confirm still works.
     const pauseNote = data.market_pause_warning
       ? `<div style="margin-top:8px;padding:8px 10px;background:#78350f;border:1px solid #d97706;border-radius:6px;color:#fde68a;">`
-        + `⏸ <strong>Market pause is on</strong> — ${data.market_pause_warning}. Buy anyway?</div>`
+        + `▼ <strong>Short mode is on</strong> — ${data.market_pause_warning}. Buy anyway?</div>`
       : '';
     resultEl.style.color = 'var(--text-primary)';
     resultEl.innerHTML = `<strong>${data.ticker}</strong> @ $${data.price?.toFixed(2)} &nbsp;|&nbsp; ${data.shares} shares &nbsp;|&nbsp; $${data.dollars?.toFixed(2)}${cappedNote}<br>Stop: $${data.stop_loss?.toFixed(2)} &nbsp;|&nbsp; T1: $${data.targets?.[0]?.toFixed(2)} &nbsp;T2: $${data.targets?.[1]?.toFixed(2)} &nbsp;T3: $${data.targets?.[2]?.toFixed(2)}${earningsNote}${pauseNote}`;

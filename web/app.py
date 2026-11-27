@@ -6970,15 +6970,18 @@ class DashboardState:
         await asyncio.to_thread(_save_market_pause_state, _market_pause_to_dict(new))
         if new.active == old.active or not self._market_pause_cfg().enabled:
             return
+        # Long/short mode wording (2026-11-27, owner: "instead of market pause,, should say like,,
+        # short mode or long mode").
         if new.active:
-            text = (f"Market pause ON — auto-buys paused: {new.reason}. "
-                    "Clears at a market close when either recovers.")
+            text = (f"SHORT MODE — {new.reason}. The dip-buyer stops buying and the short mirror shorts. "
+                    "Back to long mode at a market close when either recovers.")
         else:
-            text = f"Market pause OFF — {new.reason} at the {new.last_close_date} close; auto-buys resume."
+            text = (f"LONG MODE — {new.reason} at the {new.last_close_date} close. The dip-buyer buys again; "
+                    "no new shorts.")
         entry = self.add_ai_log("SYSTEM", "MARKET", text, "warning" if new.active else "success")
         await self.broadcast({"type": "ai_log", "entry": entry})
         asyncio.create_task(_notify(
-            "Market pause ON" if new.active else "Market pause OFF", text, priority="default"))
+            "Short mode on" if new.active else "Long mode on", text, priority="default"))
         await self.broadcast({"type": "portfolio", "portfolio": self.get_portfolio_snapshot()})
 
     async def market_pause_loop(self) -> None:
@@ -7218,7 +7221,7 @@ class DashboardState:
         self._short_state["entries_done_date"] = today
         await asyncio.to_thread(_save_short_mirror_state, dict(self._short_state))
         if not self._market_pause_active():
-            await self._sm_log("Short mirror: long mode (the market pause is off) -- no shorts today")
+            await self._sm_log("Short mirror: long mode -- no shorts today")
             return
         cands = list(self._short_state.get("candidates") or [])
         vix = self._short_state.get("vix_close")
@@ -7948,15 +7951,15 @@ class DashboardState:
         # drop -47% -> -19% (2005-15) and -26% -> -9% (2016-26); 2.1 -> 2.3%/yr and
         # 9.1 -> 7.5%/yr. _market_pause_active() is False whenever the pause is switched off.
         if self._market_pause_active():
-            why = self.market_pause.reason or "the market pause is on"
+            why = self.market_pause.reason or "SPY under its average, VIX high"
             now_iso = datetime.now().isoformat(timespec="seconds")
             statuses = self._stress_dip_state.setdefault("status", {})
             for c in cands:
                 if c["ticker"] not in self.portfolio.positions:
                     statuses[c["ticker"]] = {"status": "skipped", "at": now_iso,
-                                             "reason": f"Short mode -- no dip buys while the market pause is on ({why})"}
+                                             "reason": f"Short mode -- the dip-buyer buys only in long mode ({why})"}
             await asyncio.to_thread(_save_stress_dip_state, dict(self._stress_dip_state))
-            await self._sd_log(f"Dip-buyer: short mode -- market pause is on ({why}); no buys today, "
+            await self._sd_log(f"Dip-buyer: short mode ({why}) -- no buys today, "
                                f"{len(cands)} candidate(s) skipped", "warning")
             return
         if sdip.drawdown_halted(self.portfolio.total_value, self.portfolio.peak_value, cfg.drawdown_halt_pct):
@@ -11726,7 +11729,7 @@ async def save_settings(payload: dict):
         asyncio.create_task(state._market_pause_close_check(force=True))
     if _mp_cfg_after.enabled and not _mp_cfg_before.enabled and state.market_pause.active:
         _mp_entry = state.add_ai_log("SYSTEM", "MARKET",
-            f"Market pause re-enabled — auto-buys paused: {state.market_pause.reason}", "warning")
+            f"Long/short switch on — SHORT MODE: {state.market_pause.reason}", "warning")
         await state.broadcast({"type": "ai_log", "entry": _mp_entry})
     if _mp_cfg_after != _mp_cfg_before:
         await state.broadcast({"type": "portfolio", "portfolio": state.get_portfolio_snapshot()})

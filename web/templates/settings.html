@@ -608,15 +608,15 @@ input[type=time].setting-input { font-family: monospace; }
        docs/superpowers/specs/2026-11-21-market-buy-pause-design.md. The template's cfg values
        here are never missing: settings_page() fills in the code defaults first. -->
   <div class="section">
-    <div class="section-title">Market Pause</div>
+    <div class="section-title">Long / Short Mode</div>
     <div class="setting-desc" style="margin:0 0 12px;">
       Status: <strong>{{ market_pause_status }}</strong>
     </div>
     <div class="settings-grid">
       <div class="setting-row">
         <div>
-          <div class="setting-label">Market Pause <button type="button" class="info-btn" onclick="showInfo(event,'Pauses automatic buys while SPY closes below its N-day average and VIX closes above the level. Backtested 2005-now: much smaller crash losses; costs some dip-buys in choppy years. Stops, take-profits, scans and manual buys are unaffected. On by default since 2026-11-27: it is the long/short mode switch, and the dip-buyer makes no new buys while it is on.')">i</button></div>
-          <div class="setting-desc">Pause automatic buys during a falling, fearful market (short mode: no dip-buyer buys)</div>
+          <div class="setting-label">Long / Short Mode Switch <button type="button" class="info-btn" onclick="showInfo(event,'Short mode while SPY closes below its N-day average and VIX closes above the level; long mode otherwise. In short mode the dip-buyer makes no new buys and the short mirror shorts; in long mode the dip-buyer buys and no new shorts open. Positions on both sides run to their own exits when the mode changes. Disabled = always long mode. Backtested 2005-now: much smaller crash losses for the dip-buyer. Manual buys are unaffected.')">i</button></div>
+          <div class="setting-desc">Short mode in a falling, fearful market (no dip buys, the short mirror shorts); long mode otherwise</div>
         </div>
         <select class="setting-input" name="risk_management.market_pause_enabled">
           <option value="true" {% if cfg.risk_management.market_pause_enabled %}selected{% endif %}>Enabled</option>
