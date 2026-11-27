@@ -13,6 +13,7 @@ from src.decision.portfolio import Portfolio, Position
 # The project's single shared "is this price a real, finite number" guard
 # (GitHub #85). Pure/stdlib-only module, no circular-import risk from execution.
 from src.analytics.composition_benchmark import is_usable_price
+from src.strategy.short_mirror import short_liability as _short_liability
 
 logger = logging.getLogger(__name__)
 
@@ -1161,6 +1162,12 @@ class OrderManager:
             t3_mult = 1 + tp_cfg.get("t3_pct", 17.0) / 100
 
             positions = await self.broker.get_positions()
+            # Short Mirror (2026-11-27): short positions (negative shares) belong to the short
+            # book in web/app.py, never to the long side -- adopting one here would give it a
+            # SELL stop that ADDS to the short. Record what they owe (Portfolio.total_value
+            # nets it out of Alpaca's cash, which holds the short proceeds), then drop them.
+            self.portfolio.short_liability = _short_liability(positions)
+            positions = [p for p in positions if p["shares"] >= 0]
             for p in positions:
                 if p["ticker"] in self.portfolio.positions:
                     # Loaded from DB — update live price and actual share count, then persist
@@ -1872,7 +1879,9 @@ class OrderManager:
                     self.portfolio.cash = account.cash
                     alpaca_positions = await self.broker.get_positions()
                     for ap in alpaca_positions:
-                        if ap["ticker"] == signal.ticker and signal.ticker in self.portfolio.positions:
+                        # ap["shares"] >= 0: a short (negative) is the short mirror's, never a long's count.
+                        if (ap["ticker"] == signal.ticker and signal.ticker in self.portfolio.positions
+                                and ap["shares"] >= 0):
                             self.portfolio.positions[signal.ticker].shares = ap["shares"]
                             await self.portfolio._save_position(self.portfolio.positions[signal.ticker])
                             break
@@ -2731,6 +2740,12 @@ class OrderManager:
             return closed_reports
         try:
             positions = await self.broker.get_positions()
+            # Short Mirror (2026-11-27): short positions (negative shares) belong to the short
+            # book in web/app.py, never to the long side -- adopting one here would give it a
+            # SELL stop that ADDS to the short. Record what they owe (Portfolio.total_value
+            # nets it out of Alpaca's cash, which holds the short proceeds), then drop them.
+            self.portfolio.short_liability = _short_liability(positions)
+            positions = [p for p in positions if p["shares"] >= 0]
             alpaca_tickers = {p["ticker"] for p in positions}
 
             shares_corrected = False

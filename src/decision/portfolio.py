@@ -293,6 +293,12 @@ class Portfolio:
         self.initial_capital = config["portfolio"]["initial_capital"]
         self.cash = self.initial_capital
         self.positions: dict[str, Position] = {}
+        # Short Mirror (2026-11-27): what the account's SHORT positions owe at market (sum of
+        # |market value|). Shorts never enter self.positions, but Alpaca's cash includes their
+        # sale proceeds, so total_value must subtract this or the account looks richer than it
+        # is (inflated slots, a phantom peak_value). Set from the broker's positions fetch in
+        # OrderManager._sync_portfolio / update_positions (src/strategy/short_mirror.short_liability).
+        self.short_liability: float = 0.0
         self.peak_value = self.initial_capital
         self.day_start_value = self.initial_capital
         # Which calendar date (YYYY-MM-DD, ET) day_start_value was last snapshotted for
@@ -308,6 +314,11 @@ class Portfolio:
         # during this window the sold position and its replacement can be briefly
         # double-counted in total_value, so update_peak() must not ratchet on it.
         self._rotation_in_progress = False
+        # Short Mirror (2026-11-27): while a short is being opened or covered, Alpaca's cash
+        # (which holds short proceeds) and short_liability can be read at different moments,
+        # so total_value is briefly off by the order's size -- update_peak() must not ratchet
+        # on it. The short mirror sets this a minute ahead around every short order.
+        self._peak_hold_until: datetime | None = None
         self.db_path = config.get("database", {}).get("path", "data/aitrading.db")
         self._db: aiosqlite.Connection | None = None
         # Most recent LOSING sale's timestamp per ticker (2026-07-27, wash-sale rebuy
@@ -321,7 +332,7 @@ class Portfolio:
     @property
     def total_value(self) -> float:
         positions_value = sum(p.market_value for p in self.positions.values())
-        return self.cash + positions_value
+        return self.cash + positions_value - (getattr(self, "short_liability", 0.0) or 0.0)
 
     @property
     def total_pnl(self) -> float:
@@ -337,7 +348,7 @@ class Portfolio:
     def cash_pct(self) -> float:
         if self.total_value == 0:
             return 0.0
-        return (self.cash / self.total_value) * 100
+        return ((self.cash - (getattr(self, "short_liability", 0.0) or 0.0)) / self.total_value) * 100
 
     @property
     def day_pnl(self) -> float:
@@ -876,6 +887,9 @@ class Portfolio:
         # rotation swap's sell execution — a second, previously-unguarded path that let
         # peak_value ratchet on a transiently double-counted total_value (see RS-1).
         if self._rotation_in_progress:
+            return
+        hold = getattr(self, "_peak_hold_until", None)
+        if hold is not None and datetime.now() < hold:
             return
         if self.total_value > self.peak_value:
             self.peak_value = self.total_value

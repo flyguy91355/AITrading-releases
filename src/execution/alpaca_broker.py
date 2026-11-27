@@ -325,6 +325,24 @@ class AlpacaBroker(Broker):
             logger.warning("Failed to replace Alpaca order %s: %s", broker_order_id, e)
             return None
 
+    async def get_asset_flags(self, ticker: str) -> dict:
+        """Short Mirror (2026-11-27): GET /v2/assets/{symbol} -- tradable / shortable /
+        easy_to_borrow (Alpaca docs: ETB shorts follow the standard path with $0 borrow fees;
+        hard-to-borrow needs a locate, which paper accounts can't get). Read-only; raises on
+        a failed lookup (the caller treats that as 'don't short')."""
+        a = await self._call_with_rate_limit_retry(self.api.get_asset, ticker)
+        return {
+            "tradable": bool(getattr(a, "tradable", False)),
+            "shortable": bool(getattr(a, "shortable", False)),
+            "easy_to_borrow": bool(getattr(a, "easy_to_borrow", False)),
+        }
+
+    async def get_shorting_enabled(self) -> bool:
+        """Short Mirror: the account's shorting_enabled flag (False when the account is in
+        long-only mode, Alpaca's no_shorting configuration). Read-only."""
+        a = await self._call_with_rate_limit_retry(self.api.get_account)
+        return bool(getattr(a, "shorting_enabled", False))
+
     async def get_order_status(self, broker_order_id: str) -> Order:
         result = await self._call_with_rate_limit_retry(self.api.get_order, broker_order_id)
 

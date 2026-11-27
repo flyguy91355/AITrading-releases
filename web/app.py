@@ -132,8 +132,10 @@ from src.decision.market_pause import (
     to_dict as _market_pause_to_dict,
 )
 import src.strategy.stress_dip as sdip
+import src.strategy.short_mirror as smir
 from src.execution.order_manager import OrderManager, _is_regular_trading_hours
 from src.execution.broker import OrderStatus
+from src.execution.broker import Order as _BrokerOrder, OrderSide as _OrderSide, OrderType as _OrderType
 from src.reporting.trade_logger import TradeLogger
 from src.utils.watchlist_manager import WatchlistManager
 from src.data.stock_universe import get_universe
@@ -1524,6 +1526,41 @@ def _append_stress_dip_veto_log(rec: dict) -> None:
         logger.warning("Failed to append stress dip veto log: %s", e)
 
 
+_SHORT_MIRROR_STATE_PATH = Path("data/short_mirror_state.json")
+_SHORT_MIRROR_BOOK_PATH = Path("data/short_mirror_book.json")
+_SHORT_MIRROR_VETO_LOG_PATH = Path("data/short_mirror_veto_log.jsonl")
+_SHORT_MIRROR_TRADES_PATH = Path("data/short_mirror_trades.jsonl")
+
+
+def _save_short_mirror_state(d: dict) -> None:
+    _atomic_write_json(_SHORT_MIRROR_STATE_PATH, d, "short mirror state", default=str)
+
+
+def _save_short_mirror_book(d: dict) -> None:
+    _atomic_write_json(_SHORT_MIRROR_BOOK_PATH, d, "short mirror book", default=str)
+
+
+def _load_short_mirror_json(path: Path, label: str) -> dict:
+    try:
+        if path.exists():
+            d = json.loads(path.read_text(encoding="utf-8"))
+            return d if isinstance(d, dict) else {}
+    except Exception as e:
+        logger.warning("Failed to load %s: %s", label, e)
+    return {}
+
+
+def _append_short_mirror_jsonl(path: Path, rec: dict) -> None:
+    """Append-only JSONL (veto checks, and one line per short opened / covered -- kept apart
+    from the long trade log, which the tax package and benchmark read)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except Exception as e:
+        logger.warning("Failed to append %s: %s", path, e)
+
+
 def _sd_download_rows(tickers: list[str], period: str, chunk: int = 100):
     """Yields (ticker, rows) from Yahoo daily bars (split/dividend adjusted, the same basis
     as the research), rows oldest first as {date, open, high, low, close, volume}.
@@ -1601,7 +1638,7 @@ def _sd_recent_highs(tickers: list[str]) -> dict[str, list[tuple[str, float]]]:
 def _sd_ticker_facts(ticker: str) -> dict:
     """Sector, company name and next earnings date (YYYY-MM-DD, or "") from Yahoo, for the
     sector-concentration gate and the Claude veto prompt. Never raises."""
-    out = {"sector": "", "company": ticker, "earnings_date": ""}
+    out = {"sector": "", "company": ticker, "earnings_date": "", "ex_dividend_date": ""}
     try:
         import yfinance as yf
         tk = yf.Ticker(ticker.replace(".", "-"))
@@ -1619,6 +1656,12 @@ def _sd_ticker_facts(ticker: str) -> dict:
                             if isinstance(d, date) and d >= today)
             if future:
                 out["earnings_date"] = future[0].isoformat()
+            # Short Mirror: the next (or latest announced) ex-dividend date -- a short owes the
+            # dividend, and the owner wants no dividend exposure ("i dont want any dividened stocks").
+            exd = cal.get("Ex-Dividend Date") if isinstance(cal, dict) else None
+            exd = exd.date() if hasattr(exd, "date") else exd
+            if isinstance(exd, date):
+                out["ex_dividend_date"] = exd.isoformat()
         except Exception:
             pass
     except Exception:
@@ -2179,6 +2222,16 @@ class DashboardState:
         self._stress_dip_refresh_retry_at: datetime | None = None
         self._stress_dip_exit_closes: dict = {}
         self._stress_dip_trail_retry_at: datetime | None = None
+        # Short Mirror (2026-11-27) -- short mode's own state, book and in-flight sets.
+        self._short_state: dict = {}
+        self._short_book: dict = {}
+        self._short_refresh_in_progress = False
+        self._short_refresh_retry_at: datetime | None = None
+        self._short_exit_closes: dict = {}
+        self._short_opening: set = set()
+        self._short_covering: set = set()
+        self._short_unknown_seen: dict = {}
+        self._short_logged: set = set()
         self._stress_dip_logged: set[str] = set()
         self._market_live_readings: MarketReadings | None = None
         # The dashboard market graph's source (2026-11-21): the close check's own finished
@@ -2514,7 +2567,9 @@ class DashboardState:
         week_number = self._now_et().date().isocalendar()[1]
         return {
             "total_value": round(p.total_value, 2),
-            "cash": round(p.cash, 2),
+            # Net of what open shorts owe (Short Mirror): Alpaca's cash holds their proceeds.
+            "cash": round(p.cash - (p.short_liability or 0.0), 2),
+            "short_liability": round(p.short_liability or 0.0, 2),
             "cash_pct": round(p.cash_pct, 1),
             "day_pnl": round(p.day_pnl, 2),
             "day_pnl_pct": round((p.day_pnl / p.day_start_value * 100) if p.day_start_value else 0, 2),
@@ -4998,7 +5053,8 @@ class DashboardState:
         legacy = [
             (p["ticker"], p["shares"], p["market_value"])
             for p in all_positions
-            if p["shares"] == int(p["shares"])
+            # p["shares"] >= 0: a short mirror position (negative, whole shares) is not legacy.
+            if p["shares"] >= 0 and p["shares"] == int(p["shares"])
         ]
 
         if not legacy:
@@ -6664,7 +6720,10 @@ class DashboardState:
         minus both in-flight promotion reservations and accepted-but-unsettled buys.
         Every buy path's cash gate reads this so no two paths can spend the same
         dollars (2026-09-01, full-codebase review)."""
-        return self.portfolio.cash - self._reserved_cash - self._pending_buy_commitment()
+        # minus short_liability (Short Mirror, 2026-11-27): Alpaca's cash holds the short-sale
+        # proceeds, which long buys must never spend.
+        return (self.portfolio.cash - self._reserved_cash - self._pending_buy_commitment()
+                - (getattr(self.portfolio, "short_liability", 0.0) or 0.0))
 
     def _register_pending_buy(self, ticker: str, amount: float) -> None:
         """Hold `amount` committed until this ticker's fill is reconciled. Called right
@@ -6993,6 +7052,656 @@ class DashboardState:
     # days, sector concentration, real cash above the reserve floor, and a fail-closed
     # Claude veto on every buy.
 
+    # ── Short Mirror (2026-11-27) ─────────────────────────────────────────────────
+    # Short mode: while the market pause is on, short individual stocks by the dip-buyer's
+    # rules mirrored (src/strategy/short_mirror.py; design
+    # docs/superpowers/specs/2026-11-27-short-mirror-design.md). Owner: "turn the pause back
+    # on and use it to decide if were in a long or short mode", "Stock-by-stock mirror",
+    # "Build it in AITrading", "make this happen for todays open". Shorts NEVER enter
+    # self.portfolio.positions: OrderManager drops negative-share positions from both of its
+    # syncs and sets portfolio.short_liability, so no long-side code can touch them.
+
+    def _short_cfg(self) -> "smir.ShortMirrorConfig":
+        return smir.short_mirror_cfg(self.config.get("short_mirror"))
+
+    async def _sm_log(self, msg: str, level: str = "info", ticker: str = "SYSTEM",
+                      once_key: str | None = None) -> None:
+        """AI-feed line under the SHORT phase; once_key makes it one-shot per key."""
+        if once_key is not None:
+            if once_key in self._short_logged:
+                return
+            self._short_logged.add(once_key)
+            if len(self._short_logged) > 500:
+                self._short_logged.clear()
+        entry = self.add_ai_log(ticker, "SHORT", msg, level)
+        await self.broadcast({"type": "ai_log", "entry": entry})
+
+    async def _sm_mark(self, ticker: str, status: str, reason: str, level: str = "warning") -> None:
+        self._short_state.setdefault("status", {})[ticker] = {
+            "status": status, "reason": reason, "at": datetime.now().isoformat(timespec="seconds")}
+        await self._sm_log(f"Claude vetoed the short: {reason}" if status == "vetoed" else reason, level, ticker=ticker)
+
+    def _short_is_paper(self) -> bool:
+        return bool(getattr(getattr(self.order_manager, "broker", None), "paper", True))
+
+    def short_mirror_snapshot(self) -> dict:
+        cfg = self._short_cfg()
+        st = self._short_state or {}
+        return {
+            "enabled": cfg.enabled, "short_mode": self._market_pause_active(), "slots": cfg.slots,
+            "rsi2_min": cfg.rsi2_min, "vix_min": cfg.vix_min, "max_hold_sessions": cfg.max_hold_sessions,
+            "stop_min_pct": cfg.stop_min_pct, "stop_max_pct": cfg.stop_max_pct,
+            "signal_date": st.get("signal_date"), "vix_close": st.get("vix_close"),
+            "computed_at": st.get("computed_at"), "entries_done_date": st.get("entries_done_date"),
+            "last_error": st.get("last_error"), "candidates": st.get("candidates") or [],
+            "status": st.get("status") or {}, "book": dict(self._short_book),
+            "short_liability": round(self.portfolio.short_liability or 0.0, 2),
+        }
+
+    async def short_mirror_loop(self) -> None:
+        """30s tick. Signals once the latest session is final; entries right after the open
+        while the market pause is on (short mode); every tick, protect and reconcile the open
+        shorts and catch any short the mirror didn't open; covers in the last minutes before
+        the real close. While Paused it still protects and covers (position protection, no AI
+        spend); entries need the system running. short_mirror.enabled stops NEW shorts only --
+        open ones are always managed."""
+        logger.info("Short mirror loop started")
+        while True:
+            await asyncio.sleep(30)
+            try:
+                if self.stopped:
+                    continue
+                cfg = self._short_cfg()
+                try:
+                    sessions = await self._stress_dip_sessions()
+                except Exception:
+                    continue
+                if not sessions:
+                    continue
+                now = self._now_et()
+                today, hhmm = now.date().isoformat(), now.strftime("%H:%M")
+
+                if cfg.enabled:
+                    want = sdip.last_completed_session(sessions, today, hhmm)
+                    if (want and self._short_state.get("signal_date") != want
+                            and not self._short_refresh_in_progress
+                            and not self._stress_dip_refresh_in_progress
+                            and (self._short_refresh_retry_at is None
+                                 or datetime.now() >= self._short_refresh_retry_at)):
+                        asyncio.create_task(self._short_refresh_signals(want))
+                    if (smir.entry_window_open(sessions, today, hhmm, cfg)
+                            and self._short_state.get("entries_done_date") != today
+                            and not self.paused):
+                        prev = sdip.prior_session_date(sessions, today)
+                        if self._short_state.get("signal_date") == prev:
+                            await self._short_entries(today)
+                        else:
+                            await self._sm_log(
+                                f"Short mirror: no signals for {prev} yet (have "
+                                f"{self._short_state.get('signal_date') or 'none'}) -- waiting",
+                                "warning", once_key=f"nosig-{today}")
+
+                if self.broker_connected and self.order_manager:
+                    await self._short_monitor(sessions, today, hhmm)
+                    if self._short_book and smir.exit_window_open(sessions, today, hhmm, cfg):
+                        await self._short_exits(today, sessions)
+            except Exception as e:
+                logger.warning("Short mirror loop tick failed: %s", e)
+
+    async def _short_refresh_signals(self, session_date: str) -> None:
+        if self._short_refresh_in_progress:
+            return
+        self._short_refresh_in_progress = True
+        try:
+            cfg = self._short_cfg()
+            tickers = list(STOCK_UNIVERSE)
+            if not tickers:
+                return
+            await self._sm_log(f"Short mirror: downloading daily bars for {len(tickers)} stocks + VIX "
+                               f"(session {session_date})...")
+            snaps, vix_close = await asyncio.to_thread(_sd_compute_signals, tickers, session_date)
+            if vix_close is None or len(snaps) < 0.5 * len(tickers):
+                self._short_refresh_retry_at = datetime.now() + timedelta(minutes=15)
+                await self._sm_log(
+                    f"Short mirror: Yahoo data for {session_date} not complete yet "
+                    f"({len(snaps)}/{len(tickers)} stocks) -- retrying in 15 min", "warning")
+                return
+            ranked = smir.rank_short_candidates(snaps, vix_close, cfg)
+            top = [c.ticker for c in ranked[:25]]
+            facts = await asyncio.to_thread(lambda: {t: _sd_ticker_facts(t) for t in top})
+            cands = []
+            for c in ranked[:50]:
+                d = {k: getattr(c, k) for k in ("ticker", "date", "close", "sma5", "sma200", "rsi2", "atr",
+                                                 "dollar_volume", "last4_closes", "change_3d_pct")}
+                d["atr_pct"] = c.atr_pct
+                f = facts.get(c.ticker) or {}
+                d["company"] = f.get("company") if f.get("company") != c.ticker else ""
+                d["sector"] = f.get("sector", "")
+                d["earnings_date"] = f.get("earnings_date", "")
+                d["ex_dividend_date"] = f.get("ex_dividend_date", "")
+                cands.append(d)
+            self._short_state = {
+                "signal_date": session_date, "vix_close": vix_close,
+                "computed_at": datetime.now().isoformat(timespec="seconds"),
+                "universe": len(tickers), "with_data": len(snaps), "candidates": cands,
+                "entries_done_date": self._short_state.get("entries_done_date"),
+                "last_error": None, "status": {},
+            }
+            self._short_refresh_retry_at = None
+            await asyncio.to_thread(_save_short_mirror_state, dict(self._short_state))
+            if vix_close < cfg.vix_min:
+                msg = (f"Short mirror signals for {session_date}: VIX closed {vix_close:.2f} "
+                       f"(below {cfg.vix_min:.0f}) -- no shorts next session")
+            elif not cands:
+                msg = f"Short mirror signals for {session_date}: VIX {vix_close:.2f}, no stock qualified"
+            else:
+                top10 = ", ".join(f"{c['ticker']} (RSI2 {c['rsi2']:.1f})" for c in cands[:10])
+                msg = (f"Short mirror signals for {session_date}: VIX {vix_close:.2f} -- {len(cands)} "
+                       f"qualifier(s), best first: {top10}")
+            await self._sm_log(msg, "success" if cands else "info")
+        except Exception as e:
+            self._short_state["last_error"] = str(e)
+            self._short_refresh_retry_at = datetime.now() + timedelta(minutes=15)
+            await self._sm_log(f"Short mirror signal refresh failed: {e} -- retrying in 15 min", "error")
+        finally:
+            self._short_refresh_in_progress = False
+
+    async def _short_entries(self, today: str) -> None:
+        cfg = self._short_cfg()
+        if not self.config["trading"].get("auto_execute", False) or not self.broker_connected:
+            await self._sm_log("Short mirror: auto-execute off or broker not connected -- waiting",
+                               "warning", once_key=f"nobroker-{today}")
+            return
+        if not self._is_market_open():
+            return
+        # Stamp before shorting: a restart mid-way must not re-run the whole list.
+        self._short_state["entries_done_date"] = today
+        await asyncio.to_thread(_save_short_mirror_state, dict(self._short_state))
+        if not self._market_pause_active():
+            await self._sm_log("Short mirror: long mode (the market pause is off) -- no shorts today")
+            return
+        cands = list(self._short_state.get("candidates") or [])
+        vix = self._short_state.get("vix_close")
+        if not cands:
+            await self._sm_log(f"Short mirror: nothing to short today (signals from "
+                               f"{self._short_state.get('signal_date')})")
+            return
+        if sdip.drawdown_halted(self.portfolio.total_value, self.portfolio.peak_value, cfg.drawdown_halt_pct):
+            await self._sm_log(f"Short mirror: account is {cfg.drawdown_halt_pct:.0f}%+ below its peak -- "
+                               f"no shorts", "warning")
+            return
+        try:
+            shorting_ok = await self.order_manager.broker.get_shorting_enabled()
+        except Exception as e:
+            await self._sm_log(f"Short mirror: couldn't read the account's shorting setting ({e}) -- no shorts today",
+                               "error")
+            return
+        if not shorting_ok:
+            await self._sm_log("Short mirror: the Alpaca account has shorting turned off -- no shorts today",
+                               "warning")
+            return
+        free = cfg.slots - len(self._short_book)
+        if free <= 0:
+            await self._sm_log(f"Short mirror: all {cfg.slots} slots full -- no shorts today")
+            return
+        await self._sm_log(f"Short mirror (short mode): {len(cands)} candidate(s), {free} free slot(s) -- "
+                           f"checking in rank order")
+        opened = 0
+        for c in cands:
+            if opened >= free or self.paused or self.stopped:
+                break
+            t = c["ticker"]
+            if t in self._short_book:
+                continue
+            try:
+                if await self._short_try_open(c, vix, cfg, today):
+                    opened += 1
+            except Exception as e:
+                await self._sm_mark(t, "skipped", f"Short attempt failed: {e}", "error")
+        statuses = self._short_state.setdefault("status", {})
+        for c in cands:
+            if c["ticker"] not in statuses and c["ticker"] not in self._short_book:
+                statuses[c["ticker"]] = {"status": "waiting", "reason": "No free slot this session",
+                                         "at": datetime.now().isoformat(timespec="seconds")}
+        await asyncio.to_thread(_save_short_mirror_state, dict(self._short_state))
+        await self._sm_log(f"Short mirror: done for today -- {opened} short(s)", "success" if opened else "info")
+
+    def _short_hold_peak(self) -> None:
+        """Around every short order: Alpaca's cash (holding the proceeds) and the short
+        liability are read at different moments, so total_value is briefly off -- keep
+        update_peak() from ratcheting on it for a minute."""
+        self.portfolio._peak_hold_until = datetime.now() + timedelta(seconds=60)
+
+    async def _short_resync_value(self) -> None:
+        """Right after a short fills or covers: read positions and cash back to back so
+        total_value (cash + longs - short liability) is consistent at once."""
+        try:
+            broker = self.order_manager.broker
+            self.portfolio.short_liability = smir.short_liability(await broker.get_positions())
+            self.portfolio.cash = (await broker.get_account()).cash
+        except Exception as e:
+            logger.warning("Short mirror: cash/liability resync failed: %s", e)
+        self._short_hold_peak()
+
+    async def _short_wait_terminal(self, order_id: str, timeout_s: float):
+        """Poll the order's own status (the house rule: the order is authoritative, never a
+        positions snapshot) until filled / cancelled / rejected / expired, or the timeout.
+        Returns the last Order read, or None if it couldn't be read at all."""
+        broker = self.order_manager.broker
+        last = None
+        deadline = datetime.now() + timedelta(seconds=timeout_s)
+        while True:
+            try:
+                last = await broker.get_order_status(order_id)
+                if last.status in (OrderStatus.FILLED, OrderStatus.CANCELLED,
+                                   OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                    return last
+            except Exception as e:
+                logger.warning("Short mirror: order %s status read failed: %s", order_id, e)
+            if datetime.now() >= deadline:
+                return last
+            await asyncio.sleep(1.0)
+
+    async def _short_try_open(self, c: dict, vix, cfg, today: str) -> bool:
+        t = c["ticker"]
+        broker = self.order_manager.broker
+        # Never long and short the same stock, and no order on the other side (Alpaca rejects an
+        # opposite-side order that could interact with an open one -- the wash-trade rule).
+        if t in self.portfolio.positions or t in self._stress_dip_book or t in self._pending_buy_reservations:
+            await self._sm_mark(t, "skipped", "Skipped -- held (or being bought) on the long side")
+            return False
+        try:
+            open_orders = await broker.get_open_orders()
+        except Exception as e:
+            await self._sm_mark(t, "skipped", f"Skipped -- couldn't read open orders ({e})")
+            return False
+        if any(o.get("ticker") == t for o in open_orders):
+            await self._sm_mark(t, "skipped", "Skipped -- it already has an open order")
+            return False
+        try:
+            flags = await broker.get_asset_flags(t)
+        except Exception as e:
+            await self._sm_mark(t, "skipped", f"Skipped -- borrow check failed ({e})")
+            return False
+        if not (flags.get("tradable") and flags.get("shortable") and flags.get("easy_to_borrow")):
+            await self._sm_mark(t, "skipped", "Skipped -- not easy to borrow at Alpaca")
+            return False
+        soon, edate = await self._earnings_soon(t, cfg.earnings_block_days)
+        if soon:
+            await self._sm_mark(t, "skipped", f"Skipped -- earnings on {edate}")
+            return False
+        facts = await asyncio.to_thread(_sd_ticker_facts, t)
+        exdiv = facts.get("ex_dividend_date") or c.get("ex_dividend_date") or ""
+        if smir.date_within(exdiv, today, cfg.ex_dividend_block_days):
+            await self._sm_mark(t, "skipped", f"Skipped -- ex-dividend on {exdiv} (a short owes the dividend)")
+            return False
+        sector = facts.get("sector") or c.get("sector") or ""
+        if sector and sum(1 for b in self._short_book.values() if b.get("sector") == sector) >= cfg.max_per_sector:
+            await self._sm_mark(t, "skipped", f"Skipped -- {cfg.max_per_sector} shorts already in {sector}")
+            return False
+        price = 0.0
+        try:
+            price = float(await broker.get_quote(t) or 0.0)
+        except Exception:
+            price = 0.0
+        if not is_usable_price(price) or price <= 0:
+            try:
+                q = await self.market_data.get_quote(t)
+                price = float(getattr(q, "price", 0.0) or 0.0)
+            except Exception:
+                price = 0.0
+        if not is_usable_price(price) or price <= 0:
+            await self._sm_mark(t, "skipped", "Skipped -- no live price")
+            return False
+        snap = sdip.TickerSnapshot(
+            ticker=t, date=c.get("date", ""), close=float(c["close"]), sma5=c.get("sma5"),
+            sma200=c.get("sma200"), rsi2=c.get("rsi2"), atr=c.get("atr"),
+            dollar_volume=c.get("dollar_volume"), last4_closes=list(c.get("last4_closes") or []),
+            change_3d_pct=c.get("change_3d_pct"))
+        stop_pct = smir.stop_distance_pct(snap.atr, snap.close, cfg)
+
+        # Claude red-flag check -- fail-closed.
+        headlines: list[str] = []
+        try:
+            news = await self.news_feed.get_company_news(t, days=7)
+            headlines = [f"{n.published:%m-%d} {n.headline}" for n in news[:12]]
+        except Exception:
+            headlines = []
+        prompt = smir.build_short_veto_prompt(
+            today=today, ticker=t, company=facts.get("company") or t, price=price, snap=snap,
+            vix_close=float(vix), stop_pct=stop_pct, earnings_date=facts.get("earnings_date", ""),
+            ex_dividend_date=exdiv, headlines=headlines, max_hold=cfg.max_hold_sessions)
+        text = await self.research_engine.ask_stress_dip_veto(t, prompt)
+        verdict = smir.parse_veto_response(text or "")
+        asyncio.create_task(asyncio.to_thread(_append_short_mirror_jsonl, _SHORT_MIRROR_VETO_LOG_PATH, {
+            "at": datetime.now().isoformat(timespec="seconds"), "date": today, "ticker": t,
+            "price": price, "signal_date": snap.date, "close": snap.close, "rsi2": snap.rsi2,
+            "change_3d_pct": snap.change_3d_pct, "vix": vix, "stop_pct": stop_pct,
+            "earnings_date": facts.get("earnings_date", ""), "ex_dividend_date": exdiv,
+            "model": self.config.get("research", {}).get("model_stress_dip_veto", sdip.DEFAULT_VETO_MODEL),
+            "veto": None if verdict is None else verdict[0],
+            "reason": None if verdict is None else verdict[1],
+            "raw": None if verdict is not None else (text or "")[:500],
+        }))
+        if verdict is None:
+            await self._sm_mark(t, "skipped", "Skipped -- Claude risk check failed or unreadable (no short without it)")
+            return False
+        veto, reason = verdict
+        if veto:
+            await self._sm_mark(t, "vetoed", reason)
+            return False
+        if self.paused or self.stopped or not self._is_market_open():
+            return False
+
+        reserve_pct = self.config["risk_management"].get("min_cash_reserve_pct", 2.0)
+        slot = sdip.slot_dollars(self.portfolio.total_value, reserve_pct, cfg.slots)
+        qty = smir.short_qty(slot, price)
+        if qty < 1:
+            await self._sm_mark(t, "skipped", f"Skipped -- one share (${price:.2f}) is more than a slot (${slot:,.0f})")
+            return False
+        try:
+            acct = await broker.get_account()
+            if acct.buying_power < qty * price * 1.03:   # Alpaca checks 3% over the ask x qty
+                await self._sm_mark(t, "skipped", f"Skipped -- not enough buying power (${acct.buying_power:,.0f})")
+                return False
+        except Exception as e:
+            await self._sm_mark(t, "skipped", f"Skipped -- couldn't read buying power ({e})")
+            return False
+
+        import uuid as _uuid
+        self._short_opening.add(t)
+        self._short_hold_peak()
+        try:
+            order = await broker.submit_order(_BrokerOrder(
+                ticker=t, side=_OrderSide.SELL, order_type=_OrderType.MARKET, quantity=qty,
+                client_order_id=f"short-open-{t}-{_uuid.uuid4().hex[:8]}"))
+            final = await self._short_wait_terminal(order.broker_order_id, 30)
+            if final is not None and final.status not in (OrderStatus.FILLED, OrderStatus.CANCELLED,
+                                                          OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                await broker.cancel_order(order.broker_order_id)
+                final = await self._short_wait_terminal(order.broker_order_id, 15)
+            filled = int(round(float(getattr(final, "filled_quantity", 0) or 0)))
+            if final is None or filled <= 0:
+                await self._sm_mark(t, "skipped", f"Short order not filled ({getattr(final, 'status', None)})", "error")
+                return False
+            await self._short_resync_value()
+            entry = float(final.filled_price or price)
+            stop = smir.short_stop_price(entry, snap.atr, snap.close, cfg)
+            self._short_book[t] = {
+                "qty": filled, "entry_price": entry, "entry_date": today, "signal_date": snap.date,
+                "ref_close": snap.close, "atr": snap.atr, "stop": stop, "stop_pct": round(stop_pct, 2),
+                "stop_order_id": None, "open_order_id": order.broker_order_id, "rsi2": snap.rsi2,
+                "vix": vix, "sector": sector, "company": facts.get("company") or t,
+                "last_price": entry, "unrealized_pnl": 0.0,
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
+            await asyncio.to_thread(_save_short_mirror_book, dict(self._short_book))
+            _append_short_mirror_jsonl(_SHORT_MIRROR_TRADES_PATH, {
+                "event": "short", "at": datetime.now().isoformat(timespec="seconds"), "ticker": t,
+                "qty": filled, "price": entry, "stop": stop, "order_id": order.broker_order_id,
+                "signal_date": snap.date, "rsi2": snap.rsi2, "vix": vix, "is_paper": self._short_is_paper(),
+                "reason": f"Claude check: {reason}"})
+            self._short_state.setdefault("status", {})[t] = {
+                "status": "shorted", "reason": f"Shorted {filled} @ ${entry:.2f}; Claude check: {reason}",
+                "at": datetime.now().isoformat(timespec="seconds")}
+            await self._sm_log(
+                f"SHORT {filled} shares @ ${entry:.2f} (${filled * entry:,.0f}) | RSI(2) {snap.rsi2:.1f} | "
+                f"VIX {float(vix):.2f} | buy stop ${stop:.2f} (+{stop_pct:.1f}%)", "sell", ticker=t)
+            asyncio.create_task(_notify(
+                f"SHORT {t} (short mirror)",
+                f"{filled} shares @ ${entry:.2f} | RSI(2) {snap.rsi2:.1f}, VIX {float(vix):.1f}, stop +{stop_pct:.1f}%",
+                priority="high", tags="chart_with_downwards_trend"))
+            if not await self._short_place_stop(t):
+                await self._short_cover(t, "the buy stop could not be placed")
+            return True
+        finally:
+            self._short_opening.discard(t)
+
+    async def _short_place_stop(self, t: str) -> bool:
+        """A GTC BUY STOP for the whole short (Alpaca: GTC allowed for whole-share stops)."""
+        b = self._short_book.get(t)
+        if not b:
+            return False
+        import uuid as _uuid
+        try:
+            o = await self.order_manager.broker.submit_order(_BrokerOrder(
+                ticker=t, side=_OrderSide.BUY, order_type=_OrderType.STOP, quantity=int(b["qty"]),
+                stop_price=float(b["stop"]), client_order_id=f"short-stop-{t}-{_uuid.uuid4().hex[:8]}"))
+            if o.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED, OrderStatus.EXPIRED):
+                raise RuntimeError(f"order {o.status.value}")
+            b["stop_order_id"] = o.broker_order_id
+            await asyncio.to_thread(_save_short_mirror_book, dict(self._short_book))
+            await self._sm_log(f"Buy stop placed: {int(b['qty'])} @ ${float(b['stop']):.2f}", ticker=t)
+            return True
+        except Exception as e:
+            await self._sm_log(f"Buy stop ${float(b['stop']):.2f} could not be placed: {e}", "error", ticker=t)
+            return False
+
+    async def _short_record_close(self, t: str, price, qty, reason: str) -> None:
+        b = self._short_book.pop(t, None)
+        if not b:
+            return
+        await asyncio.to_thread(_save_short_mirror_book, dict(self._short_book))
+        await self._short_resync_value()
+        q = abs(float(qty or b["qty"]))
+        pnl = smir.short_pnl(float(b["entry_price"]), float(price), q) if price else None
+        _append_short_mirror_jsonl(_SHORT_MIRROR_TRADES_PATH, {
+            "event": "cover", "at": datetime.now().isoformat(timespec="seconds"), "ticker": t,
+            "qty": q, "price": price, "entry_price": b["entry_price"], "entry_date": b.get("entry_date"),
+            "pnl": pnl, "reason": reason, "is_paper": self._short_is_paper()})
+        self._short_state.setdefault("status", {})[t] = {
+            "status": "covered", "reason": reason, "at": datetime.now().isoformat(timespec="seconds")}
+        pnl_txt = "P&L unknown" if pnl is None else f"P&L ${pnl:+,.2f}"
+        await self._sm_log(f"COVERED {q:g} shares @ {'?' if not price else f'${float(price):.2f}'} "
+                           f"(shorted @ ${float(b['entry_price']):.2f}) -- {reason} | {pnl_txt}",
+                           "buy" if (pnl or 0) >= 0 else "warning", ticker=t)
+        asyncio.create_task(_notify(f"COVER {t} (short mirror)", f"{reason} | {pnl_txt}", tags="white_check_mark"))
+
+    async def _short_cover(self, t: str, reason: str) -> bool:
+        """Cover one short: cancel its buy stop (and confirm), re-read the real position (a
+        filled stop already covered it -- buying again would leave the account LONG), then a
+        market buy for exactly the short qty, confirmed by the order's own status."""
+        if t in self._short_covering or t not in self._short_book:
+            return False
+        self._short_covering.add(t)
+        broker = self.order_manager.broker
+        import uuid as _uuid
+        try:
+            b = self._short_book[t]
+            sid = b.get("stop_order_id")
+            if sid:
+                await broker.cancel_order(sid)
+                st = await self._short_wait_terminal(sid, 15)
+                if st is not None and st.status == OrderStatus.FILLED:
+                    await self._short_record_close(t, st.filled_price, st.filled_quantity, "buy stop filled")
+                    return True
+                if st is None or st.status not in (OrderStatus.CANCELLED, OrderStatus.EXPIRED, OrderStatus.REJECTED):
+                    await self._sm_log(f"Cover deferred -- the buy stop hasn't confirmed cancelled "
+                                       f"({getattr(st, 'status', None)})", "warning", ticker=t)
+                    return False
+                b["stop_order_id"] = None
+                await asyncio.to_thread(_save_short_mirror_book, dict(self._short_book))
+            pos = await broker.get_position(t)
+            if pos is None or float(pos.get("shares", 0)) >= 0:
+                await self._short_record_close(t, None, b["qty"], f"{reason} -- already flat at the broker")
+                return True
+            qty = int(round(abs(float(pos["shares"]))))
+            self._short_hold_peak()
+            order = await broker.submit_order(_BrokerOrder(
+                ticker=t, side=_OrderSide.BUY, order_type=_OrderType.MARKET, quantity=qty,
+                client_order_id=f"short-cover-{t}-{_uuid.uuid4().hex[:8]}"))
+            final = await self._short_wait_terminal(order.broker_order_id, 30)
+            if final is not None and final.status == OrderStatus.FILLED:
+                await self._short_record_close(t, final.filled_price, final.filled_quantity, reason)
+                return True
+            if final is not None and final.status not in (OrderStatus.CANCELLED, OrderStatus.REJECTED,
+                                                          OrderStatus.EXPIRED):
+                await broker.cancel_order(order.broker_order_id)
+                final = await self._short_wait_terminal(order.broker_order_id, 15)
+                if final is not None and final.status == OrderStatus.FILLED:
+                    await self._short_record_close(t, final.filled_price, final.filled_quantity, reason)
+                    return True
+            # Not covered: whatever is still short gets its stop back; the next tick retries.
+            pos = await broker.get_position(t)
+            if pos is None or float(pos.get("shares", 0)) >= 0:
+                await self._short_record_close(t, getattr(final, "filled_price", None), b["qty"], reason)
+                return True
+            b["qty"] = int(round(abs(float(pos["shares"]))))
+            await self._sm_log(f"Cover order didn't fill ({getattr(final, 'status', None)}) -- stop restored, "
+                               f"retrying", "error", ticker=t)
+            await self._short_place_stop(t)
+            return False
+        except Exception as e:
+            await self._sm_log(f"Cover failed: {e}", "error", ticker=t)
+            return False
+        finally:
+            self._short_covering.discard(t)
+
+    async def _short_cover_unknown(self, t: str) -> None:
+        """The accidental-short guard's cover: a short the mirror never opened (e.g. a
+        long-side double sell once shorting is on). Market buy back exactly what's short."""
+        import uuid as _uuid
+        broker = self.order_manager.broker
+        pos = await broker.get_position(t)
+        if pos is None or float(pos.get("shares", 0)) >= 0:
+            return
+        qty = abs(float(pos["shares"]))
+        order = await broker.submit_order(_BrokerOrder(
+            ticker=t, side=_OrderSide.BUY, order_type=_OrderType.MARKET, quantity=qty,
+            client_order_id=f"short-guard-{t}-{_uuid.uuid4().hex[:8]}"))
+        final = await self._short_wait_terminal(order.broker_order_id, 30)
+        await self._sm_log(f"Accidental-short guard: bought back {qty:g} shares "
+                           f"({getattr(final, 'status', None)}, ${getattr(final, 'filled_price', None)})",
+                           "error", ticker=t)
+
+    async def _short_monitor(self, sessions: list[dict], today: str, hhmm: str) -> None:
+        """Every tick: reconcile the short book with Alpaca, keep a resting buy stop under every
+        short, and catch any short the mirror didn't open."""
+        broker = self.order_manager.broker
+        try:
+            positions = await broker.get_positions()
+        except Exception:
+            return
+        s_today = sdip.session_for(sessions, today)
+        regular = bool(s_today and s_today["open"] <= hhmm < s_today["close"]) and self._is_market_open()
+        shorts = {p["ticker"]: p for p in positions if float(p.get("shares", 0)) < 0}
+
+        # Accidental-short guard (two ticks in a row, so an in-flight open never trips it).
+        unknown = smir.unknown_shorts(positions, self._short_book, self._short_opening | self._short_covering)
+        for t in list(self._short_unknown_seen):
+            if t not in unknown:
+                self._short_unknown_seen.pop(t, None)
+        for t in unknown:
+            self._short_unknown_seen[t] = self._short_unknown_seen.get(t, 0) + 1
+            if self._short_unknown_seen[t] < 2:
+                continue
+            await self._sm_log(f"ACCIDENTAL SHORT: {shorts[t]['shares']:g} shares short that the short mirror "
+                               f"didn't open" + (" -- buying it back now" if regular else
+                                                  " -- will buy it back at the open"),
+                               "error", ticker=t, once_key=f"unknown-{t}-{today}")
+            if regular and self.config["trading"].get("auto_execute", False):
+                try:
+                    await self._short_cover_unknown(t)
+                except Exception as e:
+                    await self._sm_log(f"Accidental-short buy-back failed: {e}", "error", ticker=t)
+
+        if not self._short_book:
+            return
+        # A resting buy stop can fill at any moment; keep the peak from ratcheting on a
+        # half-updated value while shorts are open (the 20% halt stays honest).
+        self._short_hold_peak()
+        try:
+            open_orders = await broker.get_open_orders()
+            open_ids = {o["order_id"] for o in open_orders}
+        except Exception:
+            open_ids = None
+        changed = False
+        for t, b in list(self._short_book.items()):
+            if t in self._short_covering or t in self._short_opening:
+                continue
+            p = shorts.get(t)
+            if p is None:
+                try:
+                    age = (datetime.now() - datetime.fromisoformat(b.get("at"))).total_seconds()
+                except Exception:
+                    age = 999
+                if age < 90:
+                    continue      # just opened -- the positions endpoint may lag a moment
+                price, q, why = None, b["qty"], "position closed at the broker"
+                sid = b.get("stop_order_id")
+                if sid:
+                    try:
+                        st = await broker.get_order_status(sid)
+                        if st.status == OrderStatus.FILLED:
+                            price, q, why = st.filled_price, st.filled_quantity, "buy stop filled"
+                    except Exception:
+                        pass
+                await self._short_record_close(t, price, q, why)
+                continue
+            b["last_price"] = float(p.get("current_price") or b.get("last_price") or 0.0)
+            b["unrealized_pnl"] = float(p.get("unrealized_pnl") or 0.0)
+            changed = True
+            real_qty = int(round(abs(float(p["shares"]))))
+            if real_qty != int(b["qty"]):
+                await self._sm_log(f"Share count {int(b['qty'])} -> {real_qty} at the broker -- resizing the stop",
+                                   "warning", ticker=t)
+                b["qty"] = real_qty
+                if b.get("stop_order_id"):
+                    await broker.cancel_order(b["stop_order_id"])
+                    await self._short_wait_terminal(b["stop_order_id"], 10)
+                    b["stop_order_id"] = None
+            if open_ids is None:
+                continue
+            sid = b.get("stop_order_id")
+            if sid and sid in open_ids:
+                continue
+            if sid:
+                try:
+                    st = await broker.get_order_status(sid)
+                    if st.status == OrderStatus.FILLED:
+                        continue          # the position read above will drop it next tick
+                except Exception:
+                    pass
+                b["stop_order_id"] = None
+            if regular and b["last_price"] >= float(b["stop"]):
+                await self._short_cover(t, f"price ${b['last_price']:.2f} is at or over the stop "
+                                           f"${float(b['stop']):.2f} with no resting stop")
+                continue
+            if not await self._short_place_stop(t) and regular:
+                await self._short_cover(t, "the buy stop could not be re-placed")
+        if changed:
+            await asyncio.to_thread(_save_short_mirror_book, dict(self._short_book))
+
+    async def _short_exits(self, today: str, sessions: list[dict]) -> None:
+        cfg = self._short_cfg()
+        held = [t for t in self._short_book if t not in self._short_covering]
+        if not held:
+            return
+        cache = self._short_exit_closes
+        if cache.get("date") != today or any(t not in cache.get("data", {}) for t in held):
+            data = await asyncio.to_thread(_sd_recent_closes, held)
+            self._short_exit_closes = cache = {"date": today, "data": data}
+        for t in held:
+            b = self._short_book.get(t)
+            if not b:
+                continue
+            rows = [(d, c) for d, c in (cache.get("data") or {}).get(t, []) if d < today]
+            last4 = [c for _, c in rows[-4:]]
+            n = sdip.calendar_sessions_held(sessions, str(b["entry_date"]), today)
+            live = float(b.get("last_price") or 0.0)
+            if not is_usable_price(live) or live <= 0:
+                continue
+            if len(last4) < 4 and n < cfg.max_hold_sessions:
+                await self._sm_log("Holding -- not enough completed closes for the 5-day average yet",
+                                   ticker=t, once_key=f"few-{t}-{today}")
+                continue
+            why = smir.cover_reason(live, last4, n, cfg)
+            if why is None:
+                await self._sm_log(f"Holding the short (session {n}/{cfg.max_hold_sessions}, ${live:.2f} "
+                                   f"not under its 5-day average)", ticker=t, once_key=f"hold-{t}-{today}")
+                continue
+            await self._short_cover(t, why)
+
     def _stress_dip_cfg(self) -> "sdip.StressDipConfig":
         return sdip.stress_dip_cfg(self.config.get("stress_dip"))
 
@@ -7269,7 +7978,7 @@ class DashboardState:
                 break
             t = c["ticker"]
             if (t in self.portfolio.positions or t in self._stress_dip_book
-                    or t in self._pending_buy_reservations):
+                    or t in self._pending_buy_reservations or t in self._short_book):
                 continue
             try:
                 if await self._stress_dip_try_buy(c, vix, cfg, today):
@@ -11340,6 +12049,12 @@ async def get_ticker_tape_config():
     return {"crypto_count": max(0, min(5, int(count)))}
 
 
+@app.get("/api/short-mirror")
+async def short_mirror_status():
+    """Short Mirror (2026-11-27): short mode's candidates, statuses and open shorts."""
+    return state.short_mirror_snapshot()
+
+
 @app.get("/api/stress-dip")
 async def stress_dip_status():
     """The Stress Dip-Buyer's state (2026-11-26): the latest evening's ranked candidates,
@@ -13626,6 +14341,8 @@ async def startup():
         logger.info("Restored %d Track 2 decline(s)", len(state._track2_declines))
     state._stress_dip_state = _load_stress_dip_state()
     state._stress_dip_book = _load_stress_dip_book()
+    state._short_state = _load_short_mirror_json(_SHORT_MIRROR_STATE_PATH, "short mirror state")
+    state._short_book = _load_short_mirror_json(_SHORT_MIRROR_BOOK_PATH, "short mirror book")
     if state._stress_dip_book:
         logger.info("Restored %d stress dip-buyer position record(s)", len(state._stress_dip_book))
 
@@ -13744,6 +14461,7 @@ async def startup():
     asyncio.create_task(state.position_deep_dive_loop())
     asyncio.create_task(state.market_pause_loop())
     asyncio.create_task(state.stress_dip_loop())
+    asyncio.create_task(state.short_mirror_loop())
     logger.info("Dashboard started — auto-scan running, position monitor active")
 
     # First-run bootstrap removed 2026-07-17 — it triggered on watchlist_manager.size() == 0,
