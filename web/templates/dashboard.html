@@ -862,6 +862,7 @@ tbody tr:hover { background: var(--bg-card-hover); }
          all the way across the sceen to between the alpaca paper button and the info button").
          Filled by updateMarketPauseBanner(); the full reason is on hover; a click opens the graph. -->
     <span id="marketPausePill" class="pause-pill" style="display:none;" onclick="openMarketChartWindow()">Long / short mode</span>
+    <span id="chartsInBtn" class="pause-pill" onclick="toggleChartsIn()" title="Where a card or position opens its chart: Quant Terminal on this computer (live, with the bot's entry, stop and trailing-stop lines), or the dashboard's own popup. Click to switch; remembered on this device.">📈 Charts: Quant</span>
   </div>
   <div class="header-right">
     <div id="aboutButton"
@@ -5291,8 +5292,30 @@ function shortTradeBlockHtml(ticker, b, sd) {
     </div>`;
 }
 
+// Charts open in Quant Terminal (2026-11-27, owner: "can we change the charts to use quant stock charts that have all
+// the trade data on it and updates live", "when i click on a card it brings up quant chart instead"). Quant runs on the
+// owner's computer (127.0.0.1:3777); its tools/aitrading_quant_charts.mjs draws the bot's lines there every minute.
+// The switch is per device (localStorage), so a phone can keep the dashboard's own popup.
+function _chartsInQuant() {
+  return localStorage.getItem('chartsIn') !== 'dashboard';
+}
+function openInQuant(ticker) {
+  window.open(`http://127.0.0.1:3777/?symbol=US:${encodeURIComponent(ticker)}`, 'quantTerminal');
+}
+function updateChartsInBtn() {
+  const b = document.getElementById('chartsInBtn');
+  if (b) b.textContent = _chartsInQuant() ? '📈 Charts: Quant' : '📈 Charts: Dashboard';
+}
+function toggleChartsIn() {
+  localStorage.setItem('chartsIn', _chartsInQuant() ? 'dashboard' : 'quant');
+  updateChartsInBtn();
+}
+try { updateChartsInBtn(); } catch (e) { /* the header isn't there yet */ }
+document.addEventListener('DOMContentLoaded', () => { try { updateChartsInBtn(); } catch (e) {} });
+
 // Chart popup for a short-list card: the same shell as the dip popup, with the buy stop ABOVE.
 async function clickShortCandidate(ticker) {
+  if (_chartsInQuant()) return openInQuant(ticker);
   const sd = shortData || {};
   let c = (sd.candidates || []).find(x => x.ticker === ticker);
   const b = (sd.book || {})[ticker];
@@ -5362,6 +5385,7 @@ async function clickShortCandidate(ticker) {
 // candlestick chart + TradingView chart as before), with the dip-buyer's own stop line
 // instead of an old Claude report's entry/target lines. Never starts a paid deep dive.
 async function clickDipCandidate(ticker) {
+  if (_chartsInQuant()) return openInQuant(ticker);
   const d = dipData || {};
   const c = (d.candidates || []).find(x => x.ticker === ticker);
   if (!c) return clickStock(ticker);
@@ -5700,6 +5724,7 @@ function fmtTimeOwned(openedAt) {
 }
 
 async function showPositionDetail(ticker) {
+  if (_chartsInQuant()) return openInQuant(ticker);
   const p = positionData[ticker];
   if (!p) return;
   _posDetailCurrentTicker = ticker;
