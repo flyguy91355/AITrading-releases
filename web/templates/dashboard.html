@@ -2546,7 +2546,7 @@ function updatePortfolio(p) {
   document.getElementById('cashValue').textContent = fmt$(p.cash);
   document.getElementById('cashPct').textContent = p.cash_pct.toFixed(1) + '%';
 
-  renderPositions(p.positions);
+  renderPositions(p.positions, p.short_positions);
 }
 
 // Portfolio-vs-market performance charts (2026-07-21) -- small sparklines in the Day/Total/
@@ -3424,11 +3424,43 @@ async function openPerformancePopup(kind) {
   }
 }
 
-function renderPositions(positions) {
+// The short mirror's open shorts in the same table (2026-11-27): a SHORT badge, negative shares, P/L that
+// grows as the price falls, and the buy stop (↓ once the trail has come down). Click opens the short's chart.
+function shortPositionRowHtml(s) {
+  const cl = (v) => v >= 0 ? 'color:var(--green)' : 'color:var(--red)';
+  const money = (v) => `${v >= 0 ? '+$' : '-$'}${Math.abs(v).toFixed(2)}`;
+  const daysHeld = s.opened_at ? Math.floor((Date.now() - parseUtcTimestamp(s.opened_at).getTime()) / 86400000) : null;
+  const stopPx = s.trail != null ? s.trail : s.stop;
+  const stopPct = s.entry_price > 0 && stopPx > 0 ? ((stopPx - s.entry_price) / s.entry_price * 100) : null;
+  const stopTxt = s.trail != null
+    ? `↓ $${s.trail.toFixed(2)}`
+    : `$${(s.stop || 0).toFixed(2)}${stopPct != null ? ` (+${stopPct.toFixed(1)}%)` : ''}`;
+  const stopColor = stopPx > 0 && stopPx <= s.entry_price ? 'var(--green)' : s.current_price > s.entry_price ? 'var(--red)' : null;
+  return `<tr onclick="clickShortCandidate('${s.ticker}')" title="Short mirror position: covered by its buy stop at Alpaca, its trailing stop, or day 20">
+      <td class="ticker-cell">${s.ticker} <span style="color:#f87171;border:1px solid rgba(239,68,68,.6);border-radius:4px;padding:0 4px;font-size:10px;font-weight:700;">SHORT</span></td>
+      <td><span style="color:var(--text-muted);">—</span></td>
+      <td class="right">${s.shares}</td>
+      <td class="right">$${s.entry_price.toFixed(2)}</td>
+      <td class="right">$${s.current_price.toFixed(2)}</td>
+      <td class="right">-$${Math.abs(s.market_value).toFixed(2)}</td>
+      <td class="right" style="${cl(s.day_pnl)}">${money(s.day_pnl)}</td>
+      <td class="right" style="${cl(s.day_pnl)}">${s.day_pnl_pct >= 0 ? '+' : ''}${s.day_pnl_pct.toFixed(1)}%</td>
+      <td class="right" style="${cl(s.pnl)}">${money(s.pnl)} (${s.pnl_pct >= 0 ? '+' : ''}${s.pnl_pct.toFixed(1)}%)</td>
+      <td class="right">${daysHeld === null ? '—' : daysHeld < 1 ? '<1d' : `${daysHeld}d`}</td>
+      <td class="right">${stopColor ? `<span style="color:${stopColor}">${stopTxt}</span>` : stopTxt}</td>
+      <td class="right" style="font-size:11px;color:var(--text-muted);">trail / day 20</td>
+      <td></td>
+    </tr>`;
+}
+
+function renderPositions(positions, shorts) {
   const tbody = document.getElementById('positionsBody');
   const countEl = document.getElementById('positionCount');
-  countEl.textContent = positions && positions.length > 0 ? `(${positions.length})` : '';
-  if (!positions || positions.length === 0) {
+  positions = positions || [];
+  shorts = shorts || [];
+  const n = positions.length + shorts.length;
+  countEl.textContent = n > 0 ? `(${n})` : '';
+  if (n === 0) {
     tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;padding:24px;color:var(--text-muted)">No open positions</td></tr>';
     return;
   }
@@ -3567,7 +3599,7 @@ function renderPositions(positions) {
       <td class="right" style="font-size:11px;">${targetsCell}</td>
       <td><button class="sell-btn" onclick="event.stopPropagation();sellPosition('${p.ticker}')" ${!brokerConnected ? 'disabled' : ''}>Sell</button></td>
     </tr>`;
-  }).join('');
+  }).join('') + shorts.map(shortPositionRowHtml).join('');
 }
 
 // ── Signals ────────────────────────────────────────────────────────────────

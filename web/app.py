@@ -2533,6 +2533,34 @@ class DashboardState:
 
     # ── Portfolio snapshot ─────────────────────────────────────────────────
 
+    def _short_positions_snapshot(self) -> list[dict]:
+        """The short mirror's open shorts for the Open Positions box (2026-11-27, owner: "im not
+        seeing any stocks that i think are being traded in the opens postitions box"). Live
+        price and P&L come from the short monitor's Alpaca read (every 30s)."""
+        out = []
+        today = self._now_et().date().isoformat()
+        for t, b in sorted(self._short_book.items(), key=lambda kv: str(kv[1].get("at", ""))):
+            qty = float(b.get("qty") or 0)
+            entry = float(b.get("entry_price") or 0)
+            cur = float(b.get("last_price") or entry)
+            if qty <= 0 or entry <= 0:
+                continue
+            pnl = (entry - cur) * qty
+            last = float(b.get("lastday_price") or 0)
+            ref = entry if (str(b.get("entry_date")) == today or not last) else last
+            day = (ref - cur) * qty
+            stop = float(b.get("stop") or 0)
+            trail = float(b.get("trail") or 0)
+            out.append({
+                "ticker": t, "shares": -qty, "entry_price": round(entry, 2), "current_price": round(cur, 2),
+                "market_value": round(-qty * cur, 2), "pnl": round(pnl, 2),
+                "pnl_pct": round(100.0 * (entry - cur) / entry, 2),
+                "day_pnl": round(day, 2), "day_pnl_pct": round(100.0 * (ref - cur) / ref, 2) if ref else 0.0,
+                "stop": round(stop, 2), "trail": round(trail, 2) if trail and trail < stop else None,
+                "entry_date": b.get("entry_date"), "opened_at": b.get("at"),
+            })
+        return out
+
     def get_portfolio_snapshot(self) -> dict:
         p = self.portfolio
         positions = [
@@ -2580,6 +2608,7 @@ class DashboardState:
             # Net of what open shorts owe (Short Mirror): Alpaca's cash holds their proceeds.
             "cash": round(p.cash - (p.short_liability or 0.0), 2),
             "short_liability": round(p.short_liability or 0.0, 2),
+            "short_positions": self._short_positions_snapshot(),
             "cash_pct": round(p.cash_pct, 1),
             "day_pnl": round(p.day_pnl, 2),
             "day_pnl_pct": round((p.day_pnl / p.day_start_value * 100) if p.day_start_value else 0, 2),
@@ -7737,6 +7766,8 @@ class DashboardState:
                 continue
             b["last_price"] = float(p.get("current_price") or b.get("last_price") or 0.0)
             b["unrealized_pnl"] = float(p.get("unrealized_pnl") or 0.0)
+            if p.get("lastday_price"):
+                b["lastday_price"] = float(p["lastday_price"])
             changed = True
             real_qty = int(round(abs(float(p["shares"]))))
             if real_qty != int(b["qty"]):

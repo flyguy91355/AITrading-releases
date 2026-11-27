@@ -374,6 +374,8 @@ class AlpacaBroker(Broker):
                 "market_value": float(p.market_value),
                 "unrealized_pnl": float(p.unrealized_pl),
                 "unrealized_pnl_pct": float(p.unrealized_plpc) * 100,
+                # previous close (Alpaca's lastday_price) -- the short mirror's day P/L
+                "lastday_price": float(getattr(p, "lastday_price", 0) or 0),
             }
             for p in positions
         ]
