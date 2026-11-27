@@ -521,6 +521,9 @@ tbody tr:hover { background: var(--bg-card-hover); }
   margin-bottom: 5px;
 }
 .stock-btn:hover { border-color: var(--accent); }
+/* Stress Dip-Buyer list header (2026-11-26) -- one line above the dip-buyer cards in the On Deck view. */
+.dip-header { display:flex; flex-wrap:wrap; gap:4px 12px; justify-content:space-between; font-size:11px;
+  color:var(--text-muted); padding:4px 6px 8px; border-bottom:1px solid var(--border); margin-bottom:8px; }
 /* Manual On Deck removal — small, unobtrusive until hovered, top-right of the card, doesn't
    participate in the button's own onclick (clickStock) via stopPropagation in the handler. */
 .btn-remove {
@@ -1696,7 +1699,7 @@ function handleMessage(msg) {
 
     case 'on_deck_removed':
       delete nearMissData[msg.ticker];
-      if (_stockView === 'ondeck') renderNearMissGrid(nearMissData);
+      if (_stockView === 'ondeck') renderOnDeckView();
       break;
 
     case 'cycle_start':
@@ -4227,18 +4230,38 @@ let nearMissData = {};
 // actually touches #stockGrid, so the two views don't clobber each other.
 let _stockView = 'ondeck';
 let todayScanData = {};
+// Stress Dip-Buyer state (2026-11-26) -- /api/stress-dip. While the old On Deck pipeline
+// is off (the default since that date), the On Deck view shows the dip-buyer's ranked
+// list for the next open instead -- see renderOnDeckView / renderDipGrid.
+let dipData = null;
 
 async function fetchNearMiss() {
   try {
-    const resp = await fetch('/api/near-miss');
-    if (!resp.ok) return;
-    nearMissData = await resp.json();
-    if (_stockView === 'ondeck') {
-      const titleEl = document.getElementById('watchlistPanelTitle');
-      if (titleEl) titleEl.textContent = `On Deck — ${Object.keys(nearMissData).length}`;
-      renderNearMissGrid(nearMissData);
-    }
+    const [resp, dresp] = await Promise.all([
+      fetch('/api/near-miss'),
+      fetch('/api/stress-dip').catch(() => null),
+    ]);
+    if (resp.ok) nearMissData = await resp.json();
+    if (dresp && dresp.ok) dipData = await dresp.json();
+    if (_stockView === 'ondeck') renderOnDeckView();
   } catch(e) { console.error('fetchNearMiss:', e); }
+}
+
+function _dipModeActive() {
+  return !!(dipData && dipData.enabled && dipData.on_deck_pipeline_enabled === false);
+}
+
+// The one On Deck render entry point: the dip-buyer list while that strategy owns buying,
+// the old Claude-picked candidates otherwise.
+function renderOnDeckView() {
+  const titleEl = document.getElementById('watchlistPanelTitle');
+  if (_dipModeActive()) {
+    if (titleEl) titleEl.textContent = `On Deck — ${(dipData.candidates || []).length}`;
+    renderDipGrid(dipData);
+  } else {
+    if (titleEl) titleEl.textContent = `On Deck — ${Object.keys(nearMissData).length}`;
+    renderNearMissGrid(nearMissData);
+  }
 }
 
 async function fetchTodayScan() {
@@ -4265,8 +4288,7 @@ function setStockView(view) {
   shoreBtn.style.cssText = base + (view === 'todayscan' ? active : inactive);
   const titleEl = document.getElementById('watchlistPanelTitle');
   if (view === 'ondeck') {
-    if (titleEl) titleEl.textContent = `On Deck — ${Object.keys(nearMissData).length}`;
-    renderNearMissGrid(nearMissData);
+    renderOnDeckView();
   } else {
     if (titleEl) titleEl.textContent = `On Shore — ${Object.keys(todayScanData).length}`;
     // Immediate loading feedback (2026-07-19 fix) -- fetchTodayScan fetches a live quote per
@@ -4935,6 +4957,193 @@ function renderNearMissGrid(data) {
     const points = await _getCardCandlePoints(nm.ticker);
     renderCardCandleLWC(document.getElementById('rrspark-' + nm.ticker), points);
   });
+}
+
+// ── Stress Dip-Buyer cards (2026-11-26) ─────────────────────────────────────
+// Same card shell, mini daily-candle chart and click-to-open chart popup as the old On Deck
+// cards, but showing the dip-buyer's own numbers (rules: src/strategy/stress_dip.py) and what
+// happened to each candidate at the open (bought / vetoed by Claude / skipped / no slot).
+function _dipStopPct(c, d) {
+  const mult = (d && d.stop_atr_mult) || 3, lo = (d && d.stop_min_pct) || 3, hi = (d && d.stop_max_pct) || 15;
+  if (!c || !c.atr || !c.close) return hi;
+  return Math.min(Math.max(100 * mult * c.atr / c.close, lo), hi);
+}
+
+function _dipEntriesDone(d) {
+  return !!(d && d.entries_done_date && d.signal_date && d.entries_done_date > d.signal_date);
+}
+
+function _dipStatus(c, d) {
+  const st = ((d && d.status) || {})[c.ticker];
+  if (st) {
+    const map = {
+      bought:  ['BOUGHT', 'var(--green)'],
+      vetoed:  ['VETOED', 'var(--amber, #f59e0b)'],
+      skipped: ['SKIPPED', 'var(--text-muted)'],
+      waiting: ['NO SLOT', 'var(--text-muted)'],
+    };
+    const [label, color] = map[st.status] || [String(st.status || '').toUpperCase(), 'var(--text-muted)'];
+    return { label, color, reason: st.reason || '' };
+  }
+  if (d && d.book && d.book[c.ticker]) return { label: 'HELD', color: 'var(--green)', reason: 'Owned by the dip-buyer' };
+  if (_dipEntriesDone(d)) return { label: '—', color: 'var(--text-muted)', reason: '' };
+  return { label: 'QUEUED', color: 'var(--accent)', reason: 'Buys at the next open if Claude’s risk check passes' };
+}
+
+function _dipDateLabel(iso) {
+  if (!iso) return '—';
+  const dt = new Date(iso + 'T12:00:00');
+  return isNaN(dt) ? iso : dt.toLocaleDateString([], {month: 'numeric', day: 'numeric'});
+}
+
+function renderDipGrid(d) {
+  const q = (document.getElementById('stockSearch').value || '').toLowerCase();
+  const names = d.names || {};
+  let items = (d.candidates || []).map((c, i) => Object.assign({}, c, { rank: i + 1, name: names[c.ticker] || '' }));
+  if (q) items = items.filter(c => c.ticker.toLowerCase().includes(q) || c.name.toLowerCase().includes(q));
+  const vix = d.vix_close;
+  const vixOk = vix != null && vix >= d.vix_min;
+  const header = `<div class="dip-header">
+      <span>Dip-buyer list · ${_dipDateLabel(d.signal_date)} close</span>
+      <span style="color:${vixOk ? 'var(--green)' : 'var(--text-muted)'};">VIX ${vix != null ? vix.toFixed(2) : '—'} ${vixOk ? `(≥ ${d.vix_min}, buying on)` : `(below ${d.vix_min}, no buys)`}</span>
+      <span>${_dipEntriesDone(d) ? 'Bought at the open' : 'Buys at the next open'}</span>
+    </div>`;
+  if (items.length === 0) {
+    const why = !d.signal_date ? 'Signals haven’t been computed yet (they run after each close).'
+      : !vixOk ? `VIX closed below ${d.vix_min} — the dip-buyer only buys in stressed markets.`
+      : 'No stock met the rules at the last close: above its 200-day average, 2-day RSI under ' + d.rsi2_max + ', $20M+ daily volume.';
+    setStockGridHtml(`<div class="stock-col">${header}<div style="color:var(--text-muted);padding:20px;text-align:center;font-size:12px;">${q ? 'No match for that search.' : why}</div></div>`);
+    return;
+  }
+  const card = c => {
+    const stopPct = _dipStopPct(c, d);
+    const above200 = c.sma200 ? 100 * (c.close / c.sma200 - 1) : null;
+    const chg = c.change_3d_pct;
+    const st = _dipStatus(c, d);
+    return `<button class="stock-btn" id="${btnId(c.ticker)}" onclick="clickDipCandidate('${c.ticker}')">
+      <span class="btn-header">
+        <span class="btn-info">
+          <span class="btn-title-row">
+            <span class="btn-rank">#${c.rank}</span>
+            <span class="btn-ticker">${c.ticker}</span>
+            <span class="btn-name">${c.name}</span>
+          </span>
+          <span class="btn-conv-sig-row">
+            <span class="btn-conv-rr-stack">
+              <span style="font-size:13px;font-weight:700;color:var(--text-primary);">RSI(2) ${(c.rsi2 ?? 0).toFixed(1)}</span>
+              <span style="font-size:13px;font-weight:700;color:${chg != null && chg < 0 ? 'var(--red)' : 'var(--text-primary)'};">3-day ${chg != null ? (chg >= 0 ? '+' : '') + chg.toFixed(1) + '%' : '—'}</span>
+            </span>
+            <span class="btn-sig-stack">
+              <span class="btn-sig-code" style="color:${st.color};border-color:${st.color};">${st.label}</span>
+              <span style="font-size:9px;color:var(--text-muted);">stop ≈ −${stopPct.toFixed(1)}%</span>
+            </span>
+          </span>
+          <span class="btn-meta">Close $${(c.close || 0).toFixed(2)} · 5-day avg $${(c.sma5 || 0).toFixed(2)}</span>
+          <span class="btn-meta-wrap">${[c.sector || '', above200 != null ? `${above200 >= 0 ? '+' : ''}${above200.toFixed(1)}% above 200-day` : '', c.dollar_volume ? `$${(c.dollar_volume / 1e6).toFixed(0)}M/day` : '', c.earnings_date ? `Earnings ${_dipDateLabel(c.earnings_date)}` : ''].filter(Boolean).join(' · ')}</span>
+        </span>
+        <span class="btn-side-col">
+          <span class="btn-chart-box" id="rrspark-${c.ticker}"></span>
+          <span class="btn-chart-box-caption" id="dipcap-${c.ticker}"></span>
+        </span>
+      </span>
+      ${st.reason ? `<span class="btn-desc-block"><span class="btn-thesis">${st.reason}</span></span>` : ''}
+    </button>`;
+  };
+  setStockGridHtml(`<div class="stock-col">${header}${items.map(card).join('')}</div>`);
+  items.forEach(async c => {
+    const points = await _getCardCandlePoints(c.ticker);
+    const el = document.getElementById('rrspark-' + c.ticker);
+    if (!el) return;
+    renderCardCandleLWC(el, points);
+    const cap = document.getElementById('dipcap-' + c.ticker);
+    if (cap && points && points.length >= 2) cap.textContent = `${_dipDateLabel(points[0].time)} → ${_dipDateLabel(points[points.length - 1].time)}`;
+  });
+}
+
+// Chart popup for a dip-buyer card -- the shared #deepDiveModal shell (so it gets the same
+// candlestick chart + TradingView chart as before), with the dip-buyer's own stop line
+// instead of an old Claude report's entry/target lines. Never starts a paid deep dive.
+async function clickDipCandidate(ticker) {
+  const d = dipData || {};
+  const c = (d.candidates || []).find(x => x.ticker === ticker);
+  if (!c) return clickStock(ticker);
+  _ddModalCurrentTicker = ticker;
+  const body = document.getElementById('ddModalBody');
+  disposeChartsIn(body);
+  document.getElementById('ddRunDiveBtn').style.display = '';
+  document.getElementById('ddRerunBtn').style.display = 'none';
+  document.getElementById('ddDiveAgainBtn').style.display = 'none';
+  const name = (d.names || {})[ticker];
+  document.getElementById('ddModalTicker').textContent = `📉 ${ticker}${name ? ' — ' + name : ''} · Dip-buyer`;
+  document.getElementById('ddModalBizSummary').innerHTML = '';
+  const stopPct = _dipStopPct(c, d);
+  const above200 = c.sma200 ? 100 * (c.close / c.sma200 - 1) : null;
+  const st = _dipStatus(c, d);
+  const chip = (label, val, color) => `<span style="background:var(--bg-card);border:1px solid ${color || 'var(--border)'};${color ? 'color:' + color + ';' : ''}padding:4px 10px;border-radius:6px;font-size:12px;">${label} <strong>${val}</strong></span>`;
+  body.innerHTML = `
+    <div style="margin-bottom:14px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px;justify-content:space-between;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;">Price Chart</div>
+          <div id="ddCandleLegend" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+        </div>
+        <div style="font-size:10px;color:var(--accent);cursor:pointer;" onclick="openDipChartExpand('${ticker}')">⤢ Expand</div>
+      </div>
+      <div id="ddCandleChart" style="width:100%;height:280px;border-radius:6px;overflow:hidden;cursor:pointer;" onclick="openDipChartExpand('${ticker}')"></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
+      <span style="border:1px solid ${st.color};color:${st.color};padding:4px 12px;border-radius:6px;font-size:13px;font-weight:700;">${st.label}</span>
+      <span style="color:var(--text-muted);font-size:12px;">${st.reason}</span>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+      ${chip('RSI(2)', (c.rsi2 ?? 0).toFixed(1))}
+      ${chip('3-day', c.change_3d_pct != null ? (c.change_3d_pct >= 0 ? '+' : '') + c.change_3d_pct.toFixed(1) + '%' : '—')}
+      ${chip('Close ' + _dipDateLabel(c.date), '$' + (c.close || 0).toFixed(2))}
+      ${chip('5-day avg', '$' + (c.sma5 || 0).toFixed(2))}
+      ${chip('vs 200-day', above200 != null ? (above200 >= 0 ? '+' : '') + above200.toFixed(1) + '%' : '—')}
+      ${chip('VIX', d.vix_close != null ? d.vix_close.toFixed(2) : '—')}
+      ${chip('Stop ≈', '$' + (c.close * (1 - stopPct / 100)).toFixed(2) + ' (−' + stopPct.toFixed(1) + '%)', '#ef4444')}
+    </div>
+    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;">
+      <div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Why it's on the list</div>
+      <div style="font-size:13px;color:var(--text-primary);line-height:1.5;">It closed above its 200-day average (a long-term uptrend) after a sharp 2–3 day drop (2-day RSI under ${d.rsi2_max}), on a day VIX closed at ${d.vix_min} or higher. The dip-buyer buys at the next open after Claude checks for red flags (earnings, a pending deal, an investigation, bad company news), then sells on the first close above the 5-day average or after ${d.max_hold_sessions || 10} trading days. The stop is 3×ATR below the buy price, kept between ${d.stop_min_pct}% and ${d.stop_max_pct}%.</div>
+    </div>`;
+  document.querySelector('#deepDiveModal .trade-modal').style.width = '760px';
+  document.getElementById('deepDiveModal').classList.add('active');
+  try {
+    const resp = await fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`);
+    const data = await resp.json();
+    if (ticker !== _ddModalCurrentTicker) return;
+    if (data.points && data.points.length >= 2) {
+      renderDetailedStockChart('ddCandleChart', 'ddCandleLegend', data.points, data.technicals,
+        { stop: c.close * (1 - stopPct / 100), takeProfits: [] });
+    }
+  } catch (e) { console.error('clickDipCandidate chart:', ticker, e); }
+  appendTradingViewChart(ticker);
+}
+
+async function openDipChartExpand(ticker) {
+  const c = ((dipData && dipData.candidates) || []).find(x => x.ticker === ticker);
+  if (!c) return openDeepDiveChartExpand(ticker);
+  const stopPct = _dipStopPct(c, dipData);
+  _chartExpandCurrentTicker = ticker;
+  document.getElementById('chartExpandTitle').textContent = `${ticker} — Daily Candlestick (dip-buyer)`;
+  document.getElementById('chartExpandBody').innerHTML = spinnerHtml();
+  document.getElementById('chartExpandModal').style.display = 'flex';
+  let data;
+  try {
+    data = await (await fetch(`/api/stock-chart/${encodeURIComponent(ticker)}`)).json();
+  } catch (e) { console.error('openDipChartExpand:', ticker, e); return; }
+  if (ticker !== _chartExpandCurrentTicker) return;
+  if (!data.points || data.points.length < 2) {
+    document.getElementById('chartExpandBody').innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted);">No price history available</div>';
+    return;
+  }
+  document.getElementById('chartExpandBody').innerHTML = `
+    <div id="ddCandleExpandLegend" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;"></div>
+    <div id="ddCandleExpandChart" style="height:520px;border-radius:6px;overflow:hidden;"></div>`;
+  renderDetailedStockChart('ddCandleExpandChart', 'ddCandleExpandLegend', data.points, data.technicals,
+    { stop: c.close * (1 - stopPct / 100), takeProfits: [] });
 }
 
 // "On Shore" grid (2026-07-19) -- today's quick_screen survivors that got a real analysis
@@ -5617,7 +5826,7 @@ allContent.forEach((content, i) => {
 // ── Search filter ──────────────────────────────────────────────────────────
 
 document.getElementById('stockSearch').addEventListener('input', () => {
-  if (_stockView === 'ondeck') renderNearMissGrid(nearMissData);
+  if (_stockView === 'ondeck') renderOnDeckView();
   else renderTodayScanGrid(todayScanData);
 });
 

@@ -7009,6 +7009,13 @@ class DashboardState:
         entry = self.add_ai_log(ticker, "DIP", msg, level)
         await self.broadcast({"type": "ai_log", "entry": entry})
 
+    async def _sd_mark(self, ticker: str, status: str, reason: str, level: str = "warning") -> None:
+        """Record what happened to one candidate this session -- shown on its On Deck card
+        (bought / vetoed / skipped / waiting) -- and put the same line in the AI feed."""
+        self._stress_dip_state.setdefault("status", {})[ticker] = {
+            "status": status, "reason": reason, "at": datetime.now().isoformat(timespec="seconds")}
+        await self._sd_log(f"Claude vetoed: {reason}" if status == "vetoed" else reason, level, ticker=ticker)
+
     async def _stress_dip_sessions(self) -> list[dict]:
         """Alpaca's market calendar, three weeks back to a week ahead, as
         [{date, open, close}] strings (ET), cached per ET day. Half-days carry their real
@@ -7066,6 +7073,13 @@ class DashboardState:
             "entries_done_date": st.get("entries_done_date"),
             "last_error": st.get("last_error"),
             "book": self._stress_dip_book,
+            "status": st.get("status") or {},
+            # Display names from the cached research reports where one exists (free).
+            "names": {c["ticker"]: (c.get("company")
+                                    or (self.research_reports.get(c["ticker"]) or {}).get("company_name", ""))
+                      for c in (st.get("candidates") or [])[:25]},
+            "stop_atr_mult": cfg.stop_atr_mult, "stop_min_pct": cfg.stop_min_pct,
+            "stop_max_pct": cfg.stop_max_pct, "max_hold_sessions": cfg.max_hold_sessions,
             "on_deck_pipeline_enabled": self._on_deck_pipeline_enabled(),
         }
 
@@ -7141,18 +7155,26 @@ class DashboardState:
                     f" -- retrying in 15 min", "warning")
                 return
             ranked = sdip.rank_candidates(snaps, vix_close, cfg)
+            # Company name / sector / next earnings for the cards (top 25 only -- two Yahoo
+            # calls each). Display only: the buy path re-checks earnings and sector itself.
+            top = [c.ticker for c in ranked[:25]]
+            facts = await asyncio.to_thread(lambda: {t: _sd_ticker_facts(t) for t in top})
             cands = []
             for c in ranked[:50]:
                 d = {k: getattr(c, k) for k in ("ticker", "date", "close", "sma5", "sma200", "rsi2", "atr",
                                                  "dollar_volume", "last4_closes", "change_3d_pct")}
                 d["atr_pct"] = c.atr_pct
+                f = facts.get(c.ticker) or {}
+                d["company"] = f.get("company") if f.get("company") != c.ticker else ""
+                d["sector"] = f.get("sector", "")
+                d["earnings_date"] = f.get("earnings_date", "")
                 cands.append(d)
             self._stress_dip_state = {
                 "signal_date": session_date, "vix_close": vix_close,
                 "computed_at": datetime.now().isoformat(timespec="seconds"),
                 "universe": len(tickers), "with_data": len(snaps), "candidates": cands,
                 "entries_done_date": self._stress_dip_state.get("entries_done_date"),
-                "last_error": None,
+                "last_error": None, "status": {},
             }
             self._stress_dip_refresh_retry_at = None
             await asyncio.to_thread(_save_stress_dip_state, dict(self._stress_dip_state))
@@ -7219,17 +7241,23 @@ class DashboardState:
                 if await self._stress_dip_try_buy(c, vix, cfg, today):
                     bought += 1
             except Exception as e:
-                await self._sd_log(f"Buy attempt failed: {e}", "error", ticker=t)
+                await self._sd_mark(t, "skipped", f"Buy attempt failed: {e}", "error")
+        statuses = self._stress_dip_state.setdefault("status", {})
+        for c in cands:
+            if c["ticker"] not in statuses and c["ticker"] not in self.portfolio.positions:
+                statuses[c["ticker"]] = {"status": "waiting", "reason": "No free slot this session",
+                                         "at": datetime.now().isoformat(timespec="seconds")}
+        await asyncio.to_thread(_save_stress_dip_state, dict(self._stress_dip_state))
         await self._sd_log(f"Dip-buyer: done for today -- {bought} buy(s)", "success" if bought else "info")
 
     async def _stress_dip_try_buy(self, c: dict, vix: float, cfg, today: str) -> bool:
         t = c["ticker"]
         if not self.risk_manager.check_wash_sale_cooldown(t, self.portfolio):
-            await self._sd_log("Skipped -- wash-sale rebuy block (recent losing sale)", "warning", ticker=t)
+            await self._sd_mark(t, "skipped", "Skipped -- wash-sale rebuy block (recent losing sale)")
             return False
         soon, edate = await self._earnings_soon(t)
         if soon:
-            await self._sd_log(f"Skipped -- earnings on {edate} (2-day auto-buy blackout)", "warning", ticker=t)
+            await self._sd_mark(t, "skipped", f"Skipped -- earnings on {edate} (2-day auto-buy blackout)")
             return False
         facts = await asyncio.to_thread(_sd_ticker_facts, t)
         sector = facts.get("sector", "")
@@ -7242,7 +7270,7 @@ class DashboardState:
                 or (pending_same and self.risk_manager.sector_concentration_enabled
                     and sum(1 for p in self.portfolio.positions.values() if p.sector == sector)
                     + pending_same >= self.risk_manager.max_sector_positions)):
-            await self._sd_log(f"Skipped -- sector limit reached ({sector})", "warning", ticker=t)
+            await self._sd_mark(t, "skipped", f"Skipped -- sector limit reached ({sector})")
             return False
         # Alpaca's live quote first (it is what the market order will meet), Yahoo second.
         price = 0.0
@@ -7257,7 +7285,7 @@ class DashboardState:
             except Exception:
                 price = 0.0
         if not is_usable_price(price) or price <= 0:
-            await self._sd_log("Skipped -- no usable live price", "warning", ticker=t)
+            await self._sd_mark(t, "skipped", "Skipped -- no usable live price")
             return False
         snap = sdip.TickerSnapshot(**{k: c.get(k) for k in (
             "ticker", "date", "close", "sma5", "sma200", "rsi2", "atr", "dollar_volume",
@@ -7289,12 +7317,11 @@ class DashboardState:
             "raw": None if verdict is not None else (text or "")[:500],
         }))
         if verdict is None:
-            await self._sd_log("Skipped -- Claude risk check failed or unreadable (no buy without it)",
-                               "warning", ticker=t)
+            await self._sd_mark(t, "skipped", "Skipped -- Claude risk check failed or unreadable (no buy without it)")
             return False
         veto, reason = verdict
         if veto:
-            await self._sd_log(f"Claude vetoed: {reason}", "warning", ticker=t)
+            await self._sd_mark(t, "vetoed", reason)
             return False
         if self.paused or self.stopped or not self._is_market_open():
             return False
@@ -7309,7 +7336,7 @@ class DashboardState:
                 self._reserved_cash += size
                 reserved = size
         if reserved <= 0:
-            await self._sd_log("Skipped -- not enough cash above the reserve floor", "warning", ticker=t)
+            await self._sd_mark(t, "skipped", "Skipped -- not enough cash above the reserve floor")
             return False
         try:
             from types import SimpleNamespace
@@ -7338,7 +7365,7 @@ class DashboardState:
                 return False
             order = await self.order_manager.execute(signal)
             if not order or order.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
-                await self._sd_log(f"Buy order not accepted ({getattr(order, 'status', None)})", "error", ticker=t)
+                await self._sd_mark(t, "skipped", f"Buy order not accepted ({getattr(order, 'status', None)})", "error")
                 return False
             if t not in self.portfolio.positions:
                 self._register_pending_buy(t, size)
@@ -7349,6 +7376,9 @@ class DashboardState:
                 "at": datetime.now().isoformat(timespec="seconds"),
             }
             await asyncio.to_thread(_save_stress_dip_book, dict(self._stress_dip_book))
+            self._stress_dip_state.setdefault("status", {})[t] = {
+                "status": "bought", "reason": f"Bought ${size:,.0f}; Claude check: {reason}",
+                "at": datetime.now().isoformat(timespec="seconds")}
             await self._log_buy_trade(signal, order)
             _fp = order.filled_price or signal.entry_price
             await self.broadcast({"type": "trade_executed", "trade": {
