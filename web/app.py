@@ -7305,6 +7305,12 @@ class DashboardState:
                 d["earnings_date"] = f.get("earnings_date", "")
                 d["ex_dividend_date"] = f.get("ex_dividend_date", "")
                 cands.append(d)
+            # The day's statuses reset below; a held short keeps why it was shorted in its book entry.
+            for _t, _b in self._short_book.items():
+                _st = (self._short_state.get("status") or {}).get(_t) or {}
+                if not _b.get("reason") and _st.get("status") == "shorted" and _st.get("reason"):
+                    _b["reason"] = _st["reason"]
+            await asyncio.to_thread(_save_short_mirror_book, dict(self._short_book))
             self._short_state = {
                 "signal_date": session_date, "vix_close": vix_close,
                 "computed_at": datetime.now().isoformat(timespec="seconds"),
@@ -7557,7 +7563,7 @@ class DashboardState:
                 "ref_close": snap.close, "atr": snap.atr, "stop": stop, "stop_pct": round(stop_pct, 2),
                 "stop_order_id": None, "open_order_id": order.broker_order_id, "rsi2": snap.rsi2,
                 "vix": vix, "sector": sector, "company": facts.get("company") or t,
-                "last_price": entry, "unrealized_pnl": 0.0,
+                "last_price": entry, "unrealized_pnl": 0.0, "reason": f"Claude check: {reason}",
                 "at": datetime.now().isoformat(timespec="seconds"),
             }
             await asyncio.to_thread(_save_short_mirror_book, dict(self._short_book))

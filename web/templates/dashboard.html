@@ -3076,6 +3076,7 @@ function renderDetailedStockChart(containerId, legendId, points, technicals, ref
   if (refLines) {
     priceLine(refLines.entry,    '#3b82f6', 'Entry',      LightweightCharts.LineStyle.Solid);
     priceLine(refLines.stop,     '#ef4444', 'Stop',       LightweightCharts.LineStyle.Solid);
+    priceLine(refLines.trail,    '#f59e0b', 'Trail');
     // Label counting from the END of the array, not the start (mirrors the Price Levels
     // ladder's own 2026-07-24 fix, showPositionDetail) -- take_profit_targets shrinks
     // from the front as each tranche fires (T1 fires -> [T2, T3] remain), so indexing
@@ -5247,12 +5248,55 @@ function renderShortGrid(sd, waiting) {
   });
 }
 
+// The trade itself, for a short the bot holds (2026-11-27, owner: "i need the charts when there brought up in
+// positions to show the trade info as well"): shares, entry, live P&L, the buy stop and trail, and why it was shorted.
+function shortTradeBlockHtml(ticker, b, sd) {
+  const qty = Number(b.qty || 0), entry = Number(b.entry_price || 0), cur = Number(b.last_price || entry);
+  const pnl = (entry - cur) * qty, pnlPct = entry ? (entry - cur) / entry * 100 : 0;
+  const today = new Date().toISOString().slice(0, 10);
+  const last = Number(b.lastday_price || 0);
+  const ref = (String(b.entry_date) === today || !last) ? entry : last;
+  const day = (ref - cur) * qty;
+  const stop = Number(b.stop || 0), trail = Number(b.trail || 0);
+  const trailOn = trail > 0 && trail < stop;
+  const inForce = trailOn ? trail : stop;
+  const lock = entry ? (entry - inForce) / entry * 100 : 0;   // + = profit locked in if it covers at the stop
+  const opened = b.at ? parseUtcTimestamp(b.at) : null;
+  const openedTxt = opened && !isNaN(opened)
+    ? opened.toLocaleString([], { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+    : (b.entry_date || '—');
+  const daysHeld = opened && !isNaN(opened) ? Math.floor((Date.now() - opened.getTime()) / 86400000) : null;
+  const maxHold = (sd && sd.max_hold_sessions) || 20;
+  const money = (v) => `${v >= 0 ? '+$' : '-$'}${Math.abs(v).toFixed(2)}`;
+  const cl = (v) => v >= 0 ? 'var(--green)' : 'var(--red)';
+  const row = (label, val) => `<div style="display:flex;justify-content:space-between;gap:12px;padding:3px 0;border-bottom:1px solid var(--border);"><span style="color:var(--text-muted);">${label}</span><span style="text-align:right;">${val}</span></div>`;
+  const stLine = ((sd && sd.status) || {})[ticker];
+  const why = String(b.reason || (stLine && stLine.status === 'shorted' ? stLine.reason : '') || '').replace(/^Shorted [^;]*; /, '');
+  return `<div style="background:var(--bg-card);border:1px solid rgba(239,68,68,.55);border-radius:8px;padding:12px;margin-bottom:12px;font-size:12.5px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+        <span style="border:1px solid var(--red);color:var(--red);padding:3px 10px;border-radius:6px;font-size:12px;font-weight:700;">SHORT</span>
+        <span style="font-size:15px;font-weight:700;color:${cl(pnl)};">${money(pnl)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)</span>
+        <span style="color:var(--text-muted);">today <span style="color:${cl(day)};">${money(day)}</span></span>
+      </div>
+      ${row('Position', `Short ${qty} shares @ $${entry.toFixed(2)} ($${(qty * entry).toFixed(2)})`)}
+      ${row('Now', `$${cur.toFixed(2)} · value -$${(qty * cur).toFixed(2)}`)}
+      ${row('Opened', `${openedTxt} · ${daysHeld === null ? '—' : daysHeld < 1 ? 'today' : daysHeld + 'd ago'} · time limit: day ${maxHold}`)}
+      ${row('Buy stop (at Alpaca)', `$${stop.toFixed(2)} (+${entry ? ((stop - entry) / entry * 100).toFixed(1) : '—'}% over the short)${!trailOn ? ' · in force' : ''}`)}
+      ${row('Trailing stop', trailOn
+        ? `<span style="color:#f59e0b;">$${trail.toFixed(2)}</span> · in force${b.trail_low ? ` · low since the short $${Number(b.trail_low).toFixed(2)}` : ''}`
+        : `not on yet — it starts once the price trades under $${entry.toFixed(2)} (set each evening)`)}
+      ${row('If it covers at the stop', `<span style="color:${cl(lock)};">${lock >= 0 ? 'keeps' : 'loses'} ${Math.abs(lock).toFixed(1)}% (${money((entry - inForce) * qty)})</span>`)}
+      ${row('Why it was shorted', `RSI(2) ${b.rsi2 != null ? Number(b.rsi2).toFixed(1) : '—'} · VIX ${b.vix != null ? Number(b.vix).toFixed(2) : '—'}${b.sector ? ' · ' + b.sector : ''}`)}
+      ${why ? `<div style="margin-top:6px;color:var(--text-primary);line-height:1.45;">${why}</div>` : ''}
+    </div>`;
+}
+
 // Chart popup for a short-list card: the same shell as the dip popup, with the buy stop ABOVE.
 async function clickShortCandidate(ticker) {
   const sd = shortData || {};
   let c = (sd.candidates || []).find(x => x.ticker === ticker);
   const b = (sd.book || {})[ticker];
-  if (!c && b) c = { ticker, company: b.company || '', close: b.entry_price, rsi2: b.rsi2, atr: b.atr, date: b.entry_date };
+  if (!c && b) c = { ticker, company: b.company || '', close: b.entry_price, rsi2: b.rsi2, atr: b.atr, date: b.entry_date, held: true };
   if (!c) return clickStock(ticker);
   _ddModalCurrentTicker = ticker;
   const body = document.getElementById('ddModalBody');
@@ -5260,7 +5304,7 @@ async function clickShortCandidate(ticker) {
   document.getElementById('ddRunDiveBtn').style.display = '';
   document.getElementById('ddRerunBtn').style.display = 'none';
   document.getElementById('ddDiveAgainBtn').style.display = 'none';
-  document.getElementById('ddModalTicker').textContent = `▼ ${ticker}${c.company ? ' — ' + c.company : ''} · Short mirror`;
+  document.getElementById('ddModalTicker').textContent = `▼ ${ticker}${c.company ? ' — ' + c.company : ''} · ${b ? 'Short position' : 'Short mirror'}`;
   document.getElementById('ddModalBizSummary').innerHTML = '';
   const stopPct = _shortStopPct(c, sd);
   const stopPx = b ? Number(b.stop) : c.close * (1 + stopPct / 100);
@@ -5278,14 +5322,14 @@ async function clickShortCandidate(ticker) {
       </div>
       <div id="ddCandleChart" style="width:100%;height:280px;border-radius:6px;overflow:hidden;cursor:pointer;" onclick="openDeepDiveChartExpand('${ticker}')"></div>
     </div>
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
+    ${b ? shortTradeBlockHtml(ticker, b, sd) : `<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;">
       <span style="border:1px solid ${st.color};color:${st.color};padding:4px 12px;border-radius:6px;font-size:13px;font-weight:700;">${st.label}</span>
       <span style="color:var(--text-muted);font-size:12px;">${st.reason}</span>
-    </div>
+    </div>`}
     <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
       ${chip('RSI(2)', (c.rsi2 ?? 0).toFixed(1))}
       ${chip('3-day', c.change_3d_pct != null ? (c.change_3d_pct >= 0 ? '+' : '') + c.change_3d_pct.toFixed(1) + '%' : '—')}
-      ${chip((b ? 'Shorted ' : 'Close ') + _dipDateLabel(c.date), '$' + (c.close || 0).toFixed(2))}
+      ${chip((c.held ? 'Shorted ' : 'Close ') + _dipDateLabel(c.date), '$' + (c.close || 0).toFixed(2))}
       ${chip('vs 200-day', vs200 != null ? vs200.toFixed(1) + '%' : '—')}
       ${chip('VIX', sd.vix_close != null ? sd.vix_close.toFixed(2) : '—')}
       ${chip('Buy stop ≈', '$' + stopPx.toFixed(2) + ' (+' + stopPct.toFixed(1) + '%)', '#ef4444')}
@@ -5304,8 +5348,11 @@ async function clickShortCandidate(ticker) {
     const data = await resp.json();
     if (ticker !== _ddModalCurrentTicker) return;
     if (data.points && data.points.length >= 2) {
+      const trailOn = b && b.trail && Number(b.trail) < Number(b.stop);
       renderDetailedStockChart('ddCandleChart', 'ddCandleLegend', data.points, data.technicals,
-        { stop: stopPx, takeProfits: [] });
+        b ? { entry: Number(b.entry_price), stop: Number(b.stop), trail: trailOn ? Number(b.trail) : null,
+              entryTime: b.at || b.entry_date, takeProfits: [] }
+          : { stop: stopPx, takeProfits: [] });
     }
   } catch (e) { console.error('clickShortCandidate chart:', ticker, e); }
   appendTradingViewChart(ticker);
