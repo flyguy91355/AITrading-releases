@@ -6760,10 +6760,12 @@ class DashboardState:
         minus both in-flight promotion reservations and accepted-but-unsettled buys.
         Every buy path's cash gate reads this so no two paths can spend the same
         dollars (2026-09-01, full-codebase review)."""
-        # minus short_liability (Short Mirror, 2026-11-27): Alpaca's cash holds the short-sale
-        # proceeds, which long buys must never spend.
+        # Open shorts count against it (Short Mirror, 2026-11-27, owner: "Yes, count them"): Alpaca's
+        # cash holds the short-sale proceeds AND the money the shorts tie up is not free -- long buys
+        # may use only free cash (account value - longs - shorts = cash - 2 x short liability), the
+        # same figure as the dashboard's Cash card, so no margin is used for longs on top of shorts.
         return (self.portfolio.cash - self._reserved_cash - self._pending_buy_commitment()
-                - (getattr(self.portfolio, "short_liability", 0.0) or 0.0))
+                - 2 * (getattr(self.portfolio, "short_liability", 0.0) or 0.0))
 
     def _register_pending_buy(self, ticker: str, amount: float) -> None:
         """Hold `amount` committed until this ticker's fill is reconciled. Called right
