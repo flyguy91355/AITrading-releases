@@ -35,6 +35,8 @@ import json
 import math
 from dataclasses import dataclass, field
 
+from src.strategy import volume_profile as vprof
+
 STRESS_DIP_DEFAULTS = {
     "enabled": True,
     "slots": 20,                      # owner 2026-11-27: "make it 20" (was 10)
@@ -64,7 +66,28 @@ STRESS_DIP_DEFAULTS = {
     # risk-tier drawdown halt do NOT apply to this strategy's buys -- they would block it on
     # exactly the stress days it is built for. Hard stops on every position still apply.
     "drawdown_halt_pct": 20.0,
+    # Pick order (2026-11-28, owner: "i can turn it on or off in settings"): the order free
+    # slots fill in -- "rsi2" (lowest first, the original rule), "volume_profile" (furthest
+    # under the 63-session point of control, in ATRs) or "move3" (biggest 3-day drop). Only the
+    # order changes, never which stocks qualify. Research:
+    # docs/research/2026-11-28-volume-profile-video/README.md (forward returns, not yet a
+    # portfolio backtest -- the owner: "we will backtest later for proper settings").
+    "rank_by": "rsi2",
+    # exit_mode "tighten" (2026-11-28, owner: "an exit that uses a tightening trailing stop like
+    # in aidaytrading", "live every minute"): the stop trails the best price since the buy and
+    # its distance shrinks tighten_by_pct for every tighten_every_pct the price rises, never
+    # closer than tighten_floor_pct; it starts at tighten_start_pct (0 = the position's own stop
+    # %). Moved live; the broker stop only changes on a tighten_min_move_pct+ move.
+    # AIDayTrading's numbers (daytrader/config.py VwapTrailCfg), to be tuned by backtest.
+    "tighten_start_pct": 0.0,
+    "tighten_every_pct": 0.1,
+    "tighten_by_pct": 0.2,
+    "tighten_floor_pct": 2.0,
+    "tighten_min_move_pct": 0.2,
 }
+
+RANK_BY_CHOICES = ("rsi2", "volume_profile", "move3")
+EXIT_MODES = ("trail", "average", "tighten")
 
 # The research engine's dial for the veto call (research.model_stress_dip_veto).
 DEFAULT_VETO_MODEL = "claude-haiku-5-5"
@@ -92,6 +115,12 @@ class StressDipConfig:
     entry_window_minutes: int
     exit_minutes_before_close: int
     drawdown_halt_pct: float
+    rank_by: str
+    tighten_start_pct: float
+    tighten_every_pct: float
+    tighten_by_pct: float
+    tighten_floor_pct: float
+    tighten_min_move_pct: float
 
 
 def stress_dip_cfg(raw: dict | None) -> StressDipConfig:
@@ -122,19 +151,32 @@ def stress_dip_cfg(raw: dict | None) -> StressDipConfig:
         entry_window_minutes=int(merged["entry_window_minutes"]),
         exit_minutes_before_close=int(merged["exit_minutes_before_close"]),
         drawdown_halt_pct=float(merged["drawdown_halt_pct"]),
+        rank_by=_rank_by(merged["rank_by"]),
+        tighten_start_pct=float(merged["tighten_start_pct"]),
+        tighten_every_pct=float(merged["tighten_every_pct"]),
+        tighten_by_pct=float(merged["tighten_by_pct"]),
+        tighten_floor_pct=float(merged["tighten_floor_pct"]),
+        tighten_min_move_pct=float(merged["tighten_min_move_pct"]),
     )
 
 
 def _exit_mode(v) -> str:
     m = str(v).strip().lower()
-    if m not in ("trail", "average"):
-        raise ValueError(f"exit_mode must be 'trail' or 'average', not {v!r}")
+    if m not in EXIT_MODES:
+        raise ValueError(f"exit_mode must be 'trail', 'average' or 'tighten', not {v!r}")
     return m
+
+
+def _rank_by(v) -> str:
+    """The pick order. Anything unknown is the original order (RSI(2)): an order is only a
+    preference, so a typo must never stop the evening refresh."""
+    m = str(v or "").strip().lower()
+    return m if m in RANK_BY_CHOICES else "rsi2"
 
 
 def max_hold(cfg: "StressDipConfig") -> int:
     """Sessions until the time exit, for the configured exit mode."""
-    return cfg.trail_max_hold_sessions if cfg.exit_mode == "trail" else cfg.max_hold_sessions
+    return cfg.trail_max_hold_sessions if cfg.exit_mode in ("trail", "tighten") else cfg.max_hold_sessions
 
 
 def _as_bool(v) -> bool:
@@ -226,6 +268,7 @@ class TickerSnapshot:
     dollar_volume: float | None
     last4_closes: list[float] = field(default_factory=list)
     change_3d_pct: float | None = None
+    vp: "vprof.VolumeProfile | None" = None     # the 63-session volume profile (pick order)
 
     @property
     def atr_pct(self) -> float | None:
@@ -234,10 +277,12 @@ class TickerSnapshot:
         return 100.0 * self.atr / self.close
 
 
-def snapshot_from_bars(ticker: str, rows: list[dict]) -> TickerSnapshot | None:
+def snapshot_from_bars(ticker: str, rows: list[dict],
+                       vp_cfg: "vprof.VpConfig | None" = None) -> TickerSnapshot | None:
     """rows: completed daily bars, oldest first, each {date, open, high, low, close, volume}.
     Rows with a non-finite OHLC are dropped first. Returns None when there isn't enough
-    clean history to judge (fewer than 200 closes)."""
+    clean history to judge (fewer than 200 closes). With vp_cfg, also the volume profile of
+    the sessions before the last one (None when it can't be judged)."""
     clean = [r for r in rows if all(_finite(r.get(k)) for k in ("high", "low", "close"))]
     if len(clean) < 200:
         return None
@@ -248,12 +293,14 @@ def snapshot_from_bars(ticker: str, rows: list[dict]) -> TickerSnapshot | None:
                  if _finite(r.get("volume"))]
     dv = sum(dv_window) / len(dv_window) if len(dv_window) >= 45 else None
     c = closes[-1]
+    atr = atr_wilder(highs, lows, closes, 14)
     return TickerSnapshot(
         ticker=ticker, date=str(clean[-1]["date"])[:10], close=c,
         sma5=sma(closes, 5), sma200=sma(closes, 200), rsi2=rsi_wilder(closes, 2),
-        atr=atr_wilder(highs, lows, closes, 14), dollar_volume=dv,
+        atr=atr, dollar_volume=dv,
         last4_closes=closes[-4:],
         change_3d_pct=(100.0 * (c / closes[-4] - 1)) if len(closes) >= 4 and closes[-4] else None,
+        vp=vprof.profile(clean, c, atr, vp_cfg) if vp_cfg is not None else None,
     )
 
 
@@ -282,10 +329,79 @@ def qualifies(s: TickerSnapshot, vix_close: float | None, cfg: StressDipConfig) 
 
 def rank_candidates(snaps: dict[str, TickerSnapshot], vix_close: float | None,
                     cfg: StressDipConfig) -> list[TickerSnapshot]:
-    """Qualifiers, lowest RSI(2) first (ties: larger 3-day drop first, then ticker)."""
+    """Qualifiers in the configured pick order (cfg.rank_by). The order never changes WHICH stocks
+    qualify. "rsi2": lowest RSI(2) first (ties: larger 3-day drop, then ticker). "volume_profile":
+    furthest under the point of control in ATRs first; stocks with no profile after all that have
+    one. "move3": biggest 3-day drop first; an unknown change last. Ties: RSI(2), then ticker."""
     picks = [s for s in snaps.values() if qualifies(s, vix_close, cfg)]
-    picks.sort(key=lambda s: (s.rsi2, s.change_3d_pct if s.change_3d_pct is not None else 0.0, s.ticker))
+    picks.sort(key=lambda s: rank_key(cfg.rank_by, "long", s.rsi2, s.change_3d_pct,
+                                      s.vp.poc_atr if s.vp is not None else None, s.ticker))
     return picks
+
+
+def rank_key(rank_by: str, side: str, rsi2, change_3d_pct, poc_atr, ticker: str) -> tuple:
+    """The one sort key for both sides' pick orders (snapshots at the evening refresh AND the
+    stored candidate dicts re-sorted when the owner changes the order in Settings). side "long":
+    lowest RSI(2) / most under the POC / biggest drop first; "short": the mirror. A missing value
+    sorts after every present one; it never drops a stock."""
+    s = 1.0 if side == "long" else -1.0
+    r = float(rsi2) if _finite(rsi2) else 0.0
+    chg = float(change_3d_pct) if _finite(change_3d_pct) else None
+    if rank_by == "volume_profile":
+        pa = float(poc_atr) if _finite(poc_atr) else None
+        return (pa is None, s * pa if pa is not None else 0.0, s * r, ticker)
+    if rank_by == "move3":
+        return (chg is None, s * chg if chg is not None else 0.0, s * r, ticker)
+    return (s * r, s * chg if chg is not None else 0.0, ticker)
+
+
+def rerank_dicts(cands: list[dict], rank_by: str, side: str) -> list[dict]:
+    """The stored candidate cards in the given pick order (same key as the evening refresh)."""
+    return sorted(cands, key=lambda c: rank_key(rank_by, side, c.get("rsi2"), c.get("change_3d_pct"),
+                                                c.get("poc_atr"), str(c.get("ticker", ""))))
+
+
+# Settings-page coercions (a ValueError aborts the whole save, so nothing half-applies).
+def coerce_rank_by(v) -> str:
+    m = str(v or "").strip().lower()
+    if m not in RANK_BY_CHOICES:
+        raise ValueError(f"pick order must be one of {', '.join(RANK_BY_CHOICES)}, got {v!r}")
+    return m
+
+
+def coerce_exit_mode(v) -> str:
+    return _exit_mode(v)
+
+
+def coerce_tighten_pct(v) -> float:
+    """A tightening-trail number: above 0 and at most 50 (%)."""
+    x = float(str(v).strip())
+    if not math.isfinite(x) or not 0 < x <= 50:
+        raise ValueError(f"tightening trail numbers must be above 0 and at most 50, got {v!r}")
+    return x
+
+
+def coerce_tighten_start_pct(v) -> float:
+    """The trail's starting width: 0 (= the position's own stop %) up to 50 (%)."""
+    x = float(str(v).strip())
+    if not math.isfinite(x) or not 0 <= x <= 50:
+        raise ValueError(f"the tightening trail's start must be 0-50 (0 = the stock's own stop %), got {v!r}")
+    return x
+
+
+def rank_value_label(c: dict, rank_by: str, side: str) -> str:
+    """The ranking number for the log line ("best first: ..."), for a candidate dict. side is
+    "long" or "short" (which way the POC distance reads)."""
+    if rank_by == "volume_profile":
+        x = c.get("poc_atr")
+        if not _finite(x):
+            return "no profile"
+        return f"{abs(float(x)):.1f} ATR {'under' if float(x) < 0 else 'over'} POC"
+    if rank_by == "move3":
+        x = c.get("change_3d_pct")
+        return f"3-day {float(x):+.1f}%" if _finite(x) else "3-day n/a"
+    x = c.get("rsi2")
+    return f"RSI2 {float(x):.1f}" if _finite(x) else "RSI2 n/a"
 
 
 def stop_distance_pct(atr: float, ref_close: float, cfg: StressDipConfig) -> float:
@@ -366,6 +482,41 @@ def trail_price(entry: float, highest_high: float, start_pct: float, cfg: Stress
         return 0.0
     w = stepped_trail_width(entry, highest_high, start_pct, cfg)
     return round(highest_high * (1 - w / 100.0), 2)
+
+
+def tighten_trail_price(entry: float, best_high: float, start_pct: float, cfg: StressDipConfig) -> float:
+    """exit_mode "tighten" (AIDayTrading's trail, mirrored for a long): the stop sits `width`%
+    under the best price since the buy, width = start - by/every x the % gain, never under the
+    floor. Rounded to the cent. 0.0 while the best price hasn't traded over the buy (not armed:
+    the hard stop rules), or on any bad input."""
+    vals = (entry, best_high, start_pct, cfg.tighten_every_pct, cfg.tighten_by_pct, cfg.tighten_floor_pct)
+    if not all(_finite(x) for x in vals) or entry <= 0 or start_pct <= 0 or cfg.tighten_every_pct <= 0:
+        return 0.0
+    if best_high <= entry:
+        return 0.0
+    gain = (best_high - entry) / entry * 100.0
+    width = max(cfg.tighten_floor_pct, start_pct - cfg.tighten_by_pct / cfg.tighten_every_pct * gain)
+    if not 0 < width < 100:
+        return 0.0
+    return round(best_high * (1 - width / 100.0), 2)
+
+
+def tighten_start(book_stop_pct: float | None, cfg) -> float:
+    """Where the tightening trail starts: tighten_start_pct when set (> 0), else the position's
+    own stop % (3 x ATR, clipped) from its book entry. Shared with the short mirror."""
+    if _finite(cfg.tighten_start_pct) and cfg.tighten_start_pct > 0:
+        return float(cfg.tighten_start_pct)
+    return float(book_stop_pct) if _finite(book_stop_pct) else 0.0
+
+
+def tighten_should_move(current: float | None, new: float, min_move_pct: float) -> bool:
+    """A long's live trail moves only UP, and only by min_move_pct% or more (fewer broker stop
+    changes, like AIDayTrading's TRAIL_MIN_MOVE). No current trail: any armed value moves it."""
+    if not _finite(new) or new <= 0:
+        return False
+    if not _finite(current) or not current or current <= 0:
+        return True
+    return new >= current * (1 + max(0.0, min_move_pct) / 100.0) - 1e-9
 
 
 def sessions_held(entry_date: str, completed_dates: list[str], today: str) -> int:

@@ -656,6 +656,180 @@ input[type=time].setting-input { font-family: monospace; }
     </div>
   </div>
 
+  <!-- DIP-BUYER & SHORT MIRROR (2026-11-28): pick order (volume profile) + exits (tightening trail).
+       Design: docs/superpowers/specs/2026-11-28-volume-profile-pick-order-design.md. settings_page() fills
+       every field from the code defaults when settings.yaml lacks it. -->
+  <div class="section">
+    <div class="section-title">Dip-Buyer &amp; Short Mirror</div>
+    <div class="settings-grid">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Dip-Buyer Pick Order <button type="button" class="info-btn" onclick="showInfo(event,'Which qualifying stocks fill the free slots first. Only the ORDER changes: the same stocks qualify either way. RSI(2): lowest first (the original rule). Volume profile: the stock furthest under its point of control (the price where the most shares traded over the last N sessions), measured in ATRs. Biggest 3-day drop: the steepest fall first. Research 2026-11-28: on stressed days the RSI(2) order picked no better than an average qualifier; the volume-profile and 3-day-drop orders did better (forward returns only, not yet a full backtest). Changing it re-sorts the current list at once.')">i</button></div>
+          <div class="setting-desc">Which qualifiers fill the long slots first</div>
+        </div>
+        <select class="setting-input" name="stress_dip.rank_by">
+          <option value="rsi2" {% if cfg.stress_dip.rank_by == 'rsi2' %}selected{% endif %}>RSI(2)</option>
+          <option value="volume_profile" {% if cfg.stress_dip.rank_by == 'volume_profile' %}selected{% endif %}>Volume profile</option>
+          <option value="move3" {% if cfg.stress_dip.rank_by == 'move3' %}selected{% endif %}>3-day drop</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">RSI(2)</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Short Mirror Pick Order <button type="button" class="info-btn" onclick="showInfo(event,'Which qualifying stocks fill the free short slots first. Only the ORDER changes. RSI(2): highest first (the original rule). Volume profile: furthest OVER its point of control, in ATRs. Biggest 3-day rise: the steepest bounce first. The short-side orders have not been tested yet. Changing it re-sorts the current list at once.')">i</button></div>
+          <div class="setting-desc">Which qualifiers fill the short slots first</div>
+        </div>
+        <select class="setting-input" name="short_mirror.rank_by">
+          <option value="rsi2" {% if cfg.short_mirror.rank_by == 'rsi2' %}selected{% endif %}>RSI(2)</option>
+          <option value="volume_profile" {% if cfg.short_mirror.rank_by == 'volume_profile' %}selected{% endif %}>Volume profile</option>
+          <option value="move3" {% if cfg.short_mirror.rank_by == 'move3' %}selected{% endif %}>3-day rise</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">RSI(2)</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Dip-Buyer Exit <button type="button" class="info-btn" onclick="showInfo(event,'Stepped trail: the trail narrows through +4.7% and +6.6% to 0.5% under the high at +8.4%, moved once a night from the day high. Tightening trail: like AIDayTrading, it follows the price LIVE in market hours and pulls in by the numbers below (every X% the price moves your way, the stop tightens Y%, never closer than the floor); Alpaca\'s stop moves at most once a minute per stock. 5-day average: the original exit (sell on a close over the 5-day average, or day 10). The trails sell at session 20 if nothing else has. Switching applies to open positions too; a trail never loosens.')">i</button></div>
+          <div class="setting-desc">How a dip-buyer position is sold</div>
+        </div>
+        <select class="setting-input" name="stress_dip.exit_mode">
+          <option value="trail" {% if cfg.stress_dip.exit_mode == 'trail' %}selected{% endif %}>Stepped trail</option>
+          <option value="tighten" {% if cfg.stress_dip.exit_mode == 'tighten' %}selected{% endif %}>Tightening (live)</option>
+          <option value="average" {% if cfg.stress_dip.exit_mode == 'average' %}selected{% endif %}>5-day average</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Stepped trail</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Short Mirror Exit <button type="button" class="info-btn" onclick="showInfo(event,'Stepped trail: the trail narrows through +4.7% and +6.6% to 0.5% under the high at +8.4%, moved once a night from the day high. Tightening trail: like AIDayTrading, it follows the price LIVE in market hours and pulls in by the numbers below (every X% the price moves your way, the stop tightens Y%, never closer than the floor); Alpaca\'s stop moves at most once a minute per stock. 5-day average: the original exit (sell on a close over the 5-day average, or day 10). The trails sell at session 20 if nothing else has. Switching applies to open positions too; a trail never loosens.')">i</button></div>
+          <div class="setting-desc">How a short is bought back</div>
+        </div>
+        <select class="setting-input" name="short_mirror.exit_mode">
+          <option value="trail" {% if cfg.short_mirror.exit_mode == 'trail' %}selected{% endif %}>Stepped trail</option>
+          <option value="tighten" {% if cfg.short_mirror.exit_mode == 'tighten' %}selected{% endif %}>Tightening (live)</option>
+          <option value="average" {% if cfg.short_mirror.exit_mode == 'average' %}selected{% endif %}>5-day average</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">Stepped trail</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Dip-Buyer: Trail Start % <button type="button" class="info-btn" onclick="showInfo(event,'Where the tightening trail starts, as a % from the best price. 0 = each position\'s own stop % (3 x ATR, kept 3-15%).')">i</button></div>
+          <div class="setting-desc">0 = the position's own stop %</div>
+        </div>
+        <input type="number" class="setting-input" name="stress_dip.tighten_start_pct"
+               value="{{ cfg.stress_dip.tighten_start_pct }}" min="0" max="50" step="0.1">
+        <div class="default-label">default<br><span class="default-val">0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Dip-Buyer: For Every % <button type="button" class="info-btn" onclick="showInfo(event,'For every this many % the price rises the trade\'s way...')">i</button></div>
+          <div class="setting-desc">For every this % the price rises your way...</div>
+        </div>
+        <input type="number" class="setting-input" name="stress_dip.tighten_every_pct"
+               value="{{ cfg.stress_dip.tighten_every_pct }}" min="0.01" max="50" step="0.01">
+        <div class="default-label">default<br><span class="default-val">0.1%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Dip-Buyer: Tighten By % <button type="button" class="info-btn" onclick="showInfo(event,'...the stop\'s distance shrinks this many % (AIDayTrading: every 0.1% tightens 0.2%).')">i</button></div>
+          <div class="setting-desc">...the stop pulls in this %</div>
+        </div>
+        <input type="number" class="setting-input" name="stress_dip.tighten_by_pct"
+               value="{{ cfg.stress_dip.tighten_by_pct }}" min="0.01" max="50" step="0.01">
+        <div class="default-label">default<br><span class="default-val">0.2%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Dip-Buyer: Trail Floor % <button type="button" class="info-btn" onclick="showInfo(event,'The closest the trail ever gets to the best price.')">i</button></div>
+          <div class="setting-desc">Never closer than this % to the best price</div>
+        </div>
+        <input type="number" class="setting-input" name="stress_dip.tighten_floor_pct"
+               value="{{ cfg.stress_dip.tighten_floor_pct }}" min="0.1" max="50" step="0.1">
+        <div class="default-label">default<br><span class="default-val">2%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Dip-Buyer: Min Stop Move % <button type="button" class="info-btn" onclick="showInfo(event,'Alpaca\'s stop only moves when the trail has tightened at least this much (fewer order changes).')">i</button></div>
+          <div class="setting-desc">Move the broker stop only on a change this big</div>
+        </div>
+        <input type="number" class="setting-input" name="stress_dip.tighten_min_move_pct"
+               value="{{ cfg.stress_dip.tighten_min_move_pct }}" min="0.01" max="50" step="0.01">
+        <div class="default-label">default<br><span class="default-val">0.2%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Short Mirror: Trail Start % <button type="button" class="info-btn" onclick="showInfo(event,'Where the tightening trail starts, as a % from the best price. 0 = each position\'s own stop % (3 x ATR, kept 3-15%).')">i</button></div>
+          <div class="setting-desc">0 = the position's own stop %</div>
+        </div>
+        <input type="number" class="setting-input" name="short_mirror.tighten_start_pct"
+               value="{{ cfg.short_mirror.tighten_start_pct }}" min="0" max="50" step="0.1">
+        <div class="default-label">default<br><span class="default-val">0</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Short Mirror: For Every % <button type="button" class="info-btn" onclick="showInfo(event,'For every this many % the price falls the trade\'s way...')">i</button></div>
+          <div class="setting-desc">For every this % the price falls your way...</div>
+        </div>
+        <input type="number" class="setting-input" name="short_mirror.tighten_every_pct"
+               value="{{ cfg.short_mirror.tighten_every_pct }}" min="0.01" max="50" step="0.01">
+        <div class="default-label">default<br><span class="default-val">0.1%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Short Mirror: Tighten By % <button type="button" class="info-btn" onclick="showInfo(event,'...the stop\'s distance shrinks this many % (AIDayTrading: every 0.1% tightens 0.2%).')">i</button></div>
+          <div class="setting-desc">...the stop pulls in this %</div>
+        </div>
+        <input type="number" class="setting-input" name="short_mirror.tighten_by_pct"
+               value="{{ cfg.short_mirror.tighten_by_pct }}" min="0.01" max="50" step="0.01">
+        <div class="default-label">default<br><span class="default-val">0.2%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Short Mirror: Trail Floor % <button type="button" class="info-btn" onclick="showInfo(event,'The closest the trail ever gets to the best price.')">i</button></div>
+          <div class="setting-desc">Never closer than this % to the best price</div>
+        </div>
+        <input type="number" class="setting-input" name="short_mirror.tighten_floor_pct"
+               value="{{ cfg.short_mirror.tighten_floor_pct }}" min="0.1" max="50" step="0.1">
+        <div class="default-label">default<br><span class="default-val">2%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Short Mirror: Min Stop Move % <button type="button" class="info-btn" onclick="showInfo(event,'Alpaca\'s stop only moves when the trail has tightened at least this much (fewer order changes).')">i</button></div>
+          <div class="setting-desc">Move the broker stop only on a change this big</div>
+        </div>
+        <input type="number" class="setting-input" name="short_mirror.tighten_min_move_pct"
+               value="{{ cfg.short_mirror.tighten_min_move_pct }}" min="0.01" max="50" step="0.01">
+        <div class="default-label">default<br><span class="default-val">0.2%</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Volume Profile Sessions <button type="button" class="info-btn" onclick="showInfo(event,'How many sessions before the signal day the profile covers (the research used 63, about 3 months).')">i</button></div>
+          <div class="setting-desc">Sessions the volume profile covers</div>
+        </div>
+        <input type="number" class="setting-input" name="volume_profile.lookback_sessions"
+               value="{{ cfg.volume_profile.lookback_sessions }}" min="20" max="250" step="1">
+        <div class="default-label">default<br><span class="default-val">63 days</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Volume Profile Rows <button type="button" class="info-btn" onclick="showInfo(event,'How many price rows the profile is split into (the research used 100).')">i</button></div>
+          <div class="setting-desc">Price rows in the profile</div>
+        </div>
+        <input type="number" class="setting-input" name="volume_profile.rows"
+               value="{{ cfg.volume_profile.rows }}" min="20" max="400" step="1">
+        <div class="default-label">default<br><span class="default-val">100</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Value Area % <button type="button" class="info-btn" onclick="showInfo(event,'The share of the volume around the point of control that makes the value area (70% is standard).')">i</button></div>
+          <div class="setting-desc">Volume share inside the value area</div>
+        </div>
+        <input type="number" class="setting-input" name="volume_profile.value_area_pct"
+               value="{{ cfg.volume_profile.value_area_pct }}" min="50" max="95" step="1">
+        <div class="default-label">default<br><span class="default-val">70%</span></div>
+      </div>
+    </div>
+  </div>
+
   <!-- TAKE PROFIT / STOP LOSS -->
   <div class="section">
     <div class="section-title">Take Profit &amp; Stop Loss</div>
@@ -1586,6 +1760,25 @@ const DEFAULTS = {
   'risk_management.market_pause_live_watch': 'true',
   'risk_management.market_pause_vix_level': 20.0,
   'risk_management.market_pause_spy_sma_days': 50,
+  // Dip-buyer / short mirror pick order + exits, shared volume profile (2026-11-28) -- the code defaults
+  // (src/strategy/stress_dip.py, short_mirror.py, volume_profile.py).
+  'stress_dip.rank_by': 'rsi2',
+  'short_mirror.rank_by': 'rsi2',
+  'stress_dip.exit_mode': 'trail',
+  'short_mirror.exit_mode': 'trail',
+  'stress_dip.tighten_start_pct': 0,
+  'stress_dip.tighten_every_pct': 0.1,
+  'stress_dip.tighten_by_pct': 0.2,
+  'stress_dip.tighten_floor_pct': 2.0,
+  'stress_dip.tighten_min_move_pct': 0.2,
+  'short_mirror.tighten_start_pct': 0,
+  'short_mirror.tighten_every_pct': 0.1,
+  'short_mirror.tighten_by_pct': 0.2,
+  'short_mirror.tighten_floor_pct': 2.0,
+  'short_mirror.tighten_min_move_pct': 0.2,
+  'volume_profile.lookback_sessions': 63,
+  'volume_profile.rows': 100,
+  'volume_profile.value_area_pct': 70,
   'risk_management.trailing_stop_enabled': 'true',
   'risk_management.trailing_stop_follow_tp_targets': 'false',
   'risk_management.protection_gap_alert_delay_seconds': 30,

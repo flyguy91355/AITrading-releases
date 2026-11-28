@@ -61,6 +61,19 @@ SHORT_MIRROR_DEFAULTS = {
     "ex_dividend_block_days": 14,     # owner: "i dont want any dividened stocks" -- narrow form:
                                       # no short with an ex-dividend date inside the hold window
     "earnings_block_days": 2,
+    # Pick order (2026-11-28): "rsi2" (highest first, the original rule), "volume_profile"
+    # (furthest OVER the point of control in ATRs) or "move3" (biggest 3-day rise). The dip-buyer's
+    # orders mirrored; only the order changes. The short side's order is untested (the research
+    # ranked dips only) -- the owner: "we will backtest later for proper settings".
+    "rank_by": "rsi2",
+    # exit_mode "tighten" (2026-11-28): AIDayTrading's trail as it was built (for shorts): the buy
+    # stop trails the lowest price since the short, its distance shrinking tighten_by_pct for
+    # every tighten_every_pct the price falls, never closer than tighten_floor_pct. Live.
+    "tighten_start_pct": 0.0,
+    "tighten_every_pct": 0.1,
+    "tighten_by_pct": 0.2,
+    "tighten_floor_pct": 2.0,
+    "tighten_min_move_pct": 0.2,
 }
 
 
@@ -89,6 +102,12 @@ class ShortMirrorConfig:
     max_per_sector: int
     ex_dividend_block_days: int
     earnings_block_days: int
+    rank_by: str
+    tighten_start_pct: float
+    tighten_every_pct: float
+    tighten_by_pct: float
+    tighten_floor_pct: float
+    tighten_min_move_pct: float
 
 
 def short_mirror_cfg(raw: dict | None) -> ShortMirrorConfig:
@@ -122,6 +141,12 @@ def short_mirror_cfg(raw: dict | None) -> ShortMirrorConfig:
         max_per_sector=int(merged["max_per_sector"]),
         ex_dividend_block_days=int(merged["ex_dividend_block_days"]),
         earnings_block_days=int(merged["earnings_block_days"]),
+        rank_by=sdip._rank_by(merged["rank_by"]),
+        tighten_start_pct=float(merged["tighten_start_pct"]),
+        tighten_every_pct=float(merged["tighten_every_pct"]),
+        tighten_by_pct=float(merged["tighten_by_pct"]),
+        tighten_floor_pct=float(merged["tighten_floor_pct"]),
+        tighten_min_move_pct=float(merged["tighten_min_move_pct"]),
     )
 
 
@@ -139,9 +164,13 @@ def qualifies_short(s: TickerSnapshot, vix_close: float | None, cfg: ShortMirror
 
 def rank_short_candidates(snaps: dict[str, TickerSnapshot], vix_close: float | None,
                           cfg: ShortMirrorConfig) -> list[TickerSnapshot]:
-    """Qualifiers, highest RSI(2) first (ties: larger 3-day rise first, then ticker)."""
+    """Qualifiers in the configured pick order (cfg.rank_by), the dip-buyer's orders mirrored.
+    "rsi2": highest RSI(2) first (ties: larger 3-day rise, then ticker). "volume_profile": furthest
+    OVER the point of control in ATRs first; no profile after all that have one. "move3": biggest
+    3-day rise first; an unknown change last. Ties: higher RSI(2), then ticker."""
     picks = [s for s in snaps.values() if qualifies_short(s, vix_close, cfg)]
-    picks.sort(key=lambda s: (-s.rsi2, -(s.change_3d_pct if s.change_3d_pct is not None else 0.0), s.ticker))
+    picks.sort(key=lambda s: sdip.rank_key(cfg.rank_by, "short", s.rsi2, s.change_3d_pct,
+                                           s.vp.poc_atr if s.vp is not None else None, s.ticker))
     return picks
 
 
@@ -173,7 +202,7 @@ def short_pnl(entry_price: float, cover_price: float, qty: float) -> float:
 
 def max_hold(cfg: ShortMirrorConfig) -> int:
     """Sessions until the time exit, for the configured exit mode."""
-    return cfg.trail_max_hold_sessions if cfg.exit_mode == "trail" else cfg.max_hold_sessions
+    return cfg.trail_max_hold_sessions if cfg.exit_mode in ("trail", "tighten") else cfg.max_hold_sessions
 
 
 def cover_reason(live_price: float, last4_closes: list[float], sessions_held: int,
@@ -220,6 +249,33 @@ def short_trail_price(entry: float, lowest_low: float, start_pct: float, cfg: Sh
         return 0.0
     w = short_trail_width(entry, lowest_low, start_pct, cfg)
     return math.ceil(lowest_low * (1 + w / 100.0) * 100 - 1e-9) / 100.0
+
+
+def short_tighten_trail_price(entry: float, best_low: float, start_pct: float, cfg: ShortMirrorConfig) -> float:
+    """exit_mode "tighten" (AIDayTrading's vwap_trail_stop "tighten" math): the buy stop sits
+    `width`% over the lowest price since the short, width = start - by/every x the % fall, never
+    under the floor. Rounded UP to the cent. 0.0 while the price hasn't traded under the short (not
+    armed: the hard stop rules), or on any bad input."""
+    vals = (entry, best_low, start_pct, cfg.tighten_every_pct, cfg.tighten_by_pct, cfg.tighten_floor_pct)
+    if not all(_finite(x) for x in vals) or entry <= 0 or best_low <= 0 or start_pct <= 0 \
+            or cfg.tighten_every_pct <= 0:
+        return 0.0
+    if best_low >= entry:
+        return 0.0
+    fall = (entry - best_low) / entry * 100.0
+    width = max(cfg.tighten_floor_pct, start_pct - cfg.tighten_by_pct / cfg.tighten_every_pct * fall)
+    if not 0 < width < 100:
+        return 0.0
+    return math.ceil(best_low * (1 + width / 100.0) * 100 - 1e-9) / 100.0
+
+
+def short_tighten_should_move(current: float | None, new: float, min_move_pct: float) -> bool:
+    """A short's live trail moves only DOWN, and only by min_move_pct% or more."""
+    if not _finite(new) or new <= 0:
+        return False
+    if not _finite(current) or not current or current <= 0:
+        return True
+    return new <= current * (1 - max(0.0, min_move_pct) / 100.0) + 1e-9
 
 
 def effective_stop(book_entry: dict) -> float:

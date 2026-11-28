@@ -133,6 +133,7 @@ from src.decision.market_pause import (
 )
 import src.strategy.stress_dip as sdip
 import src.strategy.short_mirror as smir
+import src.strategy.volume_profile as vprof
 import src.execution.broker_match as bmatch
 from src.execution.order_manager import OrderManager, _is_regular_trading_hours
 from src.execution.broker import OrderStatus
@@ -1604,10 +1605,12 @@ def _sd_download_rows(tickers: list[str], period: str, chunk: int = 100):
                 yield t, rows
 
 
-def _sd_compute_signals(tickers: list[str], session_date: str) -> tuple[dict, float | None]:
+def _sd_compute_signals(tickers: list[str], session_date: str,
+                        vp_cfg: "vprof.VpConfig | None" = None) -> tuple[dict, float | None]:
     """Thread body for the evening refresh: snapshots as of `session_date` for every ticker
     whose newest bar IS that session (stale/missing data never qualifies), plus that
-    session's VIX close (None if Yahoo doesn't have it yet)."""
+    session's VIX close (None if Yahoo doesn't have it yet). With vp_cfg, each snapshot also
+    carries its volume profile (2026-11-28 pick order) -- from the same bars, no new download."""
     snaps: dict = {}
     vix_close = None
     for t, rows in _sd_download_rows(list(tickers) + ["^VIX"], "14mo"):
@@ -1617,10 +1620,19 @@ def _sd_compute_signals(tickers: list[str], session_date: str) -> tuple[dict, fl
         if t == "^VIX":
             vix_close = rows[-1]["close"]
             continue
-        snap = sdip.snapshot_from_bars(t, rows)
+        snap = sdip.snapshot_from_bars(t, rows, vp_cfg)
         if snap is not None:
             snaps[t] = snap
     return snaps, vix_close
+
+
+def _vp_card_fields(vp) -> dict:
+    """A candidate card's volume-profile fields (2026-11-28), shared by both evening refreshes:
+    point of control, value area, distance in ATRs, the close's zone and the window's dates.
+    All None when the stock has no profile."""
+    p = vprof.as_dict(vp) or {}
+    return {"poc": p.get("poc"), "vah": p.get("vah"), "val": p.get("val"), "poc_atr": p.get("poc_atr"),
+            "vp_zone": p.get("zone"), "vp_start": p.get("start"), "vp_end": p.get("end")}
 
 
 def _sd_recent_closes(tickers: list[str]) -> dict[str, list[tuple[str, float]]]:
@@ -7222,6 +7234,11 @@ class DashboardState:
             "last_error": st.get("last_error"), "candidates": st.get("candidates") or [],
             "status": st.get("status") or {}, "book": dict(self._short_book),
             "short_liability": round(self.portfolio.short_liability or 0.0, 2),
+            # pick order + tightening trail (2026-11-28)
+            "rank_by": st.get("rank_by") or cfg.rank_by, "rank_by_setting": cfg.rank_by,
+            "profiles": st.get("profiles") or {},
+            "tighten_start_pct": cfg.tighten_start_pct, "tighten_every_pct": cfg.tighten_every_pct,
+            "tighten_by_pct": cfg.tighten_by_pct, "tighten_floor_pct": cfg.tighten_floor_pct,
         }
 
     async def short_mirror_loop(self) -> None:
@@ -7287,7 +7304,7 @@ class DashboardState:
                 return
             await self._sm_log(f"Short mirror: downloading daily bars for {len(tickers)} stocks + VIX "
                                f"(session {session_date})...")
-            snaps, vix_close = await asyncio.to_thread(_sd_compute_signals, tickers, session_date)
+            snaps, vix_close = await asyncio.to_thread(_sd_compute_signals, tickers, session_date, self._vp_cfg())
             if vix_close is None or len(snaps) < 0.5 * len(tickers):
                 self._short_refresh_retry_at = datetime.now() + timedelta(minutes=15)
                 await self._sm_log(
@@ -7302,6 +7319,7 @@ class DashboardState:
                 d = {k: getattr(c, k) for k in ("ticker", "date", "close", "sma5", "sma200", "rsi2", "atr",
                                                  "dollar_volume", "last4_closes", "change_3d_pct")}
                 d["atr_pct"] = c.atr_pct
+                d.update(_vp_card_fields(c.vp))
                 f = facts.get(c.ticker) or {}
                 d["company"] = f.get("company") if f.get("company") != c.ticker else ""
                 d["sector"] = f.get("sector", "")
@@ -7318,6 +7336,11 @@ class DashboardState:
                 "signal_date": session_date, "vix_close": vix_close,
                 "computed_at": datetime.now().isoformat(timespec="seconds"),
                 "universe": len(tickers), "with_data": len(snaps), "candidates": cands,
+                "rank_by": cfg.rank_by,
+                # held shorts' profiles, for the cards of shorts no longer on the list and the
+                # Quant chart lines (2026-11-28)
+                "profiles": {t: vprof.as_dict(snaps[t].vp) for t in self._short_book
+                             if t in snaps and snaps[t].vp is not None},
                 "entries_done_date": self._short_state.get("entries_done_date"),
                 "last_error": None, "status": {},
             }
@@ -7329,7 +7352,8 @@ class DashboardState:
             elif not cands:
                 msg = f"Short mirror signals for {session_date}: VIX {vix_close:.2f}, no stock qualified"
             else:
-                top10 = ", ".join(f"{c['ticker']} (RSI2 {c['rsi2']:.1f})" for c in cands[:10])
+                top10 = ", ".join(f"{c['ticker']} ({sdip.rank_value_label(c, cfg.rank_by, 'short')})"
+                                  for c in cands[:10])
                 msg = (f"Short mirror signals for {session_date}: VIX {vix_close:.2f} -- {len(cands)} "
                        f"qualifier(s), best first: {top10}")
             await self._sm_log(msg, "success" if cands else "info")
@@ -7713,6 +7737,7 @@ class DashboardState:
         """Every tick: reconcile the short book with Alpaca, keep a resting buy stop under every
         short, and catch any short the mirror didn't open."""
         broker = self.order_manager.broker
+        cfg = self._short_cfg()
         try:
             positions = await broker.get_positions()
         except Exception:
@@ -7787,6 +7812,31 @@ class DashboardState:
                     await broker.cancel_order(b["stop_order_id"])
                     await self._short_wait_terminal(b["stop_order_id"], 10)
                     b["stop_order_id"] = None
+            # exit_mode "tighten" (2026-11-28, owner: "like in aidaytrading", "live every minute"):
+            # in regular hours the lowest price since the short follows the live price and the
+            # trail tightens (smir.short_tighten_trail_price -- AIDayTrading's math). Only DOWN, by
+            # tighten_min_move_pct+, at most once a minute per short; the code below then moves the
+            # resting buy stop in place, or covers if the price is already over it.
+            if cfg.exit_mode == "tighten" and regular and is_usable_price(b["last_price"]) and b["last_price"] > 0:
+                entry = float(b["entry_price"])
+                prev_low = float(b["trail_low"]) if is_usable_price(b.get("trail_low")) and b.get("trail_low") else entry
+                best = min(entry, prev_low, float(b["last_price"]))
+                b["trail_low"] = best
+                start = sdip.tighten_start(
+                    b.get("stop_pct") or smir.stop_distance_pct(b.get("atr") or 0, b.get("ref_close") or 0, cfg), cfg)
+                new = smir.short_tighten_trail_price(entry, best, start, cfg)
+                try:
+                    last = datetime.fromisoformat(b["live_trail_at"]) if b.get("live_trail_at") else None
+                except (TypeError, ValueError):
+                    last = None
+                if (smir.short_tighten_should_move(smir.effective_stop(b), new, cfg.tighten_min_move_pct)
+                        and (last is None or (datetime.now() - last).total_seconds() >= 60)):
+                    old = smir.effective_stop(b)
+                    b["trail"] = new
+                    b["live_trail_at"] = datetime.now().isoformat(timespec="seconds")
+                    await self._sm_log(f"Trail tightened to ${new:.2f} (was ${old:.2f}) -- low since the short "
+                                       f"${best:.2f} ({100.0 * (1 - best / entry):.1f}% under it)", "success",
+                                       ticker=t)
             if open_ids is None:
                 continue
             sid = b.get("stop_order_id")
@@ -7839,7 +7889,8 @@ class DashboardState:
         the resting buy stop down to it when the exit-order window opens. Same timing as the
         backtest: a day's low moves the trail from the next session on."""
         cfg = self._short_cfg()
-        if cfg.exit_mode != "trail":
+        # "tighten" (2026-11-28) runs here too: the nightly catch-up from completed daily lows.
+        if cfg.exit_mode not in ("trail", "tighten"):
             return
         want = sdip.last_completed_session(sessions, today, hhmm)
         if not want:
@@ -7862,7 +7913,13 @@ class DashboardState:
                 continue
             low = min(lo for _, lo in rows)
             start = b.get("stop_pct") or smir.stop_distance_pct(b.get("atr") or 0, b.get("ref_close") or 0, cfg)
-            new = smir.short_trail_price(float(b["entry_price"]), low, float(start), cfg)
+            if cfg.exit_mode == "tighten":
+                if is_usable_price(b.get("trail_low")) and float(b["trail_low"]) > 0:
+                    low = min(low, float(b["trail_low"]))
+                new = smir.short_tighten_trail_price(float(b["entry_price"]), low,
+                                                     sdip.tighten_start(float(start), cfg), cfg)
+            else:
+                new = smir.short_trail_price(float(b["entry_price"]), low, float(start), cfg)
             b["trail_session"], b["trail_low"] = want, low
             if new > 0 and new < smir.effective_stop(b) - 0.005:
                 old = smir.effective_stop(b)
@@ -7901,11 +7958,15 @@ class DashboardState:
             if why is None:
                 hold_why = (f"buy stop ${smir.effective_stop(b):.2f}"
                             + (" (trailing)" if b.get("trail") else " (trail not on yet)")
-                            if cfg.exit_mode == "trail" else f"${live:.2f} not under its 5-day average")
+                            if cfg.exit_mode != "average" else f"${live:.2f} not under its 5-day average")
                 await self._sm_log(f"Holding the short (session {n}/{smir.max_hold(cfg)}, {hold_why})",
                                    ticker=t, once_key=f"hold-{t}-{today}")
                 continue
             await self._short_cover(t, why)
+
+    def _vp_cfg(self) -> "vprof.VpConfig":
+        """The shared volume-profile settings (2026-11-28) both strategies' pick order uses."""
+        return vprof.vp_cfg(self.config.get("volume_profile"))
 
     def _stress_dip_cfg(self) -> "sdip.StressDipConfig":
         return sdip.stress_dip_cfg(self.config.get("stress_dip"))
@@ -8006,6 +8067,11 @@ class DashboardState:
             "stop_max_pct": cfg.stop_max_pct, "max_hold_sessions": sdip.max_hold(cfg),
             "exit_mode": cfg.exit_mode, "trail_final_pct": cfg.trail_final_pct, "trail_t3_pct": cfg.trail_t3_pct,
             "on_deck_pipeline_enabled": self._on_deck_pipeline_enabled(),
+            # pick order + tightening trail (2026-11-28)
+            "rank_by": st.get("rank_by") or cfg.rank_by, "rank_by_setting": cfg.rank_by,
+            "profiles": st.get("profiles") or {},
+            "tighten_start_pct": cfg.tighten_start_pct, "tighten_every_pct": cfg.tighten_every_pct,
+            "tighten_by_pct": cfg.tighten_by_pct, "tighten_floor_pct": cfg.tighten_floor_pct,
         }
 
     async def stress_dip_loop(self) -> None:
@@ -8058,6 +8124,8 @@ class DashboardState:
                 # high is final; sell at market if the price is already under it (a gap down
                 # leaves the broker unable to hold a sell stop above the price).
                 await self._stress_dip_update_trails(sessions, today, hhmm)
+                # exit_mode "tighten" (2026-11-28): the live tightening trail, every tick.
+                await self._stress_dip_live_trail(sessions, today, hhmm)
                 await self._stress_dip_trail_breach(sessions, today, hhmm)
 
                 # 4) Exits near the real close.
@@ -8077,7 +8145,7 @@ class DashboardState:
                 return
             await self._sd_log(f"Dip-buyer: downloading daily bars for {len(tickers)} stocks + VIX "
                                f"(session {session_date})...")
-            snaps, vix_close = await asyncio.to_thread(_sd_compute_signals, tickers, session_date)
+            snaps, vix_close = await asyncio.to_thread(_sd_compute_signals, tickers, session_date, self._vp_cfg())
             if vix_close is None or len(snaps) < 0.5 * len(tickers):
                 self._stress_dip_refresh_retry_at = datetime.now() + timedelta(minutes=15)
                 await self._sd_log(
@@ -8095,6 +8163,7 @@ class DashboardState:
                 d = {k: getattr(c, k) for k in ("ticker", "date", "close", "sma5", "sma200", "rsi2", "atr",
                                                  "dollar_volume", "last4_closes", "change_3d_pct")}
                 d["atr_pct"] = c.atr_pct
+                d.update(_vp_card_fields(c.vp))
                 f = facts.get(c.ticker) or {}
                 d["company"] = f.get("company") if f.get("company") != c.ticker else ""
                 d["sector"] = f.get("sector", "")
@@ -8104,6 +8173,10 @@ class DashboardState:
                 "signal_date": session_date, "vix_close": vix_close,
                 "computed_at": datetime.now().isoformat(timespec="seconds"),
                 "universe": len(tickers), "with_data": len(snaps), "candidates": cands,
+                "rank_by": cfg.rank_by,
+                # held dip positions' profiles, for the Quant chart lines (2026-11-28)
+                "profiles": {t: vprof.as_dict(snaps[t].vp) for t in self._stress_dip_book
+                             if t in snaps and snaps[t].vp is not None},
                 "entries_done_date": self._stress_dip_state.get("entries_done_date"),
                 "last_error": None, "status": {},
             }
@@ -8115,7 +8188,8 @@ class DashboardState:
             elif not cands:
                 msg = f"Dip-buyer signals for {session_date}: VIX {vix_close:.2f}, no stock qualified"
             else:
-                top = ", ".join(f"{c['ticker']} (RSI2 {c['rsi2']:.1f})" for c in cands[:10])
+                top = ", ".join(f"{c['ticker']} ({sdip.rank_value_label(c, cfg.rank_by, 'long')})"
+                                for c in cands[:10])
                 msg = (f"Dip-buyer signals for {session_date}: VIX {vix_close:.2f} -- {len(cands)} "
                        f"qualifier(s), best first: {top}")
             await self._sd_log(msg, "success" if cands else "info")
@@ -8297,6 +8371,10 @@ class DashboardState:
                    + (f"a stepped trailing stop from {stop_pct:.1f}% down to {cfg.trail_final_pct}% at "
                       f"+{cfg.trail_t3_pct}% does the selling, or the close of session {cfg.trail_max_hold_sessions}"
                       if cfg.exit_mode == "trail" else
+                      f"a live tightening trailing stop from {sdip.tighten_start(stop_pct, cfg):.1f}% (every "
+                      f"{cfg.tighten_every_pct:g}% gain tightens it {cfg.tighten_by_pct:g}%, never under "
+                      f"{cfg.tighten_floor_pct:g}%) does the selling, or the close of session {cfg.trail_max_hold_sessions}"
+                      if cfg.exit_mode == "tighten" else
                       f"sells on the first close above its 5-day average or after {cfg.max_hold_sessions} sessions")
                    + f". Claude check: {reason}")
             # Only OrderManager._buy_snapshot_fields reads research_report on a buy -- this
@@ -8360,7 +8438,9 @@ class DashboardState:
         the broker itself sells the moment the price touches it. Same timing as the backtest:
         a day's high moves the trail from the next session on."""
         cfg = self._stress_dip_cfg()
-        if cfg.exit_mode != "trail":
+        # "tighten" (2026-11-28) runs here too: the nightly catch-up from completed daily highs, so
+        # a spike between the live 30s samples still tightens it (same math as the live trail).
+        if cfg.exit_mode not in ("trail", "tighten"):
             return
         want = sdip.last_completed_session(sessions, today, hhmm)
         if not want:
@@ -8385,7 +8465,11 @@ class DashboardState:
                 continue
             hi = max(h for _, h in rows)
             start = b.get("stop_pct") or sdip.stop_distance_pct(b.get("atr") or 0, b.get("ref_close") or 0, cfg)
-            new = sdip.trail_price(pos.entry_price, hi, float(start), cfg)
+            if cfg.exit_mode == "tighten":
+                hi = max(hi, float(b.get("trail_high") or 0))
+                new = sdip.tighten_trail_price(pos.entry_price, hi, sdip.tighten_start(float(start), cfg), cfg)
+            else:
+                new = sdip.trail_price(pos.entry_price, hi, float(start), cfg)
             b["trail_session"], b["trail_high"] = want, hi
             if new > 0 and new > (pos.trailing_stop or 0) + 0.005:
                 old = pos.trailing_stop
@@ -8399,6 +8483,59 @@ class DashboardState:
                     f"buy ${hi:.2f} ({gain:+.1f}%)", "success", ticker=t)
         self._stress_dip_trail_retry_at = datetime.now() + timedelta(minutes=10) if missing else None
         await asyncio.to_thread(_save_stress_dip_book, dict(self._stress_dip_book))
+        if raised and self.order_manager and self._exit_order_maintenance_window_open():
+            asyncio.create_task(self.order_manager.sync_exit_orders())
+
+    async def _stress_dip_live_trail(self, sessions: list[dict], today: str, hhmm: str) -> None:
+        """exit_mode "tighten" (2026-11-28, owner: "an exit that uses a tightening trailing stop
+        like in aidaytrading", "live every minute"): every tick in the real session, the best
+        price since the buy follows the live price, and the trail tightens -- tighten_by_pct for
+        every tighten_every_pct of gain, never closer than the floor (sdip.tighten_trail_price,
+        AIDayTrading's vwap_trail_stop mirrored). It only ever moves UP, by
+        tighten_min_move_pct+ and at most once a minute per stock, into pos.trailing_stop; one
+        sync_exit_orders pass then moves Alpaca's resting stop in place (replace_order), the
+        same machinery the nightly trail uses. _stress_dip_trail_breach (next in the tick) sells
+        at market if the price is already under it."""
+        cfg = self._stress_dip_cfg()
+        if cfg.exit_mode != "tighten" or not self._stress_dip_book or self.stopped:
+            return
+        # The real session from Alpaca's calendar: premarket/after-hours quotes never move it.
+        sess = sdip.session_for(sessions, today)
+        if not sess or not (sess["open"] <= hhmm < sess["close"]) or not self._is_market_open():
+            return
+        now = datetime.now()
+        raised, dirty = False, False
+        for t, b in list(self._stress_dip_book.items()):
+            pos = self.portfolio.positions.get(t)
+            if pos is None or not is_usable_price(pos.current_price) or not is_usable_price(pos.entry_price):
+                continue
+            best = max(float(pos.entry_price), float(b.get("trail_high") or 0), float(pos.current_price))
+            if best != b.get("trail_high"):
+                b["trail_high"] = best          # the best price so far, even when the stop doesn't move
+                dirty = True
+            start = sdip.tighten_start(
+                b.get("stop_pct") or sdip.stop_distance_pct(b.get("atr") or 0, b.get("ref_close") or 0, cfg), cfg)
+            new = sdip.tighten_trail_price(float(pos.entry_price), best, start, cfg)
+            if not sdip.tighten_should_move(pos.trailing_stop, new, cfg.tighten_min_move_pct):
+                continue
+            try:
+                last = datetime.fromisoformat(b["live_trail_at"]) if b.get("live_trail_at") else None
+            except (TypeError, ValueError):
+                last = None
+            if last is not None and (now - last).total_seconds() < 60:
+                continue                        # at most one broker stop change a minute per stock
+            old = pos.trailing_stop
+            pos.trailing_stop = new
+            b["trail"] = new
+            b["live_trail_at"] = now.isoformat(timespec="seconds")
+            dirty = True
+            await self.portfolio._save_position(pos)
+            raised = True
+            gain = 100.0 * (best / float(pos.entry_price) - 1)
+            await self._sd_log(f"Trail tightened to ${new:.2f}{'' if not old else f' (was ${old:.2f})'} -- best "
+                               f"${best:.2f} ({gain:+.1f}%)", "success", ticker=t)
+        if dirty:
+            await asyncio.to_thread(_save_stress_dip_book, dict(self._stress_dip_book))
         if raised and self.order_manager and self._exit_order_maintenance_window_open():
             asyncio.create_task(self.order_manager.sync_exit_orders())
 
@@ -8466,8 +8603,8 @@ class DashboardState:
                 continue
             reason = sdip.exit_reason(live, last4, n, cfg)
             if reason is None:
-                why = (f"trail ${pos.trailing_stop:.2f}" if cfg.exit_mode == "trail" and pos.trailing_stop
-                       else "trail not on yet (price hasn't traded over the buy)" if cfg.exit_mode == "trail"
+                why = (f"trail ${pos.trailing_stop:.2f}" if cfg.exit_mode != "average" and pos.trailing_stop
+                       else "trail not on yet (price hasn't traded over the buy)" if cfg.exit_mode != "average"
                        else f"${live:.2f} not above its 5-day average")
                 await self._sd_log(f"Holding (session {n}/{sdip.max_hold(cfg)}, {why})",
                                    ticker=t, once_key=f"hold-{t}-{today}")
@@ -11572,6 +11709,17 @@ async def settings_page():
         for k, v in cfg.get(section, {}).items():
             setattr(sub, k, v)
         setattr(ns, section, sub)
+    # Dip-buyer / short mirror / volume profile (2026-11-28: pick order + tightening trail). The
+    # live settings.yaml usually lacks these sections (Apply Update never touches it), so every
+    # field shows its CODE default -- a blank would render a wrong select and confuse a save.
+    for section, defaults in (("stress_dip", sdip.STRESS_DIP_DEFAULTS), ("short_mirror", smir.SHORT_MIRROR_DEFAULTS),
+                              ("volume_profile", vprof.VOLUME_PROFILE_DEFAULTS)):
+        sub = _NS()
+        merged = dict(defaults)
+        merged.update({k: v for k, v in (cfg.get(section) or {}).items() if v is not None and v != ""})
+        for k, v in merged.items():
+            setattr(sub, k, v)
+        setattr(ns, section, sub)
     # Market buy pause (2026-11-21) -- cfg here is an attribute namespace, so a key missing
     # from settings.yaml (the live box never gets new keys from Apply Update) would be
     # Jinja-falsy: the on/off selects would render "Disabled" and the first unrelated
@@ -11759,6 +11907,25 @@ async def save_settings(payload: dict):
         "risk_management.market_pause_live_watch": lambda v: v == "true",
         "risk_management.market_pause_vix_level": coerce_vix_level,
         "risk_management.market_pause_spy_sma_days": coerce_sma_days,
+        # Dip-buyer / short mirror pick order + exits, shared volume profile (2026-11-28).
+        # Each coercer raises ValueError on a bad value, which aborts the whole save.
+        "stress_dip.rank_by": sdip.coerce_rank_by,
+        "short_mirror.rank_by": sdip.coerce_rank_by,
+        "stress_dip.exit_mode": sdip.coerce_exit_mode,
+        "short_mirror.exit_mode": sdip.coerce_exit_mode,
+        "stress_dip.tighten_start_pct": sdip.coerce_tighten_start_pct,
+        "stress_dip.tighten_every_pct": sdip.coerce_tighten_pct,
+        "stress_dip.tighten_by_pct": sdip.coerce_tighten_pct,
+        "stress_dip.tighten_floor_pct": sdip.coerce_tighten_pct,
+        "stress_dip.tighten_min_move_pct": sdip.coerce_tighten_pct,
+        "short_mirror.tighten_start_pct": sdip.coerce_tighten_start_pct,
+        "short_mirror.tighten_every_pct": sdip.coerce_tighten_pct,
+        "short_mirror.tighten_by_pct": sdip.coerce_tighten_pct,
+        "short_mirror.tighten_floor_pct": sdip.coerce_tighten_pct,
+        "short_mirror.tighten_min_move_pct": sdip.coerce_tighten_pct,
+        "volume_profile.lookback_sessions": vprof.coerce_lookback,
+        "volume_profile.rows": vprof.coerce_rows,
+        "volume_profile.value_area_pct": vprof.coerce_value_area,
         "risk_management.trailing_stop_enabled": lambda v: v == "true",
         "risk_management.trailing_stop_follow_tp_targets": lambda v: v == "true",
         "risk_management.protection_gap_alert_delay_seconds": int,
@@ -11927,6 +12094,17 @@ async def save_settings(payload: dict):
     # exists. Re-enabling while the state is ON gets one log line (the flip itself was
     # silent while disabled). Any change re-broadcasts so the banner updates at once.
     _mp_cfg_after = state._market_pause_cfg()
+
+    # Pick order (2026-11-28): re-sort the stored lists right away, so the next open's entries
+    # (which fill in the stored order) use the order just chosen, not last evening's.
+    for _sec, _side, _st_attr, _saver in (("stress_dip", "long", "_stress_dip_state", _save_stress_dip_state),
+                                           ("short_mirror", "short", "_short_state", _save_short_mirror_state)):
+        _rb = coerced_values.get(f"{_sec}.rank_by")
+        _st = getattr(state, _st_attr, None)
+        if _rb and isinstance(_st, dict) and _st.get("candidates") and (_st.get("rank_by") or "rsi2") != _rb:
+            _st["candidates"] = sdip.rerank_dicts(list(_st["candidates"]), _rb, _side)
+            _st["rank_by"] = _rb
+            await asyncio.to_thread(_saver, dict(_st))
     if (_mp_cfg_after.vix_level, _mp_cfg_after.sma_days) != (_mp_cfg_before.vix_level, _mp_cfg_before.sma_days):
         asyncio.create_task(state._market_pause_close_check(force=True))
     if _mp_cfg_after.enabled and not _mp_cfg_before.enabled and state.market_pause.active:

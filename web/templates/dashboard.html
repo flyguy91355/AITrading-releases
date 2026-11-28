@@ -5085,6 +5085,31 @@ function _dipDateLabel(iso) {
   return isNaN(dt) ? iso : dt.toLocaleDateString([], {month: 'numeric', day: 'numeric'});
 }
 
+// Pick order + tightening trail (2026-11-28; design docs/superpowers/specs/2026-11-28-volume-profile-pick-order-design.md).
+// A card's volume-profile reading: how far the close sits from the point of control, in ATRs, and the value-area zone.
+function vpLine(c, side) {
+  const x = c.poc_atr;
+  if (x == null || !isFinite(x)) return 'no volume profile';
+  const zone = { below: ' · below value', above: ' · above value', inside: ' · in value' }[c.vp_zone] || '';
+  return `${Math.abs(x).toFixed(1)} ATR ${x < 0 ? 'under' : 'over'} POC${zone}`;
+}
+// Which pick order the list is in.
+function orderLabel(rb, side) {
+  if (rb === 'volume_profile') return 'Order: volume profile';
+  if (rb === 'move3') return side === 'long' ? 'Order: 3-day drop' : 'Order: 3-day rise';
+  return 'Order: RSI(2)';
+}
+// The exit, in a few words, for a card's meta line.
+function exitMeta(d, c, stopPct, side) {
+  const sign = side === 'long' ? '−' : '+';
+  if (d.exit_mode === 'average') return side === 'long' ? `5-day avg $${(c.sma5 || 0).toFixed(2)}` : 'covers under its 5-day average';
+  if (d.exit_mode === 'tighten') {
+    const start = d.tighten_start_pct > 0 ? d.tighten_start_pct : stopPct;
+    return `tightening trail from ${sign}${start.toFixed(1)}%`;
+  }
+  return `trail starts ${sign}${stopPct.toFixed(1)}%`;
+}
+
 function renderDipGrid(d, waiting) {
   const q = (document.getElementById('stockSearch').value || '').toLowerCase();
   const names = d.names || {};
@@ -5093,7 +5118,7 @@ function renderDipGrid(d, waiting) {
   const vix = d.vix_close;
   const vixOk = vix != null && vix >= d.vix_min;
   const header = `<div class="dip-header">
-      <span>▲ Long list (dip-buyer) · ${_dipDateLabel(d.signal_date)} close</span>
+      <span>▲ Long list (dip-buyer) · ${_dipDateLabel(d.signal_date)} close · ${orderLabel(d.rank_by, 'long')}</span>
       <span style="color:${vixOk ? 'var(--green)' : 'var(--text-muted)'};">VIX ${vix != null ? vix.toFixed(2) : '—'} ${vixOk ? `(≥ ${d.vix_min}, buying on)` : `(below ${d.vix_min}, no buys)`}</span>
       <span>${waiting ? 'Waits for long mode' : _dipEntriesDone(d) ? 'Bought at the open' : 'Buys at the next open'}</span>
     </div>`;
@@ -5127,7 +5152,8 @@ function renderDipGrid(d, waiting) {
               <span style="font-size:9px;color:var(--text-muted);">stop ≈ −${stopPct.toFixed(1)}%</span>
             </span>
           </span>
-          <span class="btn-meta">Close $${(c.close || 0).toFixed(2)} · ${d.exit_mode === 'average' ? `5-day avg $${(c.sma5 || 0).toFixed(2)}` : `trail starts −${stopPct.toFixed(1)}%`}</span>
+          <span class="btn-meta">Close $${(c.close || 0).toFixed(2)} · ${exitMeta(d, c, stopPct, 'long')}</span>
+          <span class="btn-meta">${vpLine(c, 'long')}</span>
           <span class="btn-meta-wrap">${[c.sector || '', above200 != null ? `${above200 >= 0 ? '+' : ''}${above200.toFixed(1)}% above 200-day` : '', c.dollar_volume ? `$${(c.dollar_volume / 1e6).toFixed(0)}M/day` : '', c.earnings_date ? `Earnings ${_dipDateLabel(c.earnings_date)}` : ''].filter(Boolean).join(' · ')}</span>
         </span>
         <span class="btn-side-col">
@@ -5188,13 +5214,14 @@ function renderShortGrid(sd, waiting) {
   const listed = new Set(cands.map(c => c.ticker));
   // Open shorts from earlier days that aren't on today's list still get a card.
   const held = Object.entries(sd.book || {}).filter(([t]) => !listed.has(t)).map(([t, b]) => ({
-    ticker: t, company: b.company || '', close: b.entry_price, rsi2: b.rsi2, atr: b.atr, held: true }));
+    ticker: t, company: b.company || '', close: b.entry_price, rsi2: b.rsi2, atr: b.atr, held: true,
+    poc_atr: ((sd.profiles || {})[t] || {}).poc_atr, vp_zone: ((sd.profiles || {})[t] || {}).zone }));
   let items = held.concat(cands).map((c, i) => Object.assign({}, c, { rank: i + 1, name: c.company || '' }));
   if (q) items = items.filter(c => c.ticker.toLowerCase().includes(q) || c.name.toLowerCase().includes(q));
   const vix = sd.vix_close;
   const vixOk = vix != null && vix >= (sd.vix_min || 20);
   const header = `<div class="dip-header">
-      <span style="color:#f87171;">▼ Short list (short mirror) · ${_dipDateLabel(sd.signal_date)} close</span>
+      <span style="color:#f87171;">▼ Short list (short mirror) · ${_dipDateLabel(sd.signal_date)} close · ${orderLabel(sd.rank_by, 'short')}</span>
       <span style="color:${vixOk ? 'var(--green)' : 'var(--text-muted)'};">VIX ${vix != null ? vix.toFixed(2) : '—'} ${vixOk ? `(≥ ${sd.vix_min || 20})` : `(below ${sd.vix_min || 20}, no shorts)`}</span>
       <span>${waiting ? 'Waits for short mode' : _dipEntriesDone(sd) ? 'Shorted at the open' : 'Shorts at the next open'}</span>
     </div>`;
@@ -5229,7 +5256,8 @@ function renderShortGrid(sd, waiting) {
               <span style="font-size:9px;color:var(--text-muted);">stop ≈ +${stopPct.toFixed(1)}%</span>
             </span>
           </span>
-          <span class="btn-meta">${c.held ? 'Shorted' : 'Close'} $${(c.close || 0).toFixed(2)} · ${sd.exit_mode === 'average' ? 'covers under its 5-day average' : `trail starts +${stopPct.toFixed(1)}%`}</span>
+          <span class="btn-meta">${c.held ? 'Shorted' : 'Close'} $${(c.close || 0).toFixed(2)} · ${exitMeta(sd, c, stopPct, 'short')}</span>
+          <span class="btn-meta">${vpLine(c, 'short')}</span>
           <span class="btn-meta-wrap">${[c.sector || '', vs200 != null ? `${vs200.toFixed(1)}% vs 200-day` : '', c.dollar_volume ? `$${(c.dollar_volume / 1e6).toFixed(0)}M/day` : '', c.earnings_date ? `Earnings ${_dipDateLabel(c.earnings_date)}` : '', exd ? `Ex-div ${_dipDateLabel(exd)}` : ''].filter(Boolean).join(' · ')}</span>
         </span>
         <span class="btn-side-col">
@@ -5357,6 +5385,8 @@ async function clickShortCandidate(ticker) {
       ${chip((c.held ? 'Shorted ' : 'Close ') + _dipDateLabel(c.date), '$' + (c.close || 0).toFixed(2))}
       ${chip('vs 200-day', vs200 != null ? vs200.toFixed(1) + '%' : '—')}
       ${chip('VIX', sd.vix_close != null ? sd.vix_close.toFixed(2) : '—')}
+      ${c.poc != null ? chip('POC', '$' + c.poc.toFixed(2) + ' (' + vpLine(c, 'short') + ')') : ''}
+      ${c.val != null ? chip('Value area', '$' + c.val.toFixed(2) + '–$' + c.vah.toFixed(2)) : ''}
       ${chip('Buy stop ≈', '$' + stopPx.toFixed(2) + ' (+' + stopPct.toFixed(1) + '%)', '#ef4444')}
       ${c.ex_dividend_date && c.ex_dividend_date >= new Date().toISOString().slice(0, 10) ? chip('Ex-div', _dipDateLabel(c.ex_dividend_date)) : ''}
     </div>
@@ -5426,6 +5456,8 @@ async function clickDipCandidate(ticker) {
       ${d.exit_mode === 'average' ? chip('5-day avg', '$' + (c.sma5 || 0).toFixed(2)) : ''}
       ${chip('vs 200-day', above200 != null ? (above200 >= 0 ? '+' : '') + above200.toFixed(1) + '%' : '—')}
       ${chip('VIX', d.vix_close != null ? d.vix_close.toFixed(2) : '—')}
+      ${c.poc != null ? chip('POC', '$' + c.poc.toFixed(2) + ' (' + vpLine(c, 'long') + ')') : ''}
+      ${c.val != null ? chip('Value area', '$' + c.val.toFixed(2) + '–$' + c.vah.toFixed(2)) : ''}
       ${chip('Stop ≈', '$' + (c.close * (1 - stopPct / 100)).toFixed(2) + ' (−' + stopPct.toFixed(1) + '%)', '#ef4444')}
     </div>
     <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;">
